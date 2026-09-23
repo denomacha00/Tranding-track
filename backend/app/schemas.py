@@ -21,6 +21,7 @@ class TradingViewSignal(BaseModel):
     amount: Optional[float] = Field(default=None, gt=0)
     # Optional overrides
     price: Optional[float] = Field(default=None, gt=0)
+    limit_price: Optional[float] = Field(default=None, gt=0)  # resting limit entry
     stop_loss: Optional[float] = Field(default=None, gt=0)
     take_profit: Optional[float] = Field(default=None, gt=0)
     note: Optional[str] = None
@@ -30,6 +31,7 @@ class ManualOrder(BaseModel):
     action: Literal["buy", "sell", "close"]
     symbol: str
     amount: Optional[float] = Field(default=None, gt=0)
+    limit_price: Optional[float] = Field(default=None, gt=0)  # resting limit entry
     stop_loss: Optional[float] = Field(default=None, gt=0)
     take_profit: Optional[float] = Field(default=None, gt=0)
 
@@ -46,6 +48,8 @@ class TradeOut(BaseModel):
     stop_loss: Optional[float]
     take_profit: Optional[float]
     status: str
+    order_type: str = "market"
+    limit_price: Optional[float] = None
     pnl: float
     mode: str
     source: str

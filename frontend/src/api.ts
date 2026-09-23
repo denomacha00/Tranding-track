@@ -50,15 +50,24 @@ export const api = {
     action: 'buy' | 'sell' | 'close'
     symbol: string
     amount?: number
+    limit_price?: number
   }) => req<ExecutionResult>('/api/order', { method: 'POST', body: JSON.stringify(body) }),
   closeTrade: (id: number) =>
     req<ExecutionResult>(`/api/trades/${id}/close`, { method: 'POST' }),
   ohlcv: (symbol: string, timeframe = '1h', limit = 200) =>
     req<Candle[]>(`/api/ohlcv/${encodeURIComponent(symbol)}?timeframe=${timeframe}&limit=${limit}`),
-  backtest: (symbol: string, strategy: string, timeframe = '1h') =>
-    req<BacktestResult>(
-      `/api/backtest?symbol=${encodeURIComponent(symbol)}&strategy=${strategy}&timeframe=${timeframe}`,
-    ),
+  backtest: (
+    symbol: string,
+    strategy: string,
+    timeframe = '1h',
+    feePct?: number,
+    slippagePct?: number,
+  ) => {
+    const params = new URLSearchParams({ symbol, strategy, timeframe })
+    if (feePct !== undefined) params.set('fee_pct', String(feePct))
+    if (slippagePct !== undefined) params.set('slippage_pct', String(slippagePct))
+    return req<BacktestResult>(`/api/backtest?${params.toString()}`)
+  },
   strategies: () => req<StrategyInfo[]>('/api/strategies'),
   train: (symbol: string, strategy: string, timeframe = '1h') =>
     req<TrainingReport>(

@@ -26,7 +26,11 @@ class RiskManager:
         self.settings = settings
 
     def open_positions(self, db: Session) -> list[Trade]:
-        stmt = select(Trade).where(Trade.status == TradeStatus.open.value)
+        # Pending limit orders count too: they reserve capital and a slot, so a
+        # resting order must be included in position/exposure limits.
+        stmt = select(Trade).where(
+            Trade.status.in_([TradeStatus.open.value, TradeStatus.pending.value])
+        )
         return list(db.scalars(stmt).all())
 
     def day_realized_pnl(self, db: Session) -> float:

@@ -51,7 +51,11 @@ def init_db() -> None:
 
 # Columns added after initial release: {table: {column: SQL type + default}}.
 _ADDED_COLUMNS: dict[str, dict[str, str]] = {
-    "trades": {"stop_order_id": "VARCHAR(64)"},
+    "trades": {
+        "stop_order_id": "VARCHAR(64)",
+        "order_type": "VARCHAR(8) DEFAULT 'market'",
+        "limit_price": "FLOAT",
+    },
 }
 
 

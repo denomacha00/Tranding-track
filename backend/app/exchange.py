@@ -207,6 +207,40 @@ class BinanceConnector:
             raise RuntimeError("Binance API credentials are not configured")
         return _with_retry(lambda: self._client.create_order(symbol, "market", side, amount))
 
+    def create_limit_order(
+        self, symbol: str, side: str, amount: float, price: float
+    ) -> dict[str, Any]:
+        """Place a REAL resting limit order. Only called in live mode.
+
+        The order sits on the book until price crosses it (or it is cancelled).
+        Caller polls fetch_order() to detect the fill.
+        """
+        if not self._client:
+            raise RuntimeError("Exchange client not available")
+        if not self.has_credentials:
+            raise RuntimeError("Binance API credentials are not configured")
+        try:
+            limit = float(self._client.price_to_precision(symbol, price))
+        except Exception:
+            limit = price
+        return _with_retry(
+            lambda: self._client.create_order(symbol, "limit", side, amount, limit)
+        )
+
+    def fetch_order(self, order_id: str, symbol: str) -> Optional[dict[str, Any]]:
+        """Fetch a single order's current state (status, filled, average price).
+
+        Best-effort: returns None if unavailable so the caller can retry next
+        tick rather than crashing the monitor loop.
+        """
+        if not self._client or not self.has_credentials or not order_id:
+            return None
+        try:
+            return _with_retry(lambda: self._client.fetch_order(order_id, symbol))
+        except Exception as exc:
+            logger.warning("fetch_order %s failed: %s", order_id, exc)
+            return None
+
     def create_stop_loss_order(
         self, symbol: str, side: str, amount: float, stop_price: float
     ) -> Optional[dict[str, Any]]:

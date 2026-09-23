@@ -22,6 +22,7 @@ def _tick(engine: TradingEngine) -> dict:
                     engine.auto_trade_symbol(db, symbol, engine.settings.auto_timeframe)
                 except Exception as exc:  # keep the loop resilient per-symbol
                     logger.warning("auto_trade %s failed: %s", symbol, exc)
+        engine.check_pending_orders(db)
         engine.check_open_positions(db)
         return engine.status(db)
     finally:

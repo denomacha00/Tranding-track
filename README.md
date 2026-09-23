@@ -41,6 +41,11 @@ TradingView alert ──▶ /webhook ──▶ risk checks ──▶ Binance ord
   down. The in-process SL/TP monitor is the fallback.
 - **Trailing stops** — an open long's stop ratchets up as price makes new highs
   (never loosened), locking in gains.
+- **Limit orders** — manual orders and TradingView alerts can carry a
+  `limit_price`: the order rests until the market reaches it (a buy fills at or
+  below, a sell at or above) instead of filling immediately at market. Pending
+  orders reserve capital and a position slot, and can be cancelled from the
+  dashboard.
 - **Multi-timeframe confirmation** — in autonomous mode, set a higher
   "confirm timeframe" (e.g. `4h` while trading `1h`) and the bot refuses to buy
   when the higher timeframe reads bearish, or exit when it reads bullish.
@@ -49,7 +54,13 @@ TradingView alert ──▶ /webhook ──▶ risk checks ──▶ Binance ord
 - **Trainable** — grid-search optimiser with an in-sample/validation split to
   guard against overfitting.
 - **Restart-safe** — settings overrides and paper balance persist across
-  restarts; live positions are reconciled (warn-only) on startup.
+  restarts; on startup in live mode positions are **auto-reconciled** against the
+  exchange: a DB long the exchange no longer holds is closed, and a partial
+  mismatch shrinks the tracked amount to match (every heal is logged and
+  broadcast).
+- **Schema migrations** — Alembic is set up (`backend/alembic`) for non-additive
+  changes; the app also applies lightweight additive column migrations on startup
+  so existing SQLite databases keep working out of the box.
 - **API auth** — set `API_KEY` and all mutating endpoints require the
   `X-API-Key` header. Secrets are compared in constant time.
 - **Structured logging** — `LOG_FORMAT=json` for log aggregators.
@@ -129,8 +140,22 @@ Set the alert webhook URL to `http(s)://<host>/webhook` and the message body to:
 ```
 
 `action` is `buy`, `sell`, or `close`. `amount` is optional (falls back to
-risk-based sizing). The alert is rejected unless `secret` matches
-`TRADINGVIEW_WEBHOOK_SECRET`.
+risk-based sizing). Add `"limit_price": 61000` to rest a limit order that only
+fills when the market reaches that price. The alert is rejected unless `secret`
+matches `TRADINGVIEW_WEBHOOK_SECRET`.
+
+## Database migrations (Alembic)
+
+The app creates tables and applies additive column migrations automatically on
+startup, so nothing is required for normal use. For schema changes that additive
+migrations can't handle, use Alembic from the `backend` directory (it reads
+`DATABASE_URL` from your `.env`):
+
+```bash
+cd backend
+.venv/Scripts/python -m alembic upgrade head              # apply migrations
+.venv/Scripts/python -m alembic revision --autogenerate -m change   # create one
+```
 
 ## Testing
 

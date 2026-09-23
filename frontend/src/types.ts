@@ -24,6 +24,8 @@ export interface Trade {
   stop_loss: number | null
   take_profit: number | null
   status: string
+  order_type?: string
+  limit_price?: number | null
   pnl: number
   mode: string
   source: string
@@ -145,6 +147,11 @@ export type WsMessage =
   | { event: 'status'; data: BotStatus }
   | { event: 'trade_opened'; data: { id: number; symbol: string; side: string } }
   | { event: 'trade_closed'; data: { id: number; symbol: string; pnl: number } }
+  | { event: 'order_pending'; data: { id: number; symbol: string; side: string; limit_price: number } }
+  | { event: 'order_canceled'; data: { id: number; symbol: string } }
+  | { event: 'stop_trailed'; data: { id: number; symbol: string; stop_loss: number } }
+  | { event: 'reconcile_closed'; data: { symbol: string; db_amount: number; exchange_amount: number; pnl: number } }
+  | { event: 'reconcile_adjusted'; data: { symbol: string; db_amount: number; exchange_amount: number } }
   | {
       event: 'signal'
       data: { source: string; action: string; symbol: string; accepted: boolean; message: string }

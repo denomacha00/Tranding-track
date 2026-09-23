@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from './api'
 import { PriceChart } from './PriceChart'
 import { useSocket } from './useSocket'
-import type { BotStatus, Candle, MarketAnalysis, Settings, SignalRow, StrategyInfo, Trade, TrainingReport } from './types'
+import type { BotStatus, BacktestResult, Candle, MarketAnalysis, Settings, SignalRow, StrategyInfo, Trade, TrainingReport } from './types'
 
 const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
@@ -23,8 +23,9 @@ export default function App() {
   const [symbol, setSymbol] = useState(SYMBOLS[0])
   const [timeframe, setTimeframe] = useState('1h')
   const [amount, setAmount] = useState('')
+  const [limitPrice, setLimitPrice] = useState('')
   const [toast, setToast] = useState<Toast>(null)
-  const [tab, setTab] = useState<'trades' | 'signals' | 'analyze' | 'train' | 'settings'>('trades')
+  const [tab, setTab] = useState<'trades' | 'signals' | 'analyze' | 'train' | 'backtest' | 'settings'>('trades')
 
   const showToast = useCallback((kind: 'ok' | 'error', text: string) => {
     setToast({ kind, text })
@@ -50,7 +51,12 @@ export default function App() {
   const { connected } = useSocket({
     onStatus: setStatus,
     onEvent: (m) => {
-      if (m.event === 'trade_opened' || m.event === 'trade_closed') {
+      if (
+        m.event === 'trade_opened' ||
+        m.event === 'trade_closed' ||
+        m.event === 'order_pending' ||
+        m.event === 'order_canceled'
+      ) {
         refreshTrades()
       }
       if (m.event === 'signal') {
@@ -84,7 +90,10 @@ export default function App() {
     }
   }, [symbol, timeframe])
 
-  const openTrades = useMemo(() => trades.filter((t) => t.status === 'open'), [trades])
+  const openTrades = useMemo(
+    () => trades.filter((t) => t.status === 'open' || t.status === 'pending'),
+    [trades],
+  )
 
   const doOrder = async (action: 'buy' | 'sell') => {
     try {
@@ -92,6 +101,7 @@ export default function App() {
         action,
         symbol,
         amount: amount ? Number(amount) : undefined,
+        limit_price: limitPrice ? Number(limitPrice) : undefined,
       })
       showToast(res.accepted ? 'ok' : 'error', res.message)
       refreshTrades()
@@ -201,6 +211,16 @@ export default function App() {
                     inputMode="decimal"
                   />
                 </div>
+                <div className="field">
+                  <label>Limit price (blank = market)</label>
+                  <input
+                    className="input"
+                    placeholder="market"
+                    value={limitPrice}
+                    onChange={(e) => setLimitPrice(e.target.value)}
+                    inputMode="decimal"
+                  />
+                </div>
                 <button className="btn buy" onClick={() => doOrder('buy')}>
                   Buy
                 </button>
@@ -210,6 +230,8 @@ export default function App() {
               </div>
               <p className="hint" style={{ marginTop: 10 }}>
                 Orders respect your risk settings. In <b>paper</b> mode nothing hits the exchange.
+                Set a <b>limit price</b> to rest the order until the market reaches it (a buy fills
+                at or below it, a sell at or above it); leave it blank for an immediate market order.
               </p>
             </div>
           </section>
@@ -244,6 +266,12 @@ export default function App() {
                   Train
                 </span>
                 <span
+                  className={`tab ${tab === 'backtest' ? 'active' : ''}`}
+                  onClick={() => setTab('backtest')}
+                >
+                  Backtest
+                </span>
+                <span
                   className={`tab ${tab === 'settings' ? 'active' : ''}`}
                   onClick={() => setTab('settings')}
                 >
@@ -270,6 +298,9 @@ export default function App() {
               )}
               {tab === 'train' && (
                 <TrainPanel symbol={symbol} timeframe={timeframe} onError={(m) => showToast('error', m)} />
+              )}
+              {tab === 'backtest' && (
+                <BacktestPanel symbol={symbol} timeframe={timeframe} onError={(m) => showToast('error', m)} />
               )}
               {tab === 'settings' && (
                 <SettingsPanel
@@ -351,7 +382,11 @@ function TradesTable({
             <td>
               <span className={`tag ${t.side}`}>{t.side}</span>
             </td>
-            <td className="mono">{fmt(t.entry_price)}</td>
+            <td className="mono">
+              {t.status === 'pending' && t.limit_price
+                ? `${fmt(t.limit_price)} (limit)`
+                : fmt(t.entry_price)}
+            </td>
             <td className={`mono ${pnlClass(t.pnl)}`}>{fmt(t.pnl)}</td>
             <td>
               <span className={`tag ${t.status}`}>{t.status}</span>
@@ -359,7 +394,7 @@ function TradesTable({
             <td>
               {openIds.has(t.id) && (
                 <button className="btn" onClick={() => onClose(t.id)}>
-                  Close
+                  {t.status === 'pending' ? 'Cancel' : 'Close'}
                 </button>
               )}
             </td>
@@ -512,6 +547,166 @@ function AnalyzePanel({
         {answer && <p className="hint" style={{ marginTop: 8 }}>{answer}</p>}
       </div>
     </div>
+  )
+}
+
+function BacktestPanel({
+  symbol,
+  timeframe,
+  onError,
+}: {
+  symbol: string
+  timeframe: string
+  onError: (msg: string) => void
+}) {
+  const [strategies, setStrategies] = useState<StrategyInfo[]>([])
+  const [strategy, setStrategy] = useState('ma_cross')
+  const [feePct, setFeePct] = useState('0.1')
+  const [slippagePct, setSlippagePct] = useState('0.05')
+  const [result, setResult] = useState<BacktestResult | null>(null)
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    api
+      .strategies()
+      .then((s) => {
+        setStrategies(s)
+        if (s.length) setStrategy(s[0].name)
+      })
+      .catch(() => {})
+  }, [])
+
+  const run = async () => {
+    setBusy(true)
+    setResult(null)
+    try {
+      setResult(
+        await api.backtest(
+          symbol,
+          strategy,
+          timeframe,
+          feePct === '' ? undefined : Number(feePct),
+          slippagePct === '' ? undefined : Number(slippagePct),
+        ),
+      )
+    } catch (e) {
+      onError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <p className="hint">
+        Replay a strategy over real <b>{symbol}</b> <b>{timeframe}</b> candles. Fills happen at the
+        next bar's open (no look-ahead), with fees and slippage applied against you, so results are
+        conservative rather than optimistic.
+      </p>
+      <div className="row">
+        <div className="field">
+          <label>Strategy</label>
+          <select className="select" value={strategy} onChange={(e) => setStrategy(e.target.value)}>
+            {strategies.map((s) => (
+              <option key={s.name} value={s.name}>
+                {s.name}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="field">
+          <label>Fee % per side</label>
+          <input
+            className="input"
+            value={feePct}
+            onChange={(e) => setFeePct(e.target.value)}
+            inputMode="decimal"
+          />
+        </div>
+        <div className="field">
+          <label>Slippage %</label>
+          <input
+            className="input"
+            value={slippagePct}
+            onChange={(e) => setSlippagePct(e.target.value)}
+            inputMode="decimal"
+          />
+        </div>
+        <button className="btn primary" onClick={run} disabled={busy}>
+          {busy ? 'Running…' : 'Run backtest'}
+        </button>
+      </div>
+
+      {result && (
+        <div>
+          <div className="stats" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
+            <div className="stat">
+              <div className="label">Return</div>
+              <div className={`value ${result.total_return_pct >= 0 ? 'pos' : 'neg'}`}>
+                {fmt(result.total_return_pct)}%
+              </div>
+            </div>
+            <div className="stat">
+              <div className="label">End balance</div>
+              <div className="value">{fmt(result.ending_balance)}</div>
+            </div>
+            <div className="stat">
+              <div className="label">Trades</div>
+              <div className="value">{result.num_trades}</div>
+            </div>
+            <div className="stat">
+              <div className="label">Win rate</div>
+              <div className="value">{fmt(result.win_rate_pct)}%</div>
+            </div>
+            <div className="stat">
+              <div className="label">Max drawdown</div>
+              <div className="value neg">{fmt(result.max_drawdown_pct)}%</div>
+            </div>
+            <div className="stat">
+              <div className="label">Fees paid</div>
+              <div className="value">{fmt(result.total_fees ?? 0)}</div>
+            </div>
+          </div>
+          {result.equity_curve.length > 1 && (
+            <div style={{ marginTop: 12 }}>
+              <EquitySparkline values={result.equity_curve} />
+            </div>
+          )}
+          {result.num_trades === 0 && (
+            <div className="empty">
+              This strategy generated no trades on this data. Try another symbol, timeframe, or
+              strategy.
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function EquitySparkline({ values }: { values: number[] }) {
+  const w = 600
+  const h = 120
+  const min = Math.min(...values)
+  const max = Math.max(...values)
+  const range = max - min || 1
+  const pts = values
+    .map((v, i) => {
+      const x = (i / (values.length - 1)) * w
+      const y = h - ((v - min) / range) * h
+      return `${x.toFixed(1)},${y.toFixed(1)}`
+    })
+    .join(' ')
+  const up = values[values.length - 1] >= values[0]
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} width="100%" height={h} preserveAspectRatio="none">
+      <polyline
+        points={pts}
+        fill="none"
+        stroke={up ? 'var(--green, #16a34a)' : 'var(--red, #dc2626)'}
+        strokeWidth={2}
+      />
+    </svg>
   )
 }
 

@@ -20,9 +20,15 @@ class OrderSide(str, Enum):
 
 
 class TradeStatus(str, Enum):
+    pending = "pending"  # limit order resting on the book, not yet filled
     open = "open"
     closed = "closed"
     canceled = "canceled"
+
+
+class OrderType(str, Enum):
+    market = "market"
+    limit = "limit"
 
 
 class Trade(Base):
@@ -40,6 +46,8 @@ class Trade(Base):
     take_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(12), default=TradeStatus.open.value, index=True)
     pnl: Mapped[float] = mapped_column(Float, default=0.0)
+    order_type: Mapped[str] = mapped_column(String(8), default="market")
+    limit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     mode: Mapped[str] = mapped_column(String(8), default="paper")
     source: Mapped[str] = mapped_column(String(24), default="manual")
     exchange_order_id: Mapped[str | None] = mapped_column(String(64), nullable=True)

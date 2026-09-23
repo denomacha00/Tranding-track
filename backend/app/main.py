@@ -178,6 +178,7 @@ async def tradingview_webhook(request: Request, db: Session = Depends(get_db)):
         take_profit=signal.take_profit,
         source="tradingview",
         note=signal.note,
+        limit_price=signal.limit_price,
     )
     _log_signal(db, "tradingview", signal.symbol, signal.action, raw, accepted, message)
     await broadcaster.broadcast(
@@ -221,6 +222,7 @@ async def manual_order(
         take_profit=order.take_profit,
         source="manual",
         note="manual order",
+        limit_price=order.limit_price,
     )
     await broadcaster.broadcast(
         {"event": "signal", "data": {"source": "manual", "action": order.action,
@@ -241,7 +243,10 @@ async def close_trade(
 ):
     engine = get_engine()
     trade = db.get(Trade, trade_id)
-    if not trade or trade.status != TradeStatus.open.value:
+    if not trade or trade.status not in (
+        TradeStatus.open.value,
+        TradeStatus.pending.value,
+    ):
         raise HTTPException(status_code=404, detail="Open trade not found")
     accepted, message, updated = await asyncio.to_thread(
         engine.execute_signal,

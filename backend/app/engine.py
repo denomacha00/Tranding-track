@@ -78,12 +78,16 @@ class TradingEngine:
         self._reconcile_live_positions(db)
 
     def _reconcile_live_positions(self, db: Session) -> None:
-        """On startup in live mode, warn if the DB and exchange disagree.
+        """On startup in live mode, heal DB/exchange disagreements.
 
         SL/TP monitoring trusts the DB as the source of truth. If the bot was
-        down while a position changed on the exchange (manual trade, liquidation),
-        the two can diverge. We can't safely auto-close, but we surface it so the
-        operator can act instead of the bot silently managing a stale position.
+        down while a position changed on the exchange (manual trade, liquidation,
+        a stop that fired), the two can diverge and the bot would otherwise keep
+        managing a position that no longer exists. We take the EXCHANGE as ground
+        truth and auto-heal: when the exchange no longer holds enough of the base
+        asset to back an open long, we mark that DB trade closed (at the last
+        known price) so the bot stops acting on a stale position. Every heal is
+        logged and broadcast so the operator can see what happened.
         """
         if not self.settings.is_live or not self.connector.has_credentials:
             return
@@ -103,15 +107,51 @@ class TradingEngine:
             base = t.symbol.split("/")[0]
             held = base_balances.get(base, 0.0)
             if t.side == "buy" and held + 1e-9 < t.amount:
+                # Exchange holds less than our DB long expects. If essentially
+                # nothing is held, the position is gone — auto-close the record.
                 logger.warning(
                     "Reconciliation: DB shows open long %s %s but exchange holds "
-                    "only %s — position may have changed while the bot was down.",
+                    "only %s — position changed while the bot was down; healing.",
                     t.amount, t.symbol, held,
                 )
-                self._emit(
-                    "reconcile_warning",
-                    {"symbol": t.symbol, "db_amount": t.amount, "exchange_amount": held},
-                )
+                if held <= max(t.amount * 0.01, 1e-8):
+                    # Cancel any orphaned protective stop, then close the record.
+                    if t.stop_order_id:
+                        self.connector.cancel_order(t.stop_order_id, t.symbol)
+                        t.stop_order_id = None
+                    price = self._price(t.symbol, fallback=t.entry_price)
+                    t.exit_price = price
+                    t.pnl = self._realized_pnl(t, price)
+                    t.status = TradeStatus.closed.value
+                    t.closed_at = _utcnow()
+                    t.note = (t.note + " | " if t.note else "") + (
+                        "auto-reconciled: exchange no longer holds this position"
+                    )
+                    db.commit()
+                    self._emit(
+                        "reconcile_closed",
+                        {"symbol": t.symbol, "db_amount": t.amount,
+                         "exchange_amount": held, "pnl": t.pnl},
+                    )
+                    self.notifier.send(
+                        f"\u2699\ufe0f Reconciled {t.symbol}: exchange no longer holds it; "
+                        f"closed stale record (PnL {t.pnl:.2f})."
+                    )
+                else:
+                    # Partial mismatch: shrink the DB amount to what's actually
+                    # held rather than closing, and warn.
+                    old = t.amount
+                    t.amount = held
+                    db.commit()
+                    self._emit(
+                        "reconcile_adjusted",
+                        {"symbol": t.symbol, "db_amount": old,
+                         "exchange_amount": held},
+                    )
+                    self.notifier.send(
+                        f"\u2699\ufe0f Reconciled {t.symbol}: adjusted tracked amount "
+                        f"{old} → {held} to match the exchange."
+                    )
 
     def persist_settings(self, db: Session, overrides: dict[str, Any]) -> None:
         """Merge and persist settings overrides so they survive restarts."""
@@ -154,8 +194,12 @@ class TradingEngine:
         return self.paper_balance
 
     def _open_trade_for_symbol(self, db: Session, symbol: str) -> Optional[Trade]:
+        # A resting (pending) limit order also occupies the symbol slot.
         stmt = select(Trade).where(
-            Trade.symbol == symbol, Trade.status == TradeStatus.open.value
+            Trade.symbol == symbol,
+            Trade.status.in_(
+                [TradeStatus.open.value, TradeStatus.pending.value]
+            ),
         )
         return db.scalars(stmt).first()
 
@@ -172,6 +216,7 @@ class TradingEngine:
         take_profit: float | None,
         source: str,
         note: str | None = None,
+        limit_price: float | None = None,
     ) -> tuple[bool, str, Optional[Trade]]:
         """Execute a buy/sell/close signal. Returns (accepted, message, trade)."""
         symbol = symbol.upper().strip()
@@ -186,22 +231,36 @@ class TradingEngine:
             if action == "close":
                 if not existing:
                     return False, f"No open position for {symbol} to close", None
+                if existing.status == TradeStatus.pending.value:
+                    return self._cancel_pending(db, existing, note or "close signal")
                 return self._close_trade(db, existing, note or "close signal")
 
             # A sell with an open long closes it; a buy with an open short closes it.
             if existing and existing.side != action:
+                if existing.status == TradeStatus.pending.value:
+                    return self._cancel_pending(
+                        db, existing, note or f"{action} signal cancelled resting order"
+                    )
                 return self._close_trade(db, existing, note or f"{action} signal closed position")
 
             if existing and existing.side == action:
-                return False, f"Already in a {action} position for {symbol}", None
+                state = (
+                    "resting limit"
+                    if existing.status == TradeStatus.pending.value
+                    else action
+                )
+                return False, f"Already in a {state} position for {symbol}", None
 
             # ---- OPEN a new position ---------------------------------
             price = self._price(symbol)
+            # For a limit order, size and validate against the LIMIT price (the
+            # intended fill), not the current market price.
+            ref_price = limit_price if limit_price else price
             equity = self._equity(db)
             decision = self.risk.check(
                 db,
                 equity=equity,
-                price=price,
+                price=ref_price,
                 requested_amount=amount,
                 is_opening=True,
             )
@@ -210,6 +269,62 @@ class TradingEngine:
 
             qty = decision.amount
             exchange_order_id: str | None = None
+
+            # ---- LIMIT order: rest it, fill later when price crosses ----
+            if limit_price:
+                if self.settings.is_live:
+                    adj_qty, err = self.connector.normalize_amount(
+                        symbol, qty, limit_price
+                    )
+                    if err:
+                        return False, f"Rejected: {err}", None
+                    qty = adj_qty
+                    try:
+                        order = self.connector.create_limit_order(
+                            symbol, action, qty, limit_price
+                        )
+                        exchange_order_id = str(order.get("id")) if order else None
+                    except Exception as exc:
+                        return False, f"Exchange limit order failed: {exc}", None
+                else:
+                    # Paper: reserve notional now so equity/exposure is honest
+                    # while the order rests; released if cancelled, consumed on fill.
+                    self.paper_balance -= qty * limit_price
+                    save_paper_balance(db, self.paper_balance)
+
+                trade = Trade(
+                    symbol=symbol,
+                    side=action,
+                    amount=qty,
+                    entry_price=limit_price,
+                    status=TradeStatus.pending.value,
+                    order_type="limit",
+                    limit_price=limit_price,
+                    stop_loss=stop_loss,
+                    take_profit=take_profit,
+                    mode=self.settings.trading_mode,
+                    source=source,
+                    exchange_order_id=exchange_order_id,
+                    note=note,
+                    opened_at=_utcnow(),
+                )
+                db.add(trade)
+                db.commit()
+                db.refresh(trade)
+                self._emit(
+                    "order_pending",
+                    {"id": trade.id, "symbol": symbol, "side": action,
+                     "limit_price": limit_price},
+                )
+                self.notifier.send(
+                    f"\U0001F4DD Limit {action.upper()} {qty:.8f} {symbol} resting @ "
+                    f"{limit_price:.2f} ({self.settings.trading_mode})"
+                )
+                return (
+                    True,
+                    f"Limit {action} {qty:.8f} {symbol} resting @ {limit_price:.2f}",
+                    trade,
+                )
 
             if self.settings.is_live:
                 adj_qty, err = self.connector.normalize_amount(symbol, qty, price)
@@ -274,6 +389,106 @@ class TradingEngine:
     def _auto_take(self, price: float, side: str) -> float:
         pct = self.settings.default_take_profit_pct / 100.0
         return price * (1 + pct) if side == "buy" else price * (1 - pct)
+
+    # ---- resting limit orders ---------------------------------------
+
+    def _cancel_pending(
+        self, db: Session, trade: Trade, reason: str
+    ) -> tuple[bool, str, Optional[Trade]]:
+        """Cancel a resting (pending) limit order. Caller holds the lock.
+
+        Releases the paper reservation and cancels the live exchange order.
+        """
+        if self.settings.is_live and trade.exchange_order_id:
+            self.connector.cancel_order(trade.exchange_order_id, trade.symbol)
+        else:
+            # Paper: give back the notional we reserved when the order was placed.
+            self.paper_balance += trade.amount * (trade.limit_price or trade.entry_price)
+            save_paper_balance(db, self.paper_balance)
+
+        trade.status = TradeStatus.canceled.value
+        trade.closed_at = _utcnow()
+        trade.note = (trade.note + " | " if trade.note else "") + reason
+        db.commit()
+        db.refresh(trade)
+        self._emit(
+            "order_canceled", {"id": trade.id, "symbol": trade.symbol}
+        )
+        return True, f"Cancelled resting {trade.side} {trade.symbol}", trade
+
+    def _fill_pending(self, db: Session, trade: Trade, fill_price: float) -> None:
+        """Promote a resting limit order to an open position once it fills.
+
+        Caller holds the lock. Paper notional was already reserved at placement,
+        so no wallet change happens here. Sets auto SL/TP if none were provided
+        and (live) places the protective exchange stop.
+        """
+        trade.entry_price = fill_price
+        trade.status = TradeStatus.open.value
+        if trade.stop_loss is None:
+            trade.stop_loss = self._auto_stop(fill_price, trade.side)
+        if trade.take_profit is None:
+            trade.take_profit = self._auto_take(fill_price, trade.side)
+        if self.settings.is_live and trade.stop_loss and trade.side == "buy":
+            stop_order = self.connector.create_stop_loss_order(
+                trade.symbol, "sell", trade.amount, trade.stop_loss
+            )
+            if stop_order:
+                trade.stop_order_id = str(stop_order.get("id"))
+        trade.opened_at = _utcnow()
+        db.commit()
+        db.refresh(trade)
+        self._emit(
+            "trade_opened",
+            {"id": trade.id, "symbol": trade.symbol, "side": trade.side},
+        )
+        self.notifier.send(
+            f"\U0001F4C8 Limit filled <b>{trade.side.upper()}</b> {trade.amount:.8f} "
+            f"{trade.symbol} @ {fill_price:.2f} ({self.settings.trading_mode})"
+        )
+
+    def check_pending_orders(self, db: Session) -> list[Trade]:
+        """Fill resting limit orders whose price has been reached. Returns filled.
+
+        Paper: a buy fills when market <= limit, a sell fills when market >= limit.
+        Live: we trust the exchange — poll the order and fill when it reports
+        closed/filled, using the exchange's average fill price.
+        """
+        filled: list[Trade] = []
+        stmt = select(Trade).where(Trade.status == TradeStatus.pending.value)
+        for trade in list(db.scalars(stmt).all()):
+            limit = trade.limit_price or trade.entry_price
+            if self.settings.is_live:
+                order = self.connector.fetch_order(
+                    trade.exchange_order_id or "", trade.symbol
+                )
+                if not order:
+                    continue
+                status = (order.get("status") or "").lower()
+                if status in {"canceled", "cancelled", "rejected", "expired"}:
+                    with self._lock:
+                        self._cancel_pending(db, trade, f"exchange {status}")
+                    continue
+                if status not in {"closed", "filled"} and not order.get("filled"):
+                    continue
+                fill_price = float(
+                    order.get("average") or order.get("price") or limit
+                )
+            else:
+                try:
+                    price = self._price(trade.symbol, fallback=limit)
+                except Exception:
+                    continue
+                crossed = (
+                    price <= limit if trade.side == "buy" else price >= limit
+                )
+                if not crossed:
+                    continue
+                fill_price = limit  # paper fills at the limit price
+            with self._lock:
+                self._fill_pending(db, trade, fill_price)
+            filled.append(trade)
+        return filled
 
     def _close_trade(
         self, db: Session, trade: Trade, reason: str

@@ -327,6 +327,16 @@ th.mono {
   color: var(--muted);
 }
 
+.tag.pending {
+  background: rgba(240, 185, 11, 0.15);
+  color: var(--accent);
+}
+
+.tag.canceled {
+  background: rgba(139, 152, 169, 0.12);
+  color: var(--muted);
+}
+
 .empty {
   color: var(--muted);
   text-align: center;
