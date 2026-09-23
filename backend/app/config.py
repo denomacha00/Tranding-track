@@ -52,6 +52,11 @@ class Settings(BaseSettings):
     auto_trade_enabled: bool = Field(default=False)
     auto_symbols: str = Field(default="BTC/USDT")
     auto_timeframe: str = Field(default="1h")
+    # Multi-timeframe confirmation for autonomous trading. When set to a higher
+    # timeframe (e.g. "4h"), a buy is only taken if that higher timeframe does
+    # NOT read as a sell, and a confident-sell exit is only taken if the higher
+    # timeframe is not a buy. Empty = single-timeframe (disabled).
+    auto_confirm_timeframe: str = Field(default="")
 
     # Paper trading
     paper_starting_balance: float = Field(default=10_000.0)

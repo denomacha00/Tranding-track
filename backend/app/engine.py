@@ -417,6 +417,17 @@ class TradingEngine:
             return False, f"{symbol}: hold ({analysis.confidence:.0%})"
 
         existing = None
+        # Multi-timeframe confirmation: refuse to act against a higher timeframe.
+        _confirm_tf = (self.settings.auto_confirm_timeframe or "").strip()
+        if _confirm_tf and _confirm_tf != timeframe:
+            try:
+                _higher = self.analyze_symbol(symbol, _confirm_tf)
+            except Exception as exc:
+                return False, f"{symbol}: confirm timeframe {_confirm_tf} failed: {exc}"
+            if analysis.verdict == "buy" and _higher.verdict == "sell":
+                return False, f"{symbol}: buy blocked - {_confirm_tf} reads sell ({_higher.confidence:.0%})"
+            if analysis.verdict == "sell" and _higher.verdict == "buy":
+                return False, f"{symbol}: exit blocked - {_confirm_tf} reads buy ({_higher.confidence:.0%})"
         with self._lock:
             existing = self._open_trade_for_symbol(db, symbol.upper())
 

@@ -317,6 +317,7 @@ def get_settings_endpoint():
         auto_trade_enabled=s.auto_trade_enabled,
         auto_symbols=s.auto_symbols,
         auto_timeframe=s.auto_timeframe,
+        auto_confirm_timeframe=s.auto_confirm_timeframe,
         ai_enabled=bool(s.ai_api_key),
         notifications_enabled=engine.notifier.enabled,
         api_key_set=bool(s.api_key),

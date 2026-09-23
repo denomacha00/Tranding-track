@@ -56,6 +56,7 @@ export interface Settings {
   auto_trade_enabled: boolean
   auto_symbols: string
   auto_timeframe: string
+  auto_confirm_timeframe: string
   ai_enabled: boolean
   notifications_enabled: boolean
   api_key_set: boolean

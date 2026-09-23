@@ -108,6 +108,7 @@ class SettingsOut(BaseModel):
     auto_trade_enabled: bool
     auto_symbols: str
     auto_timeframe: str
+    auto_confirm_timeframe: str
     ai_enabled: bool
     notifications_enabled: bool
     api_key_set: bool
@@ -126,5 +127,6 @@ class SettingsUpdate(BaseModel):
     auto_trade_enabled: Optional[bool] = None
     auto_symbols: Optional[str] = None
     auto_timeframe: Optional[str] = None
+    auto_confirm_timeframe: Optional[str] = None
     trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=100)
     max_total_exposure_pct: Optional[float] = Field(default=None, ge=0, le=1000)

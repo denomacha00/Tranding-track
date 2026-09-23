@@ -672,6 +672,7 @@ function SettingsPanel({
         auto_trade_enabled: form.auto_trade_enabled,
         auto_symbols: form.auto_symbols,
         auto_timeframe: form.auto_timeframe,
+        auto_confirm_timeframe: form.auto_confirm_timeframe,
       })
       onSaved(saved)
     } catch (e) {
@@ -804,6 +805,15 @@ function SettingsPanel({
             value={form.auto_timeframe}
             onChange={(e) => setForm({ ...form, auto_timeframe: e.target.value })}
             placeholder="1h"
+          />
+        </div>
+        <div className="field">
+          <label>Confirm timeframe (higher; blank = off)</label>
+          <input
+            className="input"
+            value={form.auto_confirm_timeframe}
+            onChange={(e) => setForm({ ...form, auto_confirm_timeframe: e.target.value })}
+            placeholder="4h"
           />
         </div>
         <div className="field">
