@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import hmac
 import logging
 from contextlib import asynccontextmanager
 
@@ -75,7 +76,7 @@ def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
     configured = get_engine().settings.api_key
     if not configured:
         return
-    if x_api_key != configured:
+    if not x_api_key or not hmac.compare_digest(x_api_key, configured):
         raise HTTPException(status_code=401, detail="Invalid or missing API key")
 
 
@@ -163,7 +164,7 @@ async def tradingview_webhook(request: Request, db: Session = Depends(get_db)):
         _log_signal(db, "tradingview", None, None, raw, False, f"parse error: {exc}")
         raise HTTPException(status_code=400, detail=f"Invalid signal payload: {exc}")
 
-    if signal.secret != engine.settings.tradingview_webhook_secret:
+    if not hmac.compare_digest(signal.secret, engine.settings.tradingview_webhook_secret):
         _log_signal(db, "tradingview", signal.symbol, signal.action, raw, False, "bad secret")
         raise HTTPException(status_code=401, detail="Invalid webhook secret")
 
