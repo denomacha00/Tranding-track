@@ -1,0 +1,7 @@
+# Backend build artifacts / local DB
+.venv/
+__pycache__/
+*.pyc
+tests/
+*.db
+.env

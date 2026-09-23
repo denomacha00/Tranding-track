@@ -1,0 +1,27 @@
+# Tranding-track full stack. Copy backend/.env with your keys before running.
+#   docker compose up -d --build
+# Dashboard: http://localhost:8080   API: http://localhost:8000
+services:
+  backend:
+    build: ./backend
+    env_file:
+      - ./backend/.env
+    environment:
+      # Allow the dashboard origin through CORS (nginx serves it on :8080).
+      CORS_ORIGINS: "http://localhost:8080"
+    volumes:
+      - tt_data:/data
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+
+volumes:
+  tt_data:
