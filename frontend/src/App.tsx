@@ -1184,6 +1184,26 @@ function SettingsPanel({
           <code className="inline">{webhookUrl}</code>
           <p className="hint" style={{ marginTop: 10 }}>Alert message (JSON) — no secret needed, the URL token authenticates you:</p>
           <pre className="code">{alertExample}</pre>
+          <details className="help" style={{ marginTop: 10 }}>
+            <summary>How do I connect TradingView?</summary>
+            <div className="help-body">
+              <p className="hint">
+                TradingView has <b>no API key to paste</b> — the webhook URL above is
+                your credential. TradingView just sends alerts to that URL; your bot
+                holds the Binance keys and does the actual trading.
+              </p>
+              <ol className="hint">
+                <li>Create a free account at{' '}
+                  <a href="https://www.tradingview.com/" target="_blank" rel="noreferrer">tradingview.com</a>{' '}
+                  (webhook alerts need a paid plan — Essential or higher).</li>
+                <li>Open a chart, click the <b>alarm clock (Alerts)</b> icon → <b>Create Alert</b>.</li>
+                <li>Set your condition (e.g. a strategy or indicator crossover).</li>
+                <li>Under <b>Notifications</b>, tick <b>Webhook URL</b> and paste the URL above.</li>
+                <li>In the alert's <b>Message</b> box, paste the JSON shown above (edit side/symbol as needed).</li>
+                <li>Save. When the alert fires, TradingView calls your bot and it places the order on Binance.</li>
+              </ol>
+            </div>
+          </details>
         </div>
       </div>
     </div>
@@ -1248,6 +1268,32 @@ function CredentialsCard({
             {me.ai_key_set ? '✅ set' : 'not set'}.
           </p>
         )}
+        <details className="help">
+          <summary>How do I get my Binance API key?</summary>
+          <div className="help-body">
+            <p className="hint">
+              <b>Live trading (real funds):</b>
+            </p>
+            <ol className="hint">
+              <li>Log in at binance.com → profile menu → <b>API Management</b>.</li>
+              <li>Click <b>Create API</b> → <b>System generated</b>, name it e.g. "trading-bot", pass 2FA.</li>
+              <li>Copy the <b>API Key</b> and <b>Secret Key</b> — the secret is shown only once.</li>
+              <li>In the key's permissions, turn ON <b>Enable Spot &amp; Margin Trading</b>. Leave <b>Enable Withdrawals</b> OFF.</li>
+              <li>Paste both below and save.</li>
+            </ol>
+            <p className="hint">
+              <b>Testnet (fake money, no risk):</b> go to testnet.binance.vision, log in
+              with GitHub, <b>Generate HMAC_SHA256 Key</b> with <b>Spot enabled</b>, then
+              tick "Use Binance testnet" below. (A testnet key without Spot permission
+              causes a -2015 error.)
+            </p>
+            <p className="hint" style={{ color: 'var(--red)' }}>
+              ⚠️ Only ever create <b>trade-only</b> keys (withdrawals disabled), and never
+              share your Secret with anyone. Your keys are encrypted and tied to your
+              account only — no other user can see or use them.
+            </p>
+          </div>
+        </details>
         <div className="row">
           <div className="field">
             <label>Binance API key</label>

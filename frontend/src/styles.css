@@ -17,6 +17,25 @@
   box-sizing: border-box;
 }
 
+.help {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel-2);
+  padding: 8px 12px;
+}
+.help > summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-weight: 600;
+}
+.help .help-body {
+  margin-top: 8px;
+}
+.help ol {
+  margin: 6px 0 6px 18px;
+  padding: 0;
+}
+
 html,
 body,
 #root {
