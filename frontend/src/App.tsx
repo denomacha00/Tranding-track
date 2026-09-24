@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { api } from './api'
 import { PriceChart } from './PriceChart'
 import { useSocket } from './useSocket'
-import type { BotStatus, BacktestResult, Candle, MarketAnalysis, Settings, SignalRow, StrategyInfo, Trade, TrainingReport } from './types'
+import type { BotStatus, BacktestResult, Candle, ExchangeAccess, MarketAnalysis, Settings, SignalRow, StrategyInfo, Trade, TrainingReport } from './types'
 
 const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
@@ -26,6 +26,7 @@ export default function App() {
   const [limitPrice, setLimitPrice] = useState('')
   const [toast, setToast] = useState<Toast>(null)
   const [tab, setTab] = useState<'trades' | 'signals' | 'analyze' | 'train' | 'backtest' | 'settings'>('trades')
+  const [access, setAccess] = useState<ExchangeAccess | null>(null)
 
   const showToast = useCallback((kind: 'ok' | 'error', text: string) => {
     setToast({ kind, text })
@@ -70,6 +71,7 @@ export default function App() {
   useEffect(() => {
     api.status().then(setStatus).catch(() => {})
     api.settings().then(setSettings).catch(() => {})
+    api.exchangeAccess().then(setAccess).catch(() => {})
     refreshTrades()
     refreshSignals()
   }, [refreshTrades, refreshSignals])
@@ -157,6 +159,16 @@ export default function App() {
           {status?.running ? 'Stop bot' : 'Start bot'}
         </button>
       </header>
+
+      {access && status?.trading_mode === 'live' && !access.ok && (
+        <div className="alert-banner">
+          <span className="alert-icon">⚠️</span>
+          <div>
+            <b>Live trading is not ready.</b> {access.detail}
+            {' '}Orders will be rejected until the exchange key can trade. Paper mode is unaffected.
+          </div>
+        </div>
+      )}
 
       <div className="body">
         <div className="col">
@@ -305,6 +317,7 @@ export default function App() {
               {tab === 'settings' && (
                 <SettingsPanel
                   settings={settings}
+                  access={access}
                   onSaved={(s) => {
                     setSettings(s)
                     showToast('ok', 'Settings saved')
@@ -865,10 +878,12 @@ function TrainPanel({
 
 function SettingsPanel({
   settings,
+  access,
   onSaved,
   onError,
 }: {
   settings: Settings | null
+  access: ExchangeAccess | null
   onSaved: (s: Settings) => void
   onError: (msg: string) => void
 }) {
@@ -927,6 +942,21 @@ function SettingsPanel({
           ⚠️ Live mode places REAL orders on Binance. Make sure your API keys are set in the
           backend .env and you have tested on testnet first.
         </p>
+      )}
+
+      {access && (
+        <div className={`access-card ${access.ok ? 'ok' : 'bad'}`}>
+          <div className="access-head">
+            {access.ok ? '✅ Exchange ready to trade' : '⚠️ Exchange cannot trade yet'}
+            {access.testnet ? ' (testnet)' : ' (live account)'}
+          </div>
+          <div className="access-rows">
+            <span>Public data: {access.can_read_public ? '✅' : '❌'}</span>
+            <span>Account read: {access.can_read_account ? '✅' : '❌'}</span>
+            <span>Trading: {access.can_trade ? '✅' : '❌'}</span>
+          </div>
+          <p className="hint" style={{ marginTop: 6 }}>{access.detail}</p>
+        </div>
       )}
 
       <div className="row">

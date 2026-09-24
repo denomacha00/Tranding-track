@@ -74,6 +74,15 @@ export interface ExecutionResult {
   trade: Trade | null
 }
 
+export interface ExchangeAccess {
+  ok: boolean
+  can_read_public: boolean
+  can_read_account: boolean
+  can_trade: boolean
+  testnet: boolean
+  detail: string
+}
+
 export interface Candle {
   time: number
   open: number

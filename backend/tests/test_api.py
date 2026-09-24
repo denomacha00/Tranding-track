@@ -46,6 +46,17 @@ def test_status_shape(client):
     assert "equity" in body and "open_positions" in body
 
 
+def test_exchange_access_shape(client):
+    r = client.get("/api/exchange/access")
+    assert r.status_code == 200
+    body = r.json()
+    for key in ("ok", "can_read_public", "can_read_account", "can_trade", "detail"):
+        assert key in body
+    # No credentials in the paper test env -> not tradable, with a helpful detail.
+    assert body["ok"] is False
+    assert isinstance(body["detail"], str) and body["detail"]
+
+
 def test_webhook_rejects_bad_secret(client):
     r = client.post(
         "/api/webhook/tradingview",

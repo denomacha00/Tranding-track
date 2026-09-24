@@ -109,6 +109,20 @@ async def lifespan(app: FastAPI):
         engine.restore_state(_db)
     finally:
         _db.close()
+    # In live mode, verify the key can actually trade (catches the common
+    # testnet -2015: key with no Spot permission / wrong site / IP-restricted).
+    if engine.settings.is_live:
+        try:
+            access = engine.connector.check_trading_access()
+            if access["ok"]:
+                logger.info("Exchange trading access OK: %s", access["detail"])
+            else:
+                logger.warning(
+                    "⚠️ LIVE MODE but exchange trading access is NOT ready: %s "
+                    "Orders will fail until this is fixed.", access["detail"],
+                )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("trading-access check failed: %s", exc)
     engine.running = True
     monitor_task = asyncio.create_task(monitor_loop(engine, broadcaster))
     logger.info("Tranding-track backend started (mode=%s, testnet=%s)",
@@ -290,6 +304,17 @@ def list_signals(limit: int = 50, db: Session = Depends(get_db)):
 @app.get("/api/status", response_model=BotStatus)
 def status(db: Session = Depends(get_db)):
     return get_engine().status(db)
+
+
+@app.get("/api/exchange/access")
+def exchange_access():
+    """Report whether the configured key can read the account and place orders.
+
+    Surfaces the common Binance -2015 failure (key without Spot trading
+    permission, created on the wrong site, or IP-restricted) so the operator can
+    fix it before relying on live orders. Never places an order.
+    """
+    return get_engine().connector.check_trading_access()
 
 
 @app.post("/api/bot/{state}")

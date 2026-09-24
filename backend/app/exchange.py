@@ -282,3 +282,90 @@ class BinanceConnector:
             self._client.cancel_order(order_id, symbol)
         except Exception as exc:
             logger.warning("cancel_order %s failed: %s", order_id, exc)
+
+    # ---- health / permissions ---------------------------------------
+
+    def check_trading_access(self) -> dict[str, Any]:
+        """Probe whether the configured key can actually TRADE, not just read.
+
+        Returns a dict: {ok, can_read_public, can_read_account, can_trade,
+        testnet, detail}. This makes the common -2015 failure (key with no Spot
+        trading permission, wrong site, or IP restriction) obvious at startup
+        instead of only when the first order silently fails.
+
+        It never places an order: it reads public data, then reads the private
+        account balance (which requires a valid, permissioned key). Trading
+        permission is inferred from the account's reported permissions when the
+        exchange exposes them, otherwise from a successful private read.
+        """
+        result: dict[str, Any] = {
+            "ok": False,
+            "can_read_public": False,
+            "can_read_account": False,
+            "can_trade": False,
+            "testnet": self._settings.binance_testnet,
+            "detail": "",
+        }
+        if not self._client:
+            result["detail"] = "exchange client not available"
+            return result
+        if not self.has_credentials:
+            result["detail"] = "no API credentials configured (paper mode is fine)"
+            return result
+        # 1) public read
+        try:
+            self._client.fetch_time()
+            result["can_read_public"] = True
+        except Exception as exc:
+            result["detail"] = f"public data unreachable: {exc}"
+            return result
+        # 2) private account read (this is what fails with -2015)
+        try:
+            balance = self._client.fetch_balance()
+            result["can_read_account"] = True
+        except Exception as exc:
+            msg = str(exc)
+            if "-2015" in msg or "Invalid API-key" in msg:
+                result["detail"] = (
+                    "account access denied (-2015): the key is invalid for this "
+                    "endpoint, lacks permission, or is IP-restricted. For testnet, "
+                    "create the key at testnet.binance.vision with Spot trading "
+                    "enabled and no/matching IP restriction."
+                )
+            else:
+                result["detail"] = f"account read failed: {msg}"
+            return result
+        # 3) infer trading permission from reported account permissions
+        perms = self._account_permissions(balance)
+        if perms is None:
+            # Exchange didn't expose permissions; a successful private read means
+            # the key works, so treat trading as available (best-effort).
+            result["can_trade"] = True
+            result["ok"] = True
+            result["detail"] = "account readable; trading permission not reported (assumed enabled)"
+            return result
+        if any(p.lower() in ("spot", "trd_grp_002", "trd_grp_003") or "spot" in p.lower() for p in perms):
+            result["can_trade"] = True
+            result["ok"] = True
+            result["detail"] = f"trading enabled (permissions: {', '.join(perms)})"
+        else:
+            result["detail"] = (
+                f"key can read the account but Spot trading is NOT enabled "
+                f"(permissions: {', '.join(perms) or 'none'}). Enable Spot trading "
+                f"on the API key to place orders."
+            )
+        return result
+
+    def _account_permissions(self, balance: dict[str, Any]) -> Optional[list[str]]:
+        """Best-effort extraction of the account's trading permissions."""
+        try:
+            info = (balance or {}).get("info", {}) or {}
+            perms = info.get("permissions")
+            if isinstance(perms, list) and perms:
+                return [str(p) for p in perms]
+            # Some responses expose canTrade instead of a permissions list.
+            if "canTrade" in info:
+                return ["spot"] if info.get("canTrade") else []
+        except Exception:
+            pass
+        return None

@@ -115,3 +115,81 @@ def test_retry_exhausts_and_raises():
 
     with pytest.raises(ccxt.RequestTimeout):
         _with_retry(always_fail, attempts=2, base_delay=0.0)
+
+
+# ---- trading-access self-check --------------------------------------
+
+
+def test_access_paper_no_credentials():
+    conn = BinanceConnector(Settings(binance_api_key="", binance_api_secret=""))
+    conn._client = FakeClient()
+    res = conn.check_trading_access()
+    assert res["ok"] is False
+    assert res["can_trade"] is False
+    assert "no API credentials" in res["detail"]
+
+
+def test_access_denied_2015_is_explained():
+    conn = _conn_with_creds()
+    conn._client.fetch_time = lambda: 123
+
+    def boom():
+        raise ccxt.AuthenticationError(
+            'binance {"code":-2015,"msg":"Invalid API-key, IP, or permissions for action."}'
+        )
+
+    conn._client.fetch_balance = boom
+    res = conn.check_trading_access()
+    assert res["can_read_public"] is True
+    assert res["can_read_account"] is False
+    assert res["can_trade"] is False
+    assert "-2015" in res["detail"]
+    assert "testnet.binance.vision" in res["detail"]
+
+
+def test_access_reads_account_but_spot_disabled():
+    conn = _conn_with_creds()
+    conn._client.fetch_time = lambda: 123
+    conn._client.fetch_balance = lambda: {"info": {"permissions": ["MARGIN"]}}
+    res = conn.check_trading_access()
+    assert res["can_read_account"] is True
+    assert res["can_trade"] is False
+    assert res["ok"] is False
+    assert "NOT enabled" in res["detail"]
+
+
+def test_access_ok_with_spot_permission():
+    conn = _conn_with_creds()
+    conn._client.fetch_time = lambda: 123
+    conn._client.fetch_balance = lambda: {"info": {"permissions": ["SPOT"]}}
+    res = conn.check_trading_access()
+    assert res["ok"] is True
+    assert res["can_trade"] is True
+
+
+def test_access_ok_when_permissions_not_reported():
+    conn = _conn_with_creds()
+    conn._client.fetch_time = lambda: 123
+    conn._client.fetch_balance = lambda: {"info": {}, "free": {"USDT": 100.0}}
+    res = conn.check_trading_access()
+    # Private read succeeded and no permission list exposed -> assume tradable.
+    assert res["ok"] is True
+    assert res["can_trade"] is True
+
+
+def test_access_cantrade_flag_true():
+    conn = _conn_with_creds()
+    conn._client.fetch_time = lambda: 123
+    conn._client.fetch_balance = lambda: {"info": {"canTrade": True}}
+    res = conn.check_trading_access()
+    assert res["can_trade"] is True
+    assert res["ok"] is True
+
+
+def test_access_cantrade_flag_false():
+    conn = _conn_with_creds()
+    conn._client.fetch_time = lambda: 123
+    conn._client.fetch_balance = lambda: {"info": {"canTrade": False}}
+    res = conn.check_trading_access()
+    assert res["can_trade"] is False
+    assert res["ok"] is False

@@ -3,6 +3,7 @@ import type {
   BacktestResult,
   BotStatus,
   Candle,
+  ExchangeAccess,
   ExecutionResult,
   MarketAnalysis,
   Settings,
@@ -83,4 +84,5 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ question, symbol, timeframe }),
     }),
+  exchangeAccess: () => req<ExchangeAccess>('/api/exchange/access'),
 }
