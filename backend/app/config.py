@@ -82,6 +82,24 @@ class Settings(BaseSettings):
     # before exposing the API on any network.
     api_key: str = Field(default="")
 
+    # ---- Multi-user auth & licensing --------------------------------
+    # Master secret used to (a) sign JWT access tokens and (b) derive the
+    # Fernet key that encrypts each user's Binance/AI API keys at rest. MUST be
+    # set in any real deployment. If empty, login still works but per-user key
+    # storage is disabled (fail-safe) because we refuse to store secrets we
+    # cannot encrypt.
+    secret_key: str = Field(default="")
+    # Access-token lifetime (minutes).
+    access_token_ttl_minutes: int = Field(default=60 * 24 * 7)
+    # The email that is auto-promoted to admin on signup/startup. The admin
+    # grants licenses to other users. If empty, the very first registered user
+    # becomes the admin.
+    admin_email: str = Field(default="")
+    # When true, new signups start with an ACTIVE license (open access). When
+    # false (default), new users are PENDING until the admin grants a license —
+    # this is the "users need a licence from me" gate.
+    auto_license_new_users: bool = Field(default=False)
+
     # Telegram notifications (optional). Set both to receive trade/alert pings.
     telegram_bot_token: str = Field(default="")
     telegram_chat_id: str = Field(default="")

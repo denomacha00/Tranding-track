@@ -19,17 +19,26 @@ class RiskDecision:
 
 
 class RiskManager:
-    def __init__(self, settings: Settings) -> None:
+    def __init__(self, settings: Settings, user_id: int | None = None) -> None:
         self.settings = settings
+        self.user_id = user_id
 
     def update(self, settings: Settings) -> None:
         self.settings = settings
 
+    def _scope(self, stmt):
+        """Restrict a Trade query to this engine's user (multi-tenant isolation)."""
+        if self.user_id is not None:
+            stmt = stmt.where(Trade.user_id == self.user_id)
+        return stmt
+
     def open_positions(self, db: Session) -> list[Trade]:
         # Pending limit orders count too: they reserve capital and a slot, so a
         # resting order must be included in position/exposure limits.
-        stmt = select(Trade).where(
-            Trade.status.in_([TradeStatus.open.value, TradeStatus.pending.value])
+        stmt = self._scope(
+            select(Trade).where(
+                Trade.status.in_([TradeStatus.open.value, TradeStatus.pending.value])
+            )
         )
         return list(db.scalars(stmt).all())
 
@@ -37,8 +46,10 @@ class RiskManager:
         start = dt.datetime.now(dt.timezone.utc).replace(
             hour=0, minute=0, second=0, microsecond=0
         )
-        stmt = select(Trade).where(
-            Trade.status == TradeStatus.closed.value, Trade.closed_at >= start
+        stmt = self._scope(
+            select(Trade).where(
+                Trade.status == TradeStatus.closed.value, Trade.closed_at >= start
+            )
         )
         return float(sum(t.pnl for t in db.scalars(stmt).all()))
 

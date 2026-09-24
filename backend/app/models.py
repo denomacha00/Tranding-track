@@ -31,12 +31,57 @@ class OrderType(str, Enum):
     limit = "limit"
 
 
+class UserRole(str, Enum):
+    admin = "admin"
+    user = "user"
+
+
+class LicenseStatus(str, Enum):
+    pending = "pending"    # signed up, waiting for the admin to grant a licence
+    active = "active"      # licensed — may configure keys and trade
+    revoked = "revoked"    # licence withdrawn by the admin
+
+
+class User(Base):
+    """A registered account. Each user brings their OWN exchange/AI keys.
+
+    Secrets (Binance + AI keys) are stored ENCRYPTED at rest (Fernet, key
+    derived from SECRET_KEY) — never in plaintext. Access to trading is gated by
+    ``license_status``: users are ``pending`` until the admin grants a licence.
+    """
+
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(255))
+    role: Mapped[str] = mapped_column(String(8), default=UserRole.user.value)
+    license_status: Mapped[str] = mapped_column(
+        String(12), default=LicenseStatus.pending.value, index=True
+    )
+    webhook_token: Mapped[str] = mapped_column(String(64), unique=True, index=True)
+    binance_api_key_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    binance_api_secret_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    binance_testnet: Mapped[bool] = mapped_column(Integer, default=1)
+    ai_api_key_enc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    ai_base_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    ai_model: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    ai_style: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    licensed_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class Trade(Base):
     """A single executed trade / position lifecycle record."""
 
     __tablename__ = "trades"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
     symbol: Mapped[str] = mapped_column(String(32), index=True)
     side: Mapped[str] = mapped_column(String(8))
     amount: Mapped[float] = mapped_column(Float)
@@ -63,6 +108,7 @@ class SignalLog(Base):
     __tablename__ = "signal_logs"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
     source: Mapped[str] = mapped_column(String(24), default="tradingview")
     symbol: Mapped[str | None] = mapped_column(String(32), nullable=True)
     action: Mapped[str | None] = mapped_column(String(16), nullable=True)

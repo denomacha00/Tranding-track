@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { api } from './api'
+import { api, setToken, getToken } from './api'
 import { PriceChart } from './PriceChart'
+import { Login, LicenseGate } from './Login'
+import { Admin } from './Admin'
 import { useSocket } from './useSocket'
-import type { BotStatus, BacktestResult, Candle, ExchangeAccess, MarketAnalysis, Settings, SignalRow, StrategyInfo, Trade, TrainingReport } from './types'
+import type { BotStatus, BacktestResult, Candle, ExchangeAccess, MarketAnalysis, Me, Settings, SignalRow, StrategyInfo, Trade, TrainingReport } from './types'
 
 const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
@@ -15,6 +17,61 @@ function fmt(n: number | null | undefined, dp = 2): string {
 type Toast = { kind: 'ok' | 'error'; text: string } | null
 
 export default function App() {
+  const [me, setMe] = useState<Me | null>(null)
+  const [checking, setChecking] = useState(true)
+
+  const loadMe = useCallback(async () => {
+    if (!getToken()) {
+      setMe(null)
+      setChecking(false)
+      return
+    }
+    try {
+      setMe(await api.me())
+    } catch {
+      setToken(null)
+      setMe(null)
+    } finally {
+      setChecking(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    loadMe()
+  }, [loadMe])
+
+  const logout = useCallback(() => {
+    setToken(null)
+    setMe(null)
+  }, [])
+
+  if (checking) {
+    return <div className="auth-wrap"><div className="auth-card">Loading…</div></div>
+  }
+  if (!me) {
+    return <Login onAuthed={() => { setChecking(true); loadMe() }} />
+  }
+  if (me.license_status !== 'active') {
+    return (
+      <LicenseGate
+        status={me.license_status as 'pending' | 'revoked'}
+        email={me.email}
+        onLogout={logout}
+      />
+    )
+  }
+  return <Dashboard me={me} onLogout={logout} onMeChanged={setMe} />
+}
+
+function Dashboard({
+  me,
+  onLogout,
+  onMeChanged,
+}: {
+  me: Me
+  onLogout: () => void
+  onMeChanged: (m: Me) => void
+}) {
   const [status, setStatus] = useState<BotStatus | null>(null)
   const [settings, setSettings] = useState<Settings | null>(null)
   const [trades, setTrades] = useState<Trade[]>([])
@@ -25,7 +82,7 @@ export default function App() {
   const [amount, setAmount] = useState('')
   const [limitPrice, setLimitPrice] = useState('')
   const [toast, setToast] = useState<Toast>(null)
-  const [tab, setTab] = useState<'trades' | 'signals' | 'analyze' | 'train' | 'backtest' | 'settings'>('trades')
+  const [tab, setTab] = useState<'trades' | 'signals' | 'analyze' | 'train' | 'backtest' | 'settings' | 'admin'>('trades')
   const [access, setAccess] = useState<ExchangeAccess | null>(null)
 
   const showToast = useCallback((kind: 'ok' | 'error', text: string) => {
@@ -153,10 +210,15 @@ export default function App() {
           </>
         )}
         <div className="spacer" />
+        <span className="hint">{me.email}</span>
+        {me.role === 'admin' && <span className="badge">admin</span>}
         <span className="hint">{connected ? 'live' : 'reconnecting…'}</span>
         <span className={`ws-dot ${connected ? 'connected' : ''}`} />
         <button className="btn primary" onClick={toggleBot}>
           {status?.running ? 'Stop bot' : 'Start bot'}
+        </button>
+        <button className="btn" onClick={onLogout}>
+          Sign out
         </button>
       </header>
 
@@ -289,6 +351,14 @@ export default function App() {
                 >
                   Settings
                 </span>
+                {me.role === 'admin' && (
+                  <span
+                    className={`tab ${tab === 'admin' ? 'active' : ''}`}
+                    onClick={() => setTab('admin')}
+                  >
+                    Admin
+                  </span>
+                )}
               </div>
             </div>
             <div className="panel-body">
@@ -318,12 +388,17 @@ export default function App() {
                 <SettingsPanel
                   settings={settings}
                   access={access}
+                  me={me}
                   onSaved={(s) => {
                     setSettings(s)
                     showToast('ok', 'Settings saved')
                   }}
+                  onMeChanged={onMeChanged}
                   onError={(msg) => showToast('error', msg)}
                 />
+              )}
+              {tab === 'admin' && me.role === 'admin' && (
+                <Admin onError={(msg) => showToast('error', msg)} />
               )}
             </div>
           </section>
@@ -879,12 +954,16 @@ function TrainPanel({
 function SettingsPanel({
   settings,
   access,
+  me,
   onSaved,
+  onMeChanged,
   onError,
 }: {
   settings: Settings | null
   access: ExchangeAccess | null
+  me: Me
   onSaved: (s: Settings) => void
+  onMeChanged: (m: Me) => void
   onError: (msg: string) => void
 }) {
   const [form, setForm] = useState<Settings | null>(settings)
@@ -919,7 +998,7 @@ function SettingsPanel({
   }
 
   const alertExample = JSON.stringify(
-    { secret: 'YOUR_SECRET', action: 'buy', symbol: 'BTC/USDT', amount: 0.001 },
+    { action: 'buy', symbol: 'BTC/USDT', amount: 0.001 },
     null,
     2,
   )
@@ -1096,17 +1175,142 @@ function SettingsPanel({
         Save settings
       </button>
 
+      <CredentialsCard me={me} onMeChanged={onMeChanged} onError={onError} />
+
       <div className="panel" style={{ marginTop: 6 }}>
-        <div className="panel-head">TradingView webhook</div>
+        <div className="panel-head">Your TradingView webhook</div>
         <div className="panel-body">
-          <p className="hint">Point your TradingView alert's webhook URL here:</p>
+          <p className="hint">Point your TradingView alert's webhook URL here (unique to your account — keep it private, it acts as your secret):</p>
           <code className="inline">{webhookUrl}</code>
-          <p className="hint" style={{ marginTop: 10 }}>
-            Secret configured: {form.webhook_secret_set ? '✅ yes' : '❌ using default — change it in .env'}
-          </p>
-          <p className="hint" style={{ marginTop: 10 }}>Alert message (JSON):</p>
+          <p className="hint" style={{ marginTop: 10 }}>Alert message (JSON) — no secret needed, the URL token authenticates you:</p>
           <pre className="code">{alertExample}</pre>
         </div>
+      </div>
+    </div>
+  )
+}
+
+function CredentialsCard({
+  me,
+  onMeChanged,
+  onError,
+}: {
+  me: Me
+  onMeChanged: (m: Me) => void
+  onError: (msg: string) => void
+}) {
+  const [binKey, setBinKey] = useState('')
+  const [binSecret, setBinSecret] = useState('')
+  const [testnet, setTestnet] = useState(me.binance_testnet)
+  const [aiKey, setAiKey] = useState('')
+  const [aiModel, setAiModel] = useState(me.ai_model || '')
+  const [busy, setBusy] = useState(false)
+  const [saved, setSaved] = useState('')
+
+  const disabled = !me.secrets_storage_enabled
+
+  const save = async () => {
+    setBusy(true)
+    setSaved('')
+    try {
+      const body: Record<string, unknown> = { binance_testnet: testnet }
+      if (binKey.trim()) body.binance_api_key = binKey.trim()
+      if (binSecret.trim()) body.binance_api_secret = binSecret.trim()
+      if (aiKey.trim()) body.ai_api_key = aiKey.trim()
+      if (aiModel.trim()) body.ai_model = aiModel.trim()
+      const updated = await api.updateCredentials(body)
+      onMeChanged(updated)
+      setBinKey('')
+      setBinSecret('')
+      setAiKey('')
+      setSaved('Credentials saved (encrypted at rest).')
+    } catch (e) {
+      onError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="panel" style={{ marginTop: 6 }}>
+      <div className="panel-head">Your Binance API keys</div>
+      <div className="panel-body" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
+        {disabled ? (
+          <p className="hint" style={{ color: 'var(--red)' }}>
+            ⚠️ Key storage is disabled: the operator has not set SECRET_KEY, so keys
+            cannot be encrypted. Ask the administrator to configure it.
+          </p>
+        ) : (
+          <p className="hint">
+            Use <b>trade-only</b> keys (no withdrawal permission). Keys are encrypted
+            at rest and never shown again. Binance keys currently{' '}
+            {me.binance_keys_set ? '✅ set' : '❌ not set'}; AI key{' '}
+            {me.ai_key_set ? '✅ set' : 'not set'}.
+          </p>
+        )}
+        <div className="row">
+          <div className="field">
+            <label>Binance API key</label>
+            <input
+              className="input"
+              type="password"
+              value={binKey}
+              onChange={(e) => setBinKey(e.target.value)}
+              placeholder={me.binance_keys_set ? 'unchanged' : 'paste key'}
+              disabled={disabled}
+              autoComplete="off"
+            />
+          </div>
+          <div className="field">
+            <label>Binance API secret</label>
+            <input
+              className="input"
+              type="password"
+              value={binSecret}
+              onChange={(e) => setBinSecret(e.target.value)}
+              placeholder={me.binance_keys_set ? 'unchanged' : 'paste secret'}
+              disabled={disabled}
+              autoComplete="off"
+            />
+          </div>
+        </div>
+        <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+          <input
+            type="checkbox"
+            checked={testnet}
+            onChange={(e) => setTestnet(e.target.checked)}
+            disabled={disabled}
+          />
+          Use Binance testnet (recommended until you have verified everything)
+        </label>
+        <div className="row">
+          <div className="field">
+            <label>AI API key (optional)</label>
+            <input
+              className="input"
+              type="password"
+              value={aiKey}
+              onChange={(e) => setAiKey(e.target.value)}
+              placeholder={me.ai_key_set ? 'unchanged' : 'optional'}
+              disabled={disabled}
+              autoComplete="off"
+            />
+          </div>
+          <div className="field">
+            <label>AI model (optional)</label>
+            <input
+              className="input"
+              value={aiModel}
+              onChange={(e) => setAiModel(e.target.value)}
+              placeholder="e.g. gpt-4o-mini"
+              disabled={disabled}
+            />
+          </div>
+        </div>
+        {saved && <p className="hint" style={{ color: 'var(--green)' }}>{saved}</p>}
+        <button className="btn primary" onClick={save} disabled={disabled || busy}>
+          {busy ? 'Saving…' : 'Save API keys'}
+        </button>
       </div>
     </div>
   )

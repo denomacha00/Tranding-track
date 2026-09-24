@@ -1,9 +1,14 @@
-"""FastAPI application: REST + WebSocket API for Tranding-track."""
+"""FastAPI application: multi-user REST + WebSocket API for Tranding-track.
+
+Multi-tenant design: anyone can self-sign-up, but an account must be LICENSED by
+the administrator before it can configure exchange keys or trade. Each user
+brings their OWN trade-only Binance keys (stored encrypted at rest) and gets
+their own in-memory :class:`TradingEngine` and a unique TradingView webhook URL.
+"""
 from __future__ import annotations
 
 import asyncio
 import json
-import hmac
 import logging
 import os
 from contextlib import asynccontextmanager
@@ -13,7 +18,6 @@ import pandas as pd
 from fastapi import (
     Depends,
     FastAPI,
-    Header,
     HTTPException,
     Request,
     WebSocket,
@@ -29,64 +33,70 @@ from app import __version__
 from app.backtest import run_backtest
 from app.config import get_settings
 from app.database import get_db, init_db
-from app.engine import get_engine
-from app.models import SignalLog, Trade, TradeStatus
+from app.deps import get_current_user, require_admin, require_licensed_user
+from app.models import (
+    LicenseStatus,
+    SignalLog,
+    Trade,
+    TradeStatus,
+    User,
+    UserRole,
+)
 from app.schemas import (
     BotStatus,
+    CredentialsUpdate,
     ExecutionResult,
+    LicenseUpdate,
+    LoginRequest,
     ManualOrder,
+    MeOut,
     SettingsOut,
     SettingsUpdate,
     SignalOut,
+    SignupRequest,
     TickerOut,
+    TokenResponse,
     TradeOut,
     TradingViewSignal,
+    UserOut,
 )
+from app.security import (
+    create_access_token,
+    encrypt_secret,
+    hash_password,
+    new_webhook_token,
+    secrets_enabled,
+    verify_password,
+)
+from app.usermgr import get_manager
 from app.learn import PARAM_GRIDS, train
 from app.analysis import MarketAnalyzer
-from app.ai import AICommentator
 from app.strategies import STRATEGY_REGISTRY, build_strategy
 from app.tasks import monitor_loop
 from app.ws import Broadcaster
 from app.logging_config import configure_logging
 
-configure_logging(
-    get_settings().log_format, get_settings().log_level
-)
+configure_logging(get_settings().log_format, get_settings().log_level)
 logger = logging.getLogger("tranding_track")
 
-WEBHOOK_PATH = "/api/webhook/tradingview"
+# Per-user webhook path template. The unguessable token in the URL is what
+# authenticates the alert to a specific user's account.
+WEBHOOK_PATH_TEMPLATE = "/api/webhook/tradingview/{token}"
 
 broadcaster = Broadcaster()
 _analyzer = MarketAnalyzer()
-_ai: AICommentator | None = None
 
 
-def get_ai() -> AICommentator:
-    global _ai
-    if _ai is None:
-        _ai = AICommentator(get_settings())
-    return _ai
+def _webhook_path(token: str) -> str:
+    return WEBHOOK_PATH_TEMPLATE.format(token=token)
 
 
-def require_api_key(x_api_key: str | None = Header(default=None)) -> None:
-    """Guard control/mutating endpoints with an optional API key.
-
-    If ``API_KEY`` is unset the API is open (fine for localhost-only dev). Once
-    set, every protected endpoint requires the matching ``X-API-Key`` header —
-    without this, anyone who can reach the port could place orders or flip the
-    bot to live mode.
-    """
-    configured = get_engine().settings.api_key
-    if not configured:
-        return
-    if not x_api_key or not hmac.compare_digest(x_api_key, configured):
-        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+def _engine_for(db: Session, user: User):
+    return get_manager().get(db, user)
 
 
-def _analysis_for(symbol: str, timeframe: str = "1h", limit: int = 200):
-    """Fetch candles and run the deterministic market analysis."""
-    engine = get_engine()
+def _analysis_for(engine, symbol: str, timeframe: str = "1h", limit: int = 200):
+    """Fetch candles via a user's connector and run deterministic analysis."""
     try:
         raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, min(limit, 1000))
     except Exception as exc:
@@ -99,38 +109,48 @@ def _analysis_for(symbol: str, timeframe: str = "1h", limit: int = 200):
     return _analyzer.analyze(df, symbol.upper())
 
 
+def _bootstrap_admin(db: Session) -> None:
+    """Ensure an admin exists: promote ADMIN_EMAIL, else the first user."""
+    admin_email = (get_settings().admin_email or "").strip().lower()
+    if admin_email:
+        user = db.scalars(select(User).where(User.email == admin_email)).first()
+        if user and user.role != UserRole.admin.value:
+            user.role = UserRole.admin.value
+            user.license_status = LicenseStatus.active.value
+            db.commit()
+            logger.info("Promoted %s to admin", admin_email)
+    else:
+        has_admin = db.scalars(
+            select(User).where(User.role == UserRole.admin.value)
+        ).first()
+        if not has_admin:
+            first = db.scalars(select(User).order_by(User.id.asc())).first()
+            if first:
+                first.role = UserRole.admin.value
+                first.license_status = LicenseStatus.active.value
+                db.commit()
+                logger.info("Promoted first user %s to admin", first.email)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    engine = get_engine()
     loop = asyncio.get_running_loop()
-    engine.attach_broadcaster(broadcaster, loop)
-    # Restore persisted settings + paper balance so a restart is not a reset.
+    get_manager().attach_broadcaster(broadcaster, loop)
     from app.database import SessionLocal
 
     _db = SessionLocal()
     try:
-        engine.restore_state(_db)
+        _bootstrap_admin(_db)
     finally:
         _db.close()
-    # In live mode, verify the key can actually trade (catches the common
-    # testnet -2015: key with no Spot permission / wrong site / IP-restricted).
-    if engine.settings.is_live:
-        try:
-            access = engine.connector.check_trading_access()
-            if access["ok"]:
-                logger.info("Exchange trading access OK: %s", access["detail"])
-            else:
-                logger.warning(
-                    "⚠️ LIVE MODE but exchange trading access is NOT ready: %s "
-                    "Orders will fail until this is fixed.", access["detail"],
-                )
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("trading-access check failed: %s", exc)
-    engine.running = True
-    monitor_task = asyncio.create_task(monitor_loop(engine, broadcaster))
-    logger.info("Tranding-track backend started (mode=%s, testnet=%s)",
-                engine.settings.trading_mode, engine.settings.binance_testnet)
+    if not get_settings().secret_key:
+        logger.warning(
+            "\u26a0\ufe0f SECRET_KEY is not set: login is disabled and per-user API "
+            "keys cannot be stored. Set SECRET_KEY before going live."
+        )
+    monitor_task = asyncio.create_task(monitor_loop(get_manager(), broadcaster))
+    logger.info("Tranding-track backend started (multi-user)")
     try:
         yield
     finally:
@@ -161,31 +181,167 @@ def health() -> dict:
     return {"status": "ok", "version": __version__}
 
 
-# ---- TradingView webhook -------------------------------------------
+# ---- Auth -----------------------------------------------------------
 
 
-@app.post(WEBHOOK_PATH, response_model=ExecutionResult)
-async def tradingview_webhook(request: Request, db: Session = Depends(get_db)):
-    """Receive a TradingView alert and execute it on Binance (or paper).
+def _issue_token(user: User) -> str:
+    s = get_settings()
+    return create_access_token(
+        s.secret_key,
+        user_id=user.id,
+        email=user.email,
+        role=user.role,
+        ttl_minutes=s.access_token_ttl_minutes,
+    )
 
-    TradingView sends the alert message body as raw text; we parse JSON. The
-    payload MUST include the shared secret to be accepted.
+
+@app.post("/api/auth/signup", response_model=TokenResponse)
+def signup(req: SignupRequest, db: Session = Depends(get_db)):
+    s = get_settings()
+    if not s.secret_key:
+        raise HTTPException(
+            status_code=503, detail="Signups are disabled (SECRET_KEY unset)."
+        )
+    email = req.email.strip().lower()
+    if "@" not in email:
+        raise HTTPException(status_code=400, detail="A valid email is required")
+    if db.scalars(select(User).where(User.email == email)).first():
+        raise HTTPException(status_code=409, detail="Email already registered")
+    try:
+        pw_hash = hash_password(req.password)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    is_admin = bool(s.admin_email) and email == s.admin_email.strip().lower()
+    first_user = db.scalars(select(User)).first() is None
+    make_admin = is_admin or (not s.admin_email and first_user)
+    licensed = make_admin or s.auto_license_new_users
+
+    user = User(
+        email=email,
+        password_hash=pw_hash,
+        role=UserRole.admin.value if make_admin else UserRole.user.value,
+        license_status=(
+            LicenseStatus.active.value if licensed else LicenseStatus.pending.value
+        ),
+        webhook_token=new_webhook_token(),
+        binance_testnet=1,
+    )
+    from app.models import _utcnow  # local import to avoid cycle at top
+
+    if licensed:
+        user.licensed_at = _utcnow()
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return TokenResponse(access_token=_issue_token(user))
+
+
+@app.post("/api/auth/login", response_model=TokenResponse)
+def login(req: LoginRequest, db: Session = Depends(get_db)):
+    if not get_settings().secret_key:
+        raise HTTPException(
+            status_code=503, detail="Login is disabled (SECRET_KEY unset)."
+        )
+    email = req.email.strip().lower()
+    user = db.scalars(select(User).where(User.email == email)).first()
+    if not user or not verify_password(req.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    return TokenResponse(access_token=_issue_token(user))
+
+
+@app.get("/api/auth/me", response_model=MeOut)
+def me(user: User = Depends(get_current_user)):
+    return MeOut(
+        id=user.id,
+        email=user.email,
+        role=user.role,
+        license_status=user.license_status,
+        webhook_path=_webhook_path(user.webhook_token),
+        binance_keys_set=bool(user.binance_api_key_enc and user.binance_api_secret_enc),
+        binance_testnet=bool(user.binance_testnet),
+        ai_key_set=bool(user.ai_api_key_enc),
+        ai_model=user.ai_model or "",
+        secrets_storage_enabled=secrets_enabled(get_settings().secret_key),
+    )
+
+
+# ---- Per-user credentials (own trade-only keys) --------------------
+
+
+@app.put("/api/credentials", response_model=MeOut)
+def update_credentials(
+    body: CredentialsUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    s = get_settings()
+    if not secrets_enabled(s.secret_key):
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                "Key storage is disabled because SECRET_KEY is not set. The "
+                "operator must set SECRET_KEY before keys can be stored securely."
+            ),
+        )
+    data = body.model_dump(exclude_unset=True)
+    if "binance_api_key" in data and data["binance_api_key"] is not None:
+        user.binance_api_key_enc = encrypt_secret(s.secret_key, data["binance_api_key"])
+    if "binance_api_secret" in data and data["binance_api_secret"] is not None:
+        user.binance_api_secret_enc = encrypt_secret(
+            s.secret_key, data["binance_api_secret"]
+        )
+    if "binance_testnet" in data and data["binance_testnet"] is not None:
+        user.binance_testnet = 1 if data["binance_testnet"] else 0
+    if "ai_api_key" in data and data["ai_api_key"] is not None:
+        user.ai_api_key_enc = (
+            encrypt_secret(s.secret_key, data["ai_api_key"])
+            if data["ai_api_key"]
+            else None
+        )
+    if "ai_base_url" in data and data["ai_base_url"] is not None:
+        user.ai_base_url = data["ai_base_url"]
+    if "ai_model" in data and data["ai_model"] is not None:
+        user.ai_model = data["ai_model"]
+    if "ai_style" in data and data["ai_style"] is not None:
+        user.ai_style = data["ai_style"]
+    db.commit()
+    db.refresh(user)
+    # Rebuild the user's engine so new keys take effect immediately.
+    get_manager().refresh(db, user)
+    return me(user)
+
+
+# ---- TradingView webhook (per-user token in the URL) ----------------
+
+
+@app.post(WEBHOOK_PATH_TEMPLATE, response_model=ExecutionResult)
+async def tradingview_webhook(
+    token: str, request: Request, db: Session = Depends(get_db)
+):
+    """Execute a TradingView alert against the token-owner's account.
+
+    The unguessable ``token`` in the URL identifies AND authenticates the target
+    user, so alerts only ever touch that one account. The account must be
+    licensed and running for the alert to act.
     """
-    engine = get_engine()
+    user = db.scalars(select(User).where(User.webhook_token == token)).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Unknown webhook token")
     raw = (await request.body()).decode("utf-8", errors="replace")
-
-    # Parse + validate.
     try:
         data = json.loads(raw)
         signal = TradingViewSignal(**data)
     except Exception as exc:
-        _log_signal(db, "tradingview", None, None, raw, False, f"parse error: {exc}")
+        _log_signal(db, user.id, "tradingview", None, None, raw, False, f"parse error: {exc}")
         raise HTTPException(status_code=400, detail=f"Invalid signal payload: {exc}")
 
-    if not hmac.compare_digest(signal.secret, engine.settings.tradingview_webhook_secret):
-        _log_signal(db, "tradingview", signal.symbol, signal.action, raw, False, "bad secret")
-        raise HTTPException(status_code=401, detail="Invalid webhook secret")
+    if user.license_status != LicenseStatus.active.value:
+        _log_signal(db, user.id, "tradingview", signal.symbol, signal.action, raw, False,
+                    "account not licensed")
+        raise HTTPException(status_code=403, detail="Account is not licensed")
 
+    engine = _engine_for(db, user)
     accepted, message, trade = await asyncio.to_thread(
         engine.execute_signal,
         db,
@@ -198,22 +354,17 @@ async def tradingview_webhook(request: Request, db: Session = Depends(get_db)):
         note=signal.note,
         limit_price=signal.limit_price,
     )
-    _log_signal(db, "tradingview", signal.symbol, signal.action, raw, accepted, message)
-    await broadcaster.broadcast(
-        {"event": "signal", "data": {"source": "tradingview", "action": signal.action,
-                                     "symbol": signal.symbol, "accepted": accepted,
-                                     "message": message}}
-    )
+    _log_signal(db, user.id, "tradingview", signal.symbol, signal.action, raw, accepted, message)
     return ExecutionResult(
         accepted=accepted, message=message,
         trade=TradeOut.model_validate(trade) if trade else None,
     )
 
 
-def _log_signal(db, source, symbol, action, raw, accepted, message) -> None:
+def _log_signal(db, user_id, source, symbol, action, raw, accepted, message) -> None:
     db.add(
         SignalLog(
-            source=source, symbol=symbol, action=action, raw=raw,
+            user_id=user_id, source=source, symbol=symbol, action=action, raw=raw,
             accepted=1 if accepted else 0, message=message,
         )
     )
@@ -227,9 +378,9 @@ def _log_signal(db, source, symbol, action, raw, accepted, message) -> None:
 async def manual_order(
     order: ManualOrder,
     db: Session = Depends(get_db),
-    _: None = Depends(require_api_key),
+    user: User = Depends(require_licensed_user),
 ):
-    engine = get_engine()
+    engine = _engine_for(db, user)
     accepted, message, trade = await asyncio.to_thread(
         engine.execute_signal,
         db,
@@ -242,11 +393,6 @@ async def manual_order(
         note="manual order",
         limit_price=order.limit_price,
     )
-    await broadcaster.broadcast(
-        {"event": "signal", "data": {"source": "manual", "action": order.action,
-                                     "symbol": order.symbol, "accepted": accepted,
-                                     "message": message}}
-    )
     return ExecutionResult(
         accepted=accepted, message=message,
         trade=TradeOut.model_validate(trade) if trade else None,
@@ -257,15 +403,16 @@ async def manual_order(
 async def close_trade(
     trade_id: int,
     db: Session = Depends(get_db),
-    _: None = Depends(require_api_key),
+    user: User = Depends(require_licensed_user),
 ):
-    engine = get_engine()
     trade = db.get(Trade, trade_id)
-    if not trade or trade.status not in (
-        TradeStatus.open.value,
-        TradeStatus.pending.value,
+    if (
+        not trade
+        or trade.user_id != user.id
+        or trade.status not in (TradeStatus.open.value, TradeStatus.pending.value)
     ):
         raise HTTPException(status_code=404, detail="Open trade not found")
+    engine = _engine_for(db, user)
     accepted, message, updated = await asyncio.to_thread(
         engine.execute_signal,
         db,
@@ -283,22 +430,35 @@ async def close_trade(
     )
 
 
-# ---- Trades & signals ----------------------------------------------
+# ---- Trades & signals (scoped to the caller) ------------------------
 
 
 @app.get("/api/trades", response_model=list[TradeOut])
-def list_trades(status: str | None = None, limit: int = 100, db: Session = Depends(get_db)):
-    stmt = select(Trade).order_by(Trade.opened_at.desc()).limit(min(limit, 500))
+def list_trades(
+    status: str | None = None,
+    limit: int = 100,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    stmt = select(Trade).where(Trade.user_id == user.id)
     if status:
-        stmt = select(Trade).where(Trade.status == status).order_by(
-            Trade.opened_at.desc()
-        ).limit(min(limit, 500))
+        stmt = stmt.where(Trade.status == status)
+    stmt = stmt.order_by(Trade.opened_at.desc()).limit(min(limit, 500))
     return list(db.scalars(stmt).all())
 
 
 @app.get("/api/signals", response_model=list[SignalOut])
-def list_signals(limit: int = 50, db: Session = Depends(get_db)):
-    stmt = select(SignalLog).order_by(SignalLog.created_at.desc()).limit(min(limit, 200))
+def list_signals(
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    stmt = (
+        select(SignalLog)
+        .where(SignalLog.user_id == user.id)
+        .order_by(SignalLog.created_at.desc())
+        .limit(min(limit, 200))
+    )
     return list(db.scalars(stmt).all())
 
 
@@ -306,24 +466,25 @@ def list_signals(limit: int = 50, db: Session = Depends(get_db)):
 
 
 @app.get("/api/status", response_model=BotStatus)
-def status(db: Session = Depends(get_db)):
-    return get_engine().status(db)
+def status(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    return _engine_for(db, user).status(db)
 
 
 @app.get("/api/exchange/access")
-def exchange_access():
-    """Report whether the configured key can read the account and place orders.
-
-    Surfaces the common Binance -2015 failure (key without Spot trading
-    permission, created on the wrong site, or IP-restricted) so the operator can
-    fix it before relying on live orders. Never places an order.
-    """
-    return get_engine().connector.check_trading_access()
+def exchange_access(
+    db: Session = Depends(get_db), user: User = Depends(get_current_user)
+):
+    """Report whether THIS user's key can read the account and place orders."""
+    return _engine_for(db, user).connector.check_trading_access()
 
 
 @app.post("/api/bot/{state}")
-def set_bot_state(state: str, _: None = Depends(require_api_key)):
-    engine = get_engine()
+def set_bot_state(
+    state: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    engine = _engine_for(db, user)
     if state == "start":
         engine.running = True
     elif state == "stop":
@@ -333,9 +494,7 @@ def set_bot_state(state: str, _: None = Depends(require_api_key)):
     return {"running": engine.running}
 
 
-@app.get("/api/settings", response_model=SettingsOut)
-def get_settings_endpoint():
-    engine = get_engine()
+def _settings_out(engine, user: User) -> SettingsOut:
     s = engine.settings
     return SettingsOut(
         trading_mode=s.trading_mode,
@@ -354,38 +513,45 @@ def get_settings_endpoint():
         auto_confirm_timeframe=s.auto_confirm_timeframe,
         ai_enabled=bool(s.ai_api_key),
         ai_model=s.ai_model,
-        ai_style=get_ai()._style() if s.ai_api_key else "",
+        ai_style=engine.ai._style() if s.ai_api_key else "",
         notifications_enabled=engine.notifier.enabled,
-        api_key_set=bool(s.api_key),
-        webhook_path=WEBHOOK_PATH,
-        webhook_secret_set=bool(s.tradingview_webhook_secret
-                                and s.tradingview_webhook_secret != "change-me"),
+        api_key_set=bool(user.binance_api_key_enc and user.binance_api_secret_enc),
+        webhook_path=_webhook_path(user.webhook_token),
+        webhook_secret_set=bool(user.webhook_token),
     )
+
+
+@app.get("/api/settings", response_model=SettingsOut)
+def get_settings_endpoint(
+    db: Session = Depends(get_db), user: User = Depends(get_current_user)
+):
+    return _settings_out(_engine_for(db, user), user)
 
 
 @app.patch("/api/settings", response_model=SettingsOut)
 def update_settings(
     update: SettingsUpdate,
     db: Session = Depends(get_db),
-    _: None = Depends(require_api_key),
+    user: User = Depends(require_licensed_user),
 ):
-    engine = get_engine()
+    engine = _engine_for(db, user)
     s = engine.settings
     data = update.model_dump(exclude_unset=True)
     for key, value in data.items():
         setattr(s, key, value)
     engine.apply_settings(s)
-    # Persist the overrides so they survive a restart.
     engine.persist_settings(db, data)
-    return get_settings_endpoint()
+    return _settings_out(engine, user)
 
 
 # ---- Market data ----------------------------------------------------
 
 
 @app.get("/api/ticker/{symbol:path}", response_model=TickerOut)
-def ticker(symbol: str):
-    engine = get_engine()
+def ticker(
+    symbol: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
+):
+    engine = _engine_for(db, user)
     try:
         t = engine.connector.fetch_ticker(symbol.upper())
     except Exception as exc:
@@ -400,8 +566,14 @@ def ticker(symbol: str):
 
 
 @app.get("/api/ohlcv/{symbol:path}")
-def ohlcv(symbol: str, timeframe: str = "1h", limit: int = 200):
-    engine = get_engine()
+def ohlcv(
+    symbol: str,
+    timeframe: str = "1h",
+    limit: int = 200,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    engine = _engine_for(db, user)
     try:
         raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, min(limit, 1000))
     except Exception as exc:
@@ -425,8 +597,10 @@ def backtest(
     starting_balance: float = 10_000.0,
     fee_pct: float = 0.1,
     slippage_pct: float = 0.05,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
-    engine = get_engine()
+    engine = _engine_for(db, user)
     try:
         raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, min(limit, 1000))
     except Exception as exc:
@@ -466,44 +640,48 @@ def backtest(
 
 
 @app.get("/api/analyze/{symbol:path}")
-def analyze(symbol: str, timeframe: str = "1h", explain: bool = False, assess: bool = False):
-    """Run the multi-indicator analyzer and return a confidence-scored verdict.
-
-    Set explain=true to also get a natural-language narration, or assess=true for
-    a deeper risk-first assessment (signal quality, risks, scenarios, sizing).
-    Both use the AI layer if configured, otherwise the deterministic summary.
-    """
-    analysis = _analysis_for(symbol, timeframe)
+def analyze(
+    symbol: str,
+    timeframe: str = "1h",
+    explain: bool = False,
+    assess: bool = False,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    engine = _engine_for(db, user)
+    analysis = _analysis_for(engine, symbol, timeframe)
     result = analysis.as_dict()
     if explain:
-        result["narration"] = get_ai().narrate(analysis)
-        result["ai_enabled"] = get_ai().available
+        result["narration"] = engine.ai.narrate(analysis)
+        result["ai_enabled"] = engine.ai.available
     if assess:
-        result["assessment"] = get_ai().assess(analysis)
-        result["ai_enabled"] = get_ai().available
+        result["assessment"] = engine.ai.assess(analysis)
+        result["ai_enabled"] = engine.ai.available
     return result
 
 
 @app.post("/api/ai/ask")
-def ai_ask(payload: dict, db: Session = Depends(get_db)):
-    """Ask a free-form market question, grounded in current analysis if a symbol
-    is provided. Requires AI_API_KEY to be configured."""
+def ai_ask(
+    payload: dict,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     question = str(payload.get("question", "")).strip()
     if not question:
         raise HTTPException(status_code=400, detail="question is required")
+    engine = _engine_for(db, user)
     symbol = payload.get("symbol")
     timeframe = payload.get("timeframe", "1h")
-    analysis = _analysis_for(symbol, timeframe) if symbol else None
-    answer = get_ai().ask(question, analysis)
-    return {"answer": answer, "ai_enabled": get_ai().available}
+    analysis = _analysis_for(engine, symbol, timeframe) if symbol else None
+    answer = engine.ai.ask(question, analysis)
+    return {"answer": answer, "ai_enabled": engine.ai.available}
 
 
 # ---- Strategies & training -----------------------------------------
 
 
 @app.get("/api/strategies")
-def strategies():
-    """List available strategies and their tunable parameter grids."""
+def strategies(user: User = Depends(get_current_user)):
     return [
         {"name": name, "params": PARAM_GRIDS.get(name, {})}
         for name in STRATEGY_REGISTRY
@@ -519,11 +697,10 @@ def train_strategy(
     starting_balance: float = 10_000.0,
     fee_pct: float = 0.1,
     slippage_pct: float = 0.05,
-    _: None = Depends(require_api_key),
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
 ):
-    """Teach the bot: grid-search a strategy's parameters on real candles and
-    return the best-performing configuration plus a leaderboard."""
-    engine = get_engine()
+    engine = _engine_for(db, user)
     if strategy not in STRATEGY_REGISTRY:
         raise HTTPException(status_code=400, detail=f"Unknown strategy '{strategy}'")
     try:
@@ -556,23 +733,89 @@ def train_strategy(
     }
 
 
+# ---- Admin: user & licence management ------------------------------
+
+
+@app.get("/api/admin/users", response_model=list[UserOut])
+def admin_list_users(
+    db: Session = Depends(get_db), _admin: User = Depends(require_admin)
+):
+    return list(db.scalars(select(User).order_by(User.id.asc())).all())
+
+
+@app.patch("/api/admin/users/{user_id}/license", response_model=UserOut)
+def admin_set_license(
+    user_id: int,
+    body: LicenseUpdate,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    target = db.get(User, user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    if target.id == admin.id and body.status != LicenseStatus.active.value:
+        raise HTTPException(status_code=400, detail="Refusing to de-license yourself")
+    from app.models import _utcnow
+
+    target.license_status = body.status
+    if body.status == LicenseStatus.active.value and target.licensed_at is None:
+        target.licensed_at = _utcnow()
+    db.commit()
+    db.refresh(target)
+    # Revoked/pending users must stop trading immediately: drop their engine.
+    if body.status != LicenseStatus.active.value:
+        get_manager().drop(target.id)
+    return target
+
+
+@app.delete("/api/admin/users/{user_id}")
+def admin_delete_user(
+    user_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    if user_id == admin.id:
+        raise HTTPException(status_code=400, detail="Refusing to delete yourself")
+    target = db.get(User, user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    get_manager().drop(target.id)
+    db.delete(target)
+    db.commit()
+    return {"deleted": user_id}
+
+
 # ---- WebSocket ------------------------------------------------------
 
 
 @app.websocket("/ws")
-async def websocket_endpoint(ws: WebSocket):
-    await broadcaster.connect(ws)
-    try:
-        # Send an immediate status snapshot on connect.
-        from app.database import SessionLocal
+async def websocket_endpoint(ws: WebSocket, token: str | None = None):
+    """Authenticated status stream. Pass the access token as ?token=... ."""
+    from app.security import decode_access_token
+    from app.database import SessionLocal
 
+    secret = get_settings().secret_key
+    payload = decode_access_token(secret, token or "")
+    if not payload:
+        await ws.close(code=4401)
+        return
+    try:
+        user_id = int(payload.get("sub"))
+    except (TypeError, ValueError):
+        await ws.close(code=4401)
+        return
+    await broadcaster.connect(ws, user_id)
+    try:
         db = SessionLocal()
         try:
-            await ws.send_json({"event": "status", "data": get_engine().status(db)})
+            user = db.get(User, user_id)
+            if user:
+                await ws.send_json(
+                    {"event": "status", "data": get_manager().get(db, user).status(db)}
+                )
         finally:
             db.close()
         while True:
-            # Keep the connection alive; ignore inbound messages (ping/pong).
             await ws.receive_text()
     except WebSocketDisconnect:
         await broadcaster.disconnect(ws)
@@ -581,11 +824,6 @@ async def websocket_endpoint(ws: WebSocket):
 
 
 # ---- Static frontend (single-service deploy, e.g. Railway) ----------
-# When the built dashboard is present (frontend/dist copied into the image at
-# /app/static), serve it from this same FastAPI app so the whole bot runs as ONE
-# fast service: same origin (no CORS), same domain for REST + WebSocket, one
-# process to keep warm. API routes above always take precedence; anything else
-# falls back to index.html so client-side routing works.
 _STATIC_DIR = Path(os.getenv("STATIC_DIR", Path(__file__).resolve().parent.parent / "static"))
 if _STATIC_DIR.is_dir() and (_STATIC_DIR / "index.html").is_file():
     app.mount(
@@ -600,7 +838,6 @@ if _STATIC_DIR.is_dir() and (_STATIC_DIR / "index.html").is_file():
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def _spa_fallback(full_path: str) -> FileResponse:
-        # Never shadow the API/WS namespaces; let them 404 normally.
         if full_path.startswith(("api/", "ws")):
             raise HTTPException(status_code=404, detail="Not found")
         candidate = _STATIC_DIR / full_path

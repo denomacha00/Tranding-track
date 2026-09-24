@@ -34,6 +34,32 @@ TradingView alert ──▶ /webhook ──▶ risk checks ──▶ Binance ord
   (Claude) provider — pick via `AI_API_STYLE` (auto-detected by default).
 - **Autonomous trading** is off by default, long-only, and confidence-gated.
 
+## Multi-user, licensing & admin
+
+Tranding-track is **multi-tenant**: anyone can self-sign-up with an email +
+password, but an account must be **licensed by the administrator** before it can
+enter exchange keys or trade. Each user brings their **own trade-only Binance
+keys** (stored encrypted at rest), gets their **own isolated trading engine**
+(separate positions, paper wallet, settings and AI config), and a **unique,
+unguessable TradingView webhook URL** that authenticates alerts to their account.
+
+- **Auth:** email + password. Passwords are hashed with PBKDF2-HMAC-SHA256
+  (stdlib). Sessions use HS256 JWTs signed with `SECRET_KEY`; the frontend sends
+  `Authorization: Bearer <token>`.
+- **Licensing gate:** new users default to `pending` and see an "awaiting
+  approval" screen until the admin grants a licence. Set
+  `AUTO_LICENSE_NEW_USERS=true` to auto-activate new signups instead.
+- **Admin:** the account whose email equals `ADMIN_EMAIL` is auto-promoted to
+  admin (or, if `ADMIN_EMAIL` is empty, the first registered user). The admin
+  gets an **Admin dashboard** to list users and grant/revoke licences (revoking
+  immediately stops that user's engine) and delete accounts.
+- **Key encryption:** users' Binance/AI secrets are encrypted with Fernet, keyed
+  off `SECRET_KEY`. **If `SECRET_KEY` is unset, key storage is disabled** (we
+  refuse to store secrets we cannot encrypt) and login/signup are disabled — so
+  set `SECRET_KEY` in any real deployment.
+- **Per-user webhook:** `POST /api/webhook/tradingview/{token}`. The token in the
+  URL is the secret — no separate shared secret is needed.
+
 ## Features
 
 - **Paper & live modes** — live places REAL Binance orders; testnet supported.
@@ -64,8 +90,8 @@ TradingView alert ──▶ /webhook ──▶ risk checks ──▶ Binance ord
 - **Schema migrations** — Alembic is set up (`backend/alembic`) for non-additive
   changes; the app also applies lightweight additive column migrations on startup
   so existing SQLite databases keep working out of the box.
-- **API auth** — set `API_KEY` and all mutating endpoints require the
-  `X-API-Key` header. Secrets are compared in constant time.
+- **API auth** — every REST/WebSocket endpoint requires a valid JWT (see
+  "Multi-user" above); users only ever see their own trades, signals and status.
 - **Structured logging** — `LOG_FORMAT=json` for log aggregators.
 - **Retry/backoff** — transient Binance network errors are retried with
   exponential backoff; auth/insufficient-funds errors fail fast.
@@ -140,14 +166,19 @@ Steps:
    detects `railway.json` and builds the root `Dockerfile` (builder =
    `DOCKERFILE`). No root/subfolder selection needed.
 3. In the service **Variables** tab set at least:
+   - `SECRET_KEY` (**required** — signs JWTs and encrypts users' API keys; use a
+     long random value. Without it, login and key storage are disabled.)
+   - `ADMIN_EMAIL` (the account promoted to admin; grants licences to others)
    - `TRADING_MODE` (`paper` to start; `live` only when ready)
-   - `BINANCE_API_KEY`, `BINANCE_API_SECRET`, `BINANCE_TESTNET`
-   - `TRADINGVIEW_WEBHOOK_SECRET`, and `API_KEY` (**set this — the public URL is
-     internet-facing**)
-   - AI vars if used (`AI_API_KEY`, `AI_BASE_URL`, `AI_MODEL`, `AI_API_STYLE`)
+   - `AUTO_LICENSE_NEW_USERS` (`false` to require admin approval — the default
+     licensing gate; `true` to auto-activate signups)
+   - Optional global fallbacks: `BINANCE_TESTNET`, AI vars (`AI_API_KEY`,
+     `AI_BASE_URL`, `AI_MODEL`, `AI_API_STYLE`). Each user normally supplies
+     their own Binance/AI keys via the dashboard.
    - Do **not** set `PORT` — Railway injects it and the app binds to it.
-4. (Recommended) Add a **Volume** mounted at `/data` so the SQLite DB survives
-   redeploys. The image already points `DATABASE_URL` there.
+4. (Recommended) Add a **Volume** mounted at `/data` so the SQLite DB (users,
+   encrypted keys, trades, settings) survives redeploys. The image already
+   points `DATABASE_URL` there.
 5. Deploy. Healthcheck is `GET /api/health`; the dashboard is the service root
    `/`. On startup in live mode the logs run the exchange trading-access
    self-check and warn loudly if the key can't trade.
@@ -165,10 +196,12 @@ All settings load from environment / `backend/.env`. Key variables:
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `TRADING_MODE` | `paper` | `paper` (simulated) or `live` (REAL orders) |
-| `BINANCE_API_KEY` / `BINANCE_API_SECRET` | – | Binance credentials (live) |
+| `SECRET_KEY` | – | **Required in production.** Signs JWTs and encrypts users' API keys. Empty = login & key storage disabled |
+| `ADMIN_EMAIL` | – | Account auto-promoted to admin (empty = first registered user) |
+| `AUTO_LICENSE_NEW_USERS` | `false` | `false` = new users need admin approval (licensing gate); `true` = auto-activate |
+| `ACCESS_TOKEN_TTL_MINUTES` | `10080` | JWT lifetime (default 7 days) |
+| `BINANCE_API_KEY` / `BINANCE_API_SECRET` | – | Optional global fallback (users normally set their own) |
 | `BINANCE_TESTNET` | `true` | Use Binance testnet |
-| `TRADINGVIEW_WEBHOOK_SECRET` | `change-me` | Shared secret required in every alert |
-| `API_KEY` | – | If set, mutating endpoints require `X-API-Key` |
 | `MAX_OPEN_POSITIONS` | `5` | Max concurrent positions |
 | `RISK_PER_TRADE_PCT` | `1.0` | Equity risked per trade |
 | `DAILY_LOSS_LIMIT_PCT` | `5.0` | Halt new trades after this daily loss |
@@ -190,16 +223,17 @@ All settings load from environment / `backend/.env`. Key variables:
 
 ## TradingView alert format
 
-Set the alert webhook URL to `http(s)://<host>/webhook` and the message body to:
+Set the alert webhook URL to `http(s)://<host>/api/webhook/tradingview/<your-token>`
+(shown in your dashboard Settings; unique to your account). The token in the URL
+authenticates the alert, so the message body needs no secret:
 
 ```json
-{ "secret": "your-webhook-secret", "action": "buy", "symbol": "BTC/USDT", "amount": 0.001 }
+{ "action": "buy", "symbol": "BTC/USDT", "amount": 0.001 }
 ```
 
 `action` is `buy`, `sell`, or `close`. `amount` is optional (falls back to
 risk-based sizing). Add `"limit_price": 61000` to rest a limit order that only
-fills when the market reaches that price. The alert is rejected unless `secret`
-matches `TRADINGVIEW_WEBHOOK_SECRET`.
+fills when the market reaches that price. Keep your webhook URL private — treat it like a password.
 
 ## Database migrations (Alembic)
 
@@ -223,8 +257,12 @@ cd frontend && npm run build                        # type-check + build
 
 ## Security notes
 
-- The API is unauthenticated unless `API_KEY` is set — **set it before exposing
-  the API on any network.** Webhook and API secrets are compared in constant
-  time to avoid timing attacks.
+- **Set `SECRET_KEY`** before exposing the service — it signs JWTs and encrypts
+  every user's exchange keys at rest. Without it, login and key storage are
+  disabled by design. All endpoints require a valid JWT; users are isolated to
+  their own data.
+- **Custodial risk:** storing other people's exchange keys is sensitive. Keys
+  are encrypted with Fernet (never logged or returned), and users are told to
+  create **trade-only** keys (no withdrawal permission). Always serve over HTTPS.
 - Never commit `backend/.env` or real API keys.
 - Live mode places real orders — start on testnet and with small size.

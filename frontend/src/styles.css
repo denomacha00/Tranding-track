@@ -36,6 +36,30 @@ button {
   cursor: pointer;
 }
 
+.auth-wrap {
+  min-height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+.auth-card {
+  width: 100%;
+  max-width: 380px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.auth-card a {
+  color: var(--accent);
+  text-decoration: none;
+}
+
 input,
 select {
   font-family: inherit;

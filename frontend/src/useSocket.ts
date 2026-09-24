@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
+import { getToken } from './api'
 import type { BotStatus, WsMessage } from './types'
 
 type Handlers = {
@@ -19,7 +20,12 @@ export function useSocket({ onStatus, onEvent }: Handlers) {
 
     const connect = () => {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws'
-      ws = new WebSocket(`${proto}://${location.host}/ws`)
+      const token = getToken()
+      if (!token) {
+        retry = setTimeout(connect, 2000)
+        return
+      }
+      ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}`)
 
       ws.onopen = () => setConnected(true)
       ws.onclose = () => {

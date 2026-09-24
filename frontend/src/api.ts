@@ -6,21 +6,36 @@ import type {
   ExchangeAccess,
   ExecutionResult,
   MarketAnalysis,
+  Me,
   Settings,
   SignalRow,
   StrategyInfo,
   Trade,
   TrainingReport,
+  UserRow,
 } from './types'
 
+const TOKEN_KEY = 'tt_token'
+
+export function getToken(): string | null {
+  return typeof localStorage !== 'undefined' ? localStorage.getItem(TOKEN_KEY) : null
+}
+
+export function setToken(token: string | null) {
+  if (typeof localStorage === 'undefined') return
+  if (token) localStorage.setItem(TOKEN_KEY, token)
+  else localStorage.removeItem(TOKEN_KEY)
+}
+
+// Raised on a 401 so the app can bounce the user back to the login screen.
+export class AuthError extends Error {}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
-  // Optional API key (used when the backend has API_KEY set). Stored locally so
-  // the dashboard keeps working once the API is locked down.
-  const apiKey = typeof localStorage !== 'undefined' ? localStorage.getItem('tt_api_key') : null
+  const token = getToken()
   const res = await fetch(path, {
     headers: {
       'Content-Type': 'application/json',
-      ...(apiKey ? { 'X-API-Key': apiKey } : {}),
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
     },
     ...init,
   })
@@ -32,12 +47,46 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       /* ignore */
     }
+    if (res.status === 401) throw new AuthError(detail || 'Unauthorized')
     throw new Error(detail)
   }
   return res.json() as Promise<T>
 }
 
 export const api = {
+  // ---- auth ----
+  signup: (email: string, password: string) =>
+    req<{ access_token: string }>('/api/auth/signup', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    }),
+  login: (email: string, password: string) =>
+    req<{ access_token: string }>('/api/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ email, password }),
+    }),
+  me: () => req<Me>('/api/auth/me'),
+  updateCredentials: (body: {
+    binance_api_key?: string
+    binance_api_secret?: string
+    binance_testnet?: boolean
+    ai_api_key?: string
+    ai_base_url?: string
+    ai_model?: string
+    ai_style?: string
+  }) => req<Me>('/api/credentials', { method: 'PUT', body: JSON.stringify(body) }),
+
+  // ---- admin ----
+  adminUsers: () => req<UserRow[]>('/api/admin/users'),
+  adminSetLicense: (id: number, status: 'pending' | 'active' | 'revoked') =>
+    req<UserRow>(`/api/admin/users/${id}/license`, {
+      method: 'PATCH',
+      body: JSON.stringify({ status }),
+    }),
+  adminDeleteUser: (id: number) =>
+    req<{ deleted: number }>(`/api/admin/users/${id}`, { method: 'DELETE' }),
+
+  // ---- trading ----
   status: () => req<BotStatus>('/api/status'),
   settings: () => req<Settings>('/api/settings'),
   updateSettings: (patch: Partial<Settings>) =>

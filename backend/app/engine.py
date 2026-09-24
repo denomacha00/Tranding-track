@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session
 from app.config import Settings, get_settings
 from app.exchange import BinanceConnector
 from app.analysis import MarketAnalyzer
+from app.ai import AICommentator
 from app.models import Trade, TradeStatus
 from app.risk import RiskManager
 from app.notifier import Notifier
@@ -39,12 +40,15 @@ def _utcnow() -> dt.datetime:
 class TradingEngine:
     """Coordinates market data, risk, execution and position bookkeeping."""
 
-    def __init__(self, settings: Settings, connector: BinanceConnector) -> None:
+    def __init__(self, settings: Settings, connector: BinanceConnector,
+                 user_id: int | None = None) -> None:
         self.settings = settings
         self.connector = connector
-        self.risk = RiskManager(settings)
+        self.user_id = user_id
+        self.risk = RiskManager(settings, user_id=user_id)
         self.analyzer = MarketAnalyzer(min_confidence=settings.min_signal_confidence)
         self.notifier = Notifier(settings)
+        self.ai = AICommentator(settings)
         self._lock = threading.Lock()
         self.running = False
         # Paper wallet (quote currency, e.g. USDT).
@@ -52,6 +56,16 @@ class TradingEngine:
         # Event broadcaster set by the app on startup.
         self._broadcaster: Optional[Any] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
+
+    def _scope(self, stmt):
+        """Restrict a Trade query to this engine's user (multi-tenant isolation).
+
+        In single-tenant mode (user_id is None) queries are unscoped, preserving
+        the original global behaviour used by the tests.
+        """
+        if self.user_id is not None:
+            stmt = stmt.where(Trade.user_id == self.user_id)
+        return stmt
 
     # ---- wiring ------------------------------------------------------
 
@@ -65,7 +79,7 @@ class TradingEngine:
         Called once at app start so a restart doesn't silently reset trading
         mode, auto-trade flags, risk params or the simulated wallet.
         """
-        overrides = load_settings_overrides(db)
+        overrides = load_settings_overrides(db, self.user_id)
         if overrides:
             for key, value in overrides.items():
                 if hasattr(self.settings, key):
@@ -74,7 +88,9 @@ class TradingEngine:
             self.connector.reload(self.settings)
             self.analyzer.min_confidence = self.settings.min_signal_confidence
         # Paper wallet: restore or seed from configured starting balance.
-        self.paper_balance = load_paper_balance(db, self.settings.paper_starting_balance)
+        self.paper_balance = load_paper_balance(
+            db, self.settings.paper_starting_balance, self.user_id
+        )
         self._reconcile_live_positions(db)
 
     def _reconcile_live_positions(self, db: Session) -> None:
@@ -93,7 +109,9 @@ class TradingEngine:
             return
         open_trades = list(
             db.scalars(
-                select(Trade).where(Trade.status == TradeStatus.open.value)
+                self._scope(
+                    select(Trade).where(Trade.status == TradeStatus.open.value)
+                )
             ).all()
         )
         if not open_trades:
@@ -155,9 +173,9 @@ class TradingEngine:
 
     def persist_settings(self, db: Session, overrides: dict[str, Any]) -> None:
         """Merge and persist settings overrides so they survive restarts."""
-        current = load_settings_overrides(db)
+        current = load_settings_overrides(db, self.user_id)
         current.update(overrides)
-        save_settings_overrides(db, current)
+        save_settings_overrides(db, current, self.user_id)
 
     def apply_settings(self, settings: Settings) -> None:
         self.settings = settings
@@ -165,11 +183,15 @@ class TradingEngine:
         self.connector.reload(settings)
         self.analyzer.min_confidence = settings.min_signal_confidence
         self.notifier.reload(settings)
+        self.ai.reload(settings)
 
     def _emit(self, event: str, payload: dict[str, Any]) -> None:
         if self._broadcaster and self._loop:
+            message: dict[str, Any] = {"event": event, "data": payload}
+            if self.user_id is not None:
+                message["user_id"] = self.user_id
             asyncio.run_coroutine_threadsafe(
-                self._broadcaster.broadcast({"event": event, "data": payload}),
+                self._broadcaster.broadcast(message),
                 self._loop,
             )
 
@@ -195,11 +217,13 @@ class TradingEngine:
 
     def _open_trade_for_symbol(self, db: Session, symbol: str) -> Optional[Trade]:
         # A resting (pending) limit order also occupies the symbol slot.
-        stmt = select(Trade).where(
-            Trade.symbol == symbol,
-            Trade.status.in_(
-                [TradeStatus.open.value, TradeStatus.pending.value]
-            ),
+        stmt = self._scope(
+            select(Trade).where(
+                Trade.symbol == symbol,
+                Trade.status.in_(
+                    [TradeStatus.open.value, TradeStatus.pending.value]
+                ),
+            )
         )
         return db.scalars(stmt).first()
 
@@ -290,7 +314,7 @@ class TradingEngine:
                     # Paper: reserve notional now so equity/exposure is honest
                     # while the order rests; released if cancelled, consumed on fill.
                     self.paper_balance -= qty * limit_price
-                    save_paper_balance(db, self.paper_balance)
+                    save_paper_balance(db, self.paper_balance, self.user_id)
 
                 trade = Trade(
                     symbol=symbol,
@@ -307,6 +331,7 @@ class TradingEngine:
                     exchange_order_id=exchange_order_id,
                     note=note,
                     opened_at=_utcnow(),
+                    user_id=self.user_id,
                 )
                 db.add(trade)
                 db.commit()
@@ -341,7 +366,7 @@ class TradingEngine:
             else:
                 # Paper: reserve notional from the paper wallet.
                 self.paper_balance -= qty * price
-                save_paper_balance(db, self.paper_balance)
+                save_paper_balance(db, self.paper_balance, self.user_id)
 
             sl = stop_loss or self._auto_stop(price, action)
             tp = take_profit or self._auto_take(price, action)
@@ -371,6 +396,7 @@ class TradingEngine:
                 stop_order_id=stop_order_id,
                 note=note,
                 opened_at=_utcnow(),
+                user_id=self.user_id,
             )
             db.add(trade)
             db.commit()
@@ -404,7 +430,7 @@ class TradingEngine:
         else:
             # Paper: give back the notional we reserved when the order was placed.
             self.paper_balance += trade.amount * (trade.limit_price or trade.entry_price)
-            save_paper_balance(db, self.paper_balance)
+            save_paper_balance(db, self.paper_balance, self.user_id)
 
         trade.status = TradeStatus.canceled.value
         trade.closed_at = _utcnow()
@@ -455,7 +481,7 @@ class TradingEngine:
         closed/filled, using the exchange's average fill price.
         """
         filled: list[Trade] = []
-        stmt = select(Trade).where(Trade.status == TradeStatus.pending.value)
+        stmt = self._scope(select(Trade).where(Trade.status == TradeStatus.pending.value))
         for trade in list(db.scalars(stmt).all()):
             limit = trade.limit_price or trade.entry_price
             if self.settings.is_live:
@@ -512,7 +538,7 @@ class TradingEngine:
         if not self.settings.is_live:
             # Return notional + pnl to the paper wallet.
             self.paper_balance += trade.amount * trade.entry_price + pnl
-            save_paper_balance(db, self.paper_balance)
+            save_paper_balance(db, self.paper_balance, self.user_id)
 
         trade.exit_price = price
         trade.pnl = pnl
@@ -545,7 +571,7 @@ class TradingEngine:
     def check_open_positions(self, db: Session) -> list[tuple[Trade, str]]:
         """Check SL/TP for all open trades and close those that hit. Returns closed."""
         closed: list[tuple[Trade, str]] = []
-        stmt = select(Trade).where(Trade.status == TradeStatus.open.value)
+        stmt = self._scope(select(Trade).where(Trade.status == TradeStatus.open.value))
         for trade in list(db.scalars(stmt).all()):
             try:
                 price = self._price(trade.symbol, fallback=trade.entry_price)
@@ -670,7 +696,9 @@ class TradingEngine:
     def status(self, db: Session) -> dict[str, Any]:
         open_trades = list(
             db.scalars(
-                select(Trade).where(Trade.status == TradeStatus.open.value)
+                self._scope(
+                    select(Trade).where(Trade.status == TradeStatus.open.value)
+                )
             ).all()
         )
         unrealized = 0.0
@@ -685,7 +713,9 @@ class TradingEngine:
             sum(
                 t.pnl
                 for t in db.scalars(
-                    select(Trade).where(Trade.status == TradeStatus.closed.value)
+                    self._scope(
+                        select(Trade).where(Trade.status == TradeStatus.closed.value)
+                    )
                 ).all()
             )
         )

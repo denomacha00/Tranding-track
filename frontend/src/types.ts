@@ -156,7 +156,7 @@ export interface MarketAnalysis {
 }
 
 export type WsMessage =
-  | { event: 'status'; data: BotStatus }
+  | { event: 'status'; data: BotStatus; user_id?: number }
   | { event: 'trade_opened'; data: { id: number; symbol: string; side: string } }
   | { event: 'trade_closed'; data: { id: number; symbol: string; pnl: number } }
   | { event: 'order_pending'; data: { id: number; symbol: string; side: string; limit_price: number } }
@@ -168,3 +168,25 @@ export type WsMessage =
       event: 'signal'
       data: { source: string; action: string; symbol: string; accepted: boolean; message: string }
     }
+
+export interface Me {
+  id: number
+  email: string
+  role: 'admin' | 'user'
+  license_status: 'pending' | 'active' | 'revoked'
+  webhook_path: string
+  binance_keys_set: boolean
+  binance_testnet: boolean
+  ai_key_set: boolean
+  ai_model: string
+  secrets_storage_enabled: boolean
+}
+
+export interface UserRow {
+  id: number
+  email: string
+  role: 'admin' | 'user'
+  license_status: 'pending' | 'active' | 'revoked'
+  created_at: string
+  licensed_at: string | null
+}

@@ -55,7 +55,9 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "stop_order_id": "VARCHAR(64)",
         "order_type": "VARCHAR(8) DEFAULT 'market'",
         "limit_price": "FLOAT",
+        "user_id": "INTEGER",
     },
+    "signal_logs": {"user_id": "INTEGER"},
 }
 
 

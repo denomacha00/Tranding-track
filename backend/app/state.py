@@ -1,18 +1,22 @@
 """Persisted runtime state (KV store) so the bot survives restarts.
 
+Multi-user: every piece of runtime state is scoped by ``user_id`` so one user's
+settings/wallet never leak into another's. Keys look like
+``settings_overrides:{user_id}`` and ``paper_balance:{user_id}``. A ``user_id``
+of ``None`` maps to the legacy global keys (used by single-tenant tests and any
+pre-multiuser data).
+
 What lives here and why:
-- ``settings_overrides``: fields changed via PATCH /api/settings. Without this,
-  restarting the backend would silently reset trading mode, auto-trade on/off,
-  risk params, etc. — dangerous for an unattended bot.
-- ``paper_balance``: the simulated wallet. Without this the paper P&L resets on
-  every restart and drifts from the trade history in the DB.
+- ``settings_overrides``: fields changed via the settings endpoint. Without this,
+  a restart would silently reset trading mode, auto-trade on/off, risk params.
+- ``paper_balance``: the simulated wallet, so paper P&L survives restarts.
 
 Everything is stored as JSON text in the ``kv_store`` table.
 """
 from __future__ import annotations
 
 import json
-from typing import Any
+from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
@@ -20,6 +24,10 @@ from app.models import KeyValue
 
 SETTINGS_KEY = "settings_overrides"
 PAPER_BALANCE_KEY = "paper_balance"
+
+
+def _scoped(base: str, user_id: Optional[int]) -> str:
+    return base if user_id is None else f"{base}:{user_id}"
 
 
 def kv_get(db: Session, key: str, default: Any = None) -> Any:
@@ -42,22 +50,28 @@ def kv_set(db: Session, key: str, value: Any) -> None:
     db.commit()
 
 
-def load_settings_overrides(db: Session) -> dict[str, Any]:
-    data = kv_get(db, SETTINGS_KEY, {})
+def load_settings_overrides(db: Session, user_id: Optional[int] = None) -> dict[str, Any]:
+    data = kv_get(db, _scoped(SETTINGS_KEY, user_id), {})
     return data if isinstance(data, dict) else {}
 
 
-def save_settings_overrides(db: Session, overrides: dict[str, Any]) -> None:
-    kv_set(db, SETTINGS_KEY, overrides)
+def save_settings_overrides(
+    db: Session, overrides: dict[str, Any], user_id: Optional[int] = None
+) -> None:
+    kv_set(db, _scoped(SETTINGS_KEY, user_id), overrides)
 
 
-def load_paper_balance(db: Session, default: float) -> float:
-    val = kv_get(db, PAPER_BALANCE_KEY, None)
+def load_paper_balance(
+    db: Session, default: float, user_id: Optional[int] = None
+) -> float:
+    val = kv_get(db, _scoped(PAPER_BALANCE_KEY, user_id), None)
     try:
         return float(val) if val is not None else default
     except (ValueError, TypeError):
         return default
 
 
-def save_paper_balance(db: Session, balance: float) -> None:
-    kv_set(db, PAPER_BALANCE_KEY, float(balance))
+def save_paper_balance(
+    db: Session, balance: float, user_id: Optional[int] = None
+) -> None:
+    kv_set(db, _scoped(PAPER_BALANCE_KEY, user_id), float(balance))

@@ -14,7 +14,9 @@ class TradingViewSignal(BaseModel):
         {"secret": "...", "action": "buy", "symbol": "BTC/USDT", "amount": 0.001}
     """
 
-    secret: str
+    # Optional now: the unguessable per-user token in the webhook URL is the
+    # authenticator. Kept for backward-compatible alert payloads.
+    secret: Optional[str] = None
     action: Literal["buy", "sell", "close"]
     symbol: str
     # Optional explicit amount (base currency). If omitted, risk manager sizes it.
@@ -136,3 +138,63 @@ class SettingsUpdate(BaseModel):
     auto_confirm_timeframe: Optional[str] = None
     trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=100)
     max_total_exposure_pct: Optional[float] = Field(default=None, ge=0, le=1000)
+
+
+# ---- Auth & multi-user ----------------------------------------------
+
+
+class SignupRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=255)
+    password: str = Field(min_length=8, max_length=200)
+
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
+
+class UserOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    email: str
+    role: str
+    license_status: str
+    created_at: dt.datetime
+    licensed_at: Optional[dt.datetime] = None
+
+
+class MeOut(BaseModel):
+    """Current user + capability flags the UI needs to render correctly."""
+
+    id: int
+    email: str
+    role: str
+    license_status: str
+    webhook_path: str
+    binance_keys_set: bool
+    binance_testnet: bool
+    ai_key_set: bool
+    ai_model: str = ""
+    secrets_storage_enabled: bool
+
+
+class CredentialsUpdate(BaseModel):
+    """Per-user API-key entry. Any field omitted is left unchanged."""
+
+    binance_api_key: Optional[str] = None
+    binance_api_secret: Optional[str] = None
+    binance_testnet: Optional[bool] = None
+    ai_api_key: Optional[str] = None
+    ai_base_url: Optional[str] = None
+    ai_model: Optional[str] = None
+    ai_style: Optional[str] = None
+
+
+class LicenseUpdate(BaseModel):
+    status: Literal["pending", "active", "revoked"]
