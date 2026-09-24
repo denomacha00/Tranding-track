@@ -92,8 +92,15 @@ def test_ai_ask_requires_question(client):
     assert r.status_code == 400
 
 
-def test_ai_ask_without_key_falls_back(client):
-    # No AI_API_KEY configured -> graceful message, ai_enabled False, no crash.
+def test_ai_ask_without_key_falls_back(client, monkeypatch):
+    # Force NO AI key so the fallback path is exercised regardless of the
+    # environment's .env (the app may have a real key configured locally).
+    import app.main as main_mod
+    from app.ai import AICommentator
+
+    s = get_settings()
+    monkeypatch.setattr(s, "ai_api_key", "", raising=False)
+    monkeypatch.setattr(main_mod, "_ai", AICommentator(s), raising=False)
     r = client.post("/api/ai/ask", json={"question": "what is the trend?"})
     assert r.status_code == 200
     body = r.json()

@@ -23,12 +23,19 @@ class Settings(BaseSettings):
     # TradingView webhook
     tradingview_webhook_secret: str = Field(default="change-me")
 
-    # Optional AI/LLM commentary (OpenAI-compatible chat completions API).
-    # Leave ai_api_key empty to disable — the bot works fully without it.
+    # Optional AI/LLM commentary. Works with EITHER an OpenAI-compatible
+    # chat-completions API OR an Anthropic-native messages API. Leave
+    # ai_api_key empty to disable — the bot works fully without it.
     ai_api_key: str = Field(default="")
     ai_base_url: str = Field(default="https://api.openai.com/v1")
     ai_model: str = Field(default="gpt-4o-mini")
-    ai_timeout_seconds: float = Field(default=20.0)
+    ai_timeout_seconds: float = Field(default=45.0)
+    # Provider API style: "auto" (infer from model/base_url), "openai", or
+    # "anthropic". Auto picks Anthropic when the model looks like a Claude model
+    # or the base URL is anthropic-flavoured; otherwise OpenAI chat-completions.
+    ai_api_style: str = Field(default="auto")
+    # Token budget for AI replies. Higher = more room to reason/research.
+    ai_max_tokens: int = Field(default=1024)
 
     # Risk management
     max_open_positions: int = Field(default=5)

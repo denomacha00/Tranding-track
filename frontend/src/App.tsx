@@ -458,6 +458,17 @@ function AnalyzePanel({
     }
   }
 
+  const runAssess = async () => {
+    setBusy(true)
+    try {
+      setAnalysis(await api.analyze(symbol, timeframe, false, true))
+    } catch (e) {
+      onError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   const ask = async () => {
     if (!question.trim()) return
     setAsking(true)
@@ -490,6 +501,9 @@ function AnalyzePanel({
         <button className="btn" onClick={() => run(true)} disabled={busy}>
           Analyze + explain
         </button>
+        <button className="btn" onClick={() => runAssess()} disabled={busy}>
+          🧠 Deep assessment
+        </button>
       </div>
 
       {analysis && (
@@ -504,6 +518,20 @@ function AnalyzePanel({
           <p style={{ marginTop: 6 }}>{analysis.summary}</p>
           {analysis.narration && analysis.narration !== analysis.summary && (
             <p className="hint" style={{ fontStyle: 'italic' }}>🧠 {analysis.narration}</p>
+          )}
+          {analysis.assessment && analysis.assessment !== analysis.summary && (
+            <div
+              className="hint"
+              style={{
+                marginTop: 8,
+                whiteSpace: 'pre-wrap',
+                background: 'rgba(127,127,127,0.08)',
+                borderRadius: 8,
+                padding: 12,
+              }}
+            >
+              {analysis.assessment}
+            </div>
           )}
           <table style={{ marginTop: 8 }}>
             <thead>
@@ -1025,7 +1053,7 @@ function SettingsPanel({
         When enabled, on every monitor tick the bot runs its analyzer on each auto
         symbol and only opens a long (or exits one) when confidence clears the
         threshold. Higher confidence = fewer, higher-conviction trades.{' '}
-        {form.ai_enabled ? '✅ AI commentary is configured.' : 'AI commentary is off (set AI_API_KEY to enable).'}
+        {form.ai_enabled ? `✅ AI commentary is configured${form.ai_model ? ` (${form.ai_model}${form.ai_style ? `, ${form.ai_style}` : ''})` : ''}.` : 'AI commentary is off (set AI_API_KEY to enable).'}
       </p>
       <p className="hint">
         Trailing stop ratchets an open long's stop-loss upward as price rises to

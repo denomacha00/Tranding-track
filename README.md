@@ -27,8 +27,11 @@ TradingView alert ──▶ /webhook ──▶ risk checks ──▶ Binance ord
   volatility, recent return) that produces one confidence-scored verdict with a
   human-readable reason for every component. When signals disagree or
   volatility is extreme it returns **HOLD** — "no trade" is a valid decision.
-- **Optional LLM narration** (`app/ai.py`) can *explain* the analysis, but it
-  **never decides trades**.
+- **Optional LLM narration + assessment** (`app/ai.py`) can *explain* the
+  analysis and produce a deeper risk-first assessment (signal quality, risks,
+  bull/bear scenarios, position-sizing sanity check), but it **never decides
+  trades**. Works with either an OpenAI-compatible or an Anthropic-native
+  (Claude) provider — pick via `AI_API_STYLE` (auto-detected by default).
 - **Autonomous trading** is off by default, long-only, and confidence-gated.
 
 ## Features
@@ -128,6 +131,11 @@ All settings load from environment / `backend/.env`. Key variables:
 | `AUTO_SYMBOLS` | `BTC/USDT` | Symbols the bot analyses/trades |
 | `AUTO_TIMEFRAME` | `1h` | Timeframe for autonomous analysis |
 | `AUTO_CONFIRM_TIMEFRAME` | – | Higher timeframe that must agree (blank = off) |
+| `AI_API_KEY` | – | Enables the optional LLM commentary/assessment layer |
+| `AI_BASE_URL` | `https://api.openai.com/v1` | Provider base URL (OpenAI- or Anthropic-style) |
+| `AI_MODEL` | `gpt-4o-mini` | Model name (e.g. `gpt-4o-mini` or `claude-opus-4-8`) |
+| `AI_API_STYLE` | `auto` | `auto` / `openai` / `anthropic` — auto infers from the model/URL |
+| `AI_MAX_TOKENS` | `1024` | Token budget for AI replies (more = deeper reasoning) |
 | `LOG_FORMAT` / `LOG_LEVEL` | `text` / `INFO` | `json` for structured logs |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | – | Optional notifications |
 

@@ -114,6 +114,8 @@ class SettingsOut(BaseModel):
     auto_timeframe: str
     auto_confirm_timeframe: str
     ai_enabled: bool
+    ai_model: str = ""
+    ai_style: str = ""
     notifications_enabled: bool
     api_key_set: bool
     webhook_path: str

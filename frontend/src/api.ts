@@ -74,9 +74,9 @@ export const api = {
       `/api/train?symbol=${encodeURIComponent(symbol)}&strategy=${strategy}&timeframe=${timeframe}`,
       { method: 'POST' },
     ),
-  analyze: (symbol: string, timeframe = '1h', explain = false) =>
+  analyze: (symbol: string, timeframe = '1h', explain = false, assess = false) =>
     req<MarketAnalysis>(
-      `/api/analyze/${encodeURIComponent(symbol)}?timeframe=${timeframe}&explain=${explain}`,
+      `/api/analyze/${encodeURIComponent(symbol)}?timeframe=${timeframe}&explain=${explain}&assess=${assess}`,
     ),
   aiAsk: (question: string, symbol?: string, timeframe = '1h') =>
     req<{ answer: string; ai_enabled: boolean }>('/api/ai/ask', {

@@ -60,6 +60,8 @@ export interface Settings {
   auto_timeframe: string
   auto_confirm_timeframe: string
   ai_enabled: boolean
+  ai_model?: string
+  ai_style?: string
   notifications_enabled: boolean
   api_key_set: boolean
   webhook_path: string
@@ -140,6 +142,7 @@ export interface MarketAnalysis {
   summary: string
   factors: AnalysisFactor[]
   narration?: string
+  assessment?: string
   ai_enabled?: boolean
 }
 

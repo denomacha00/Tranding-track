@@ -324,6 +324,8 @@ def get_settings_endpoint():
         auto_timeframe=s.auto_timeframe,
         auto_confirm_timeframe=s.auto_confirm_timeframe,
         ai_enabled=bool(s.ai_api_key),
+        ai_model=s.ai_model,
+        ai_style=get_ai()._style() if s.ai_api_key else "",
         notifications_enabled=engine.notifier.enabled,
         api_key_set=bool(s.api_key),
         webhook_path=WEBHOOK_PATH,
@@ -435,16 +437,20 @@ def backtest(
 
 
 @app.get("/api/analyze/{symbol:path}")
-def analyze(symbol: str, timeframe: str = "1h", explain: bool = False):
+def analyze(symbol: str, timeframe: str = "1h", explain: bool = False, assess: bool = False):
     """Run the multi-indicator analyzer and return a confidence-scored verdict.
 
-    Set explain=true to also get a natural-language narration (uses the AI
-    layer if configured, otherwise the built-in deterministic summary).
+    Set explain=true to also get a natural-language narration, or assess=true for
+    a deeper risk-first assessment (signal quality, risks, scenarios, sizing).
+    Both use the AI layer if configured, otherwise the deterministic summary.
     """
     analysis = _analysis_for(symbol, timeframe)
     result = analysis.as_dict()
     if explain:
         result["narration"] = get_ai().narrate(analysis)
+        result["ai_enabled"] = get_ai().available
+    if assess:
+        result["assessment"] = get_ai().assess(analysis)
         result["ai_enabled"] = get_ai().available
     return result
 
