@@ -65,6 +65,25 @@ class Settings(BaseSettings):
     # timeframe is not a buy. Empty = single-timeframe (disabled).
     auto_confirm_timeframe: str = Field(default="")
 
+    # AI trade review (permission gate). When true AND an AI key is configured
+    # AND autonomous trading is on, the AI layer reviews each ENTRY the
+    # deterministic brain proposes and may VETO it (risk-first). It can only
+    # BLOCK new risk — never invent a trade, never block an exit — and if the AI
+    # is unavailable it falls back to the deterministic decision (never
+    # fabricates a veto/approval). Off by default; paper-test before enabling live.
+    ai_trade_confirm: bool = Field(default=False)
+
+    # Live market-news sources for the AI assistant + News panel. Comma-separated
+    # public RSS/Atom feed URLs (crypto/markets). Real headlines only — if a feed
+    # is unreachable it's reported as unavailable, never faked. No user data is
+    # sent to fetch these (plain GETs to public feeds).
+    news_feeds: str = Field(
+        default=(
+            "https://www.coindesk.com/arc/outboundfeeds/rss/,"
+            "https://cointelegraph.com/rss"
+        )
+    )
+
     # Paper trading
     paper_starting_balance: float = Field(default=10_000.0)
 
@@ -115,6 +134,10 @@ class Settings(BaseSettings):
     @property
     def auto_symbol_list(self) -> list[str]:
         return [s.strip().upper() for s in self.auto_symbols.split(",") if s.strip()]
+
+    @property
+    def news_feed_list(self) -> list[str]:
+        return [u.strip() for u in self.news_feeds.split(",") if u.strip()]
 
     @property
     def is_live(self) -> bool:

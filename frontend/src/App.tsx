@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, setToken, getToken, setAuthFailureHandler } from './api'
 import { PriceChart } from './PriceChart'
 import { Login, LicenseGate } from './Login'
@@ -6,7 +6,7 @@ import { Admin } from './Admin'
 import { useSocket } from './useSocket'
 import { useTheme, type Theme } from './theme'
 import { ThemeToggle } from './ThemeToggle'
-import type { BotStatus, BacktestResult, Candle, ExchangeAccess, MarketAnalysis, Me, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
+import type { BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, MarketAnalysis, Me, NewsItem, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
 
 const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
@@ -91,13 +91,14 @@ export default function App() {
   return <Dashboard me={me} onLogout={logout} onMeChanged={setMe} theme={theme} onToggleTheme={toggleTheme} />
 }
 
-type TabKey = 'trades' | 'signals' | 'analyze' | 'train' | 'backtest' | 'settings' | 'admin'
+type TabKey = 'trades' | 'signals' | 'assistant' | 'analyze' | 'train' | 'backtest' | 'settings' | 'admin'
 
 // Left-drawer navigation. `admin: true` items only render for admins. The same
 // keys drive the in-panel tab strip, so the two stay in sync off one `tab`.
 const NAV: { key: TabKey; label: string; icon: string; admin?: boolean }[] = [
   { key: 'trades', label: 'Trades', icon: '📈' },
   { key: 'signals', label: 'Signals', icon: '📡' },
+  { key: 'assistant', label: 'AI Assistant', icon: '🤖' },
   { key: 'analyze', label: 'Analyze', icon: '🔍' },
   { key: 'train', label: 'Train', icon: '🧠' },
   { key: 'backtest', label: 'Backtest', icon: '↺' },
@@ -190,7 +191,16 @@ function Dashboard({
       }
       if (m.event === 'signal') {
         refreshSignals()
-        showToast(m.data.accepted ? 'ok' : 'error', m.data.message)
+        // The built-in analyzer logs its OWN verdict changes here too. A
+        // hold/blocked verdict isn't a failure, so don't flash a red error
+        // toast for it — only surface a toast when the bot actually acted.
+        // External (TradingView) signals keep the ok/error toast so a
+        // rejected alert is still visible.
+        if (m.data.source === 'analyzer') {
+          if (m.data.accepted) showToast('ok', m.data.message)
+        } else {
+          showToast(m.data.accepted ? 'ok' : 'error', m.data.message)
+        }
       }
     },
   })
@@ -212,6 +222,14 @@ function Dashboard({
     const id = setInterval(refreshTrades, 15000)
     return () => clearInterval(id)
   }, [refreshTrades])
+
+  // Same safety net for the signal log: verdict changes are pushed over the
+  // WebSocket, but poll on a slow cadence so anything missed during a socket
+  // gap still appears (and the tab is populated even if a push was dropped).
+  useEffect(() => {
+    const id = setInterval(refreshSignals, 20000)
+    return () => clearInterval(id)
+  }, [refreshSignals])
 
   // Load candles when symbol/timeframe changes, and poll periodically. The
   // poll is fairly frequent so a new closed bar shows up quickly; the live
@@ -467,6 +485,13 @@ function Dashboard({
         <div className="col">
           <StatsRow status={status} />
 
+          <AutonomyToggle
+            settings={settings}
+            status={status}
+            onSaved={(s) => setSettings(s)}
+            onError={(m) => showToast('error', m)}
+          />
+
           <section className="panel">
             <div className="panel-head">
               <div className="price-ticker">
@@ -604,6 +629,12 @@ function Dashboard({
                   Signals
                 </span>
                 <span
+                  className={`tab ${tab === 'assistant' ? 'active' : ''}`}
+                  onClick={() => setTab('assistant')}
+                >
+                  AI Assistant
+                </span>
+                <span
                   className={`tab ${tab === 'analyze' ? 'active' : ''}`}
                   onClick={() => setTab('analyze')}
                 >
@@ -648,6 +679,14 @@ function Dashboard({
                 />
               )}
               {tab === 'signals' && <SignalsTable signals={signals} />}
+              {tab === 'assistant' && (
+                <AssistantPanel
+                  symbol={symbol}
+                  timeframe={timeframe}
+                  aiKeySet={me.ai_key_set}
+                  onError={(m) => showToast('error', m)}
+                />
+              )}
               {tab === 'analyze' && (
                 <AnalyzePanel
                   symbol={symbol}
@@ -794,30 +833,572 @@ function TradesTable({
   )
 }
 
+// Map a REAL analyzer verdict + confidence to a TradingView-style rating label.
+// Never invents a rating: a hold, or a row with no confidence, reads "Neutral".
+function ratingFor(
+  action: string | null,
+  confidence: number | null,
+): { label: string; cls: string } {
+  if (action === 'buy')
+    return confidence != null && confidence >= 0.66
+      ? { label: 'Strong Buy', cls: 'rate-strong-buy' }
+      : { label: 'Buy', cls: 'rate-buy' }
+  if (action === 'sell')
+    return confidence != null && confidence >= 0.66
+      ? { label: 'Strong Sell', cls: 'rate-strong-sell' }
+      : { label: 'Sell', cls: 'rate-sell' }
+  return { label: 'Neutral', cls: 'rate-neutral' }
+}
+
+type SigSource = 'all' | 'analyzer' | 'tradingview'
+type SigAction = 'all' | 'buy' | 'sell' | 'hold'
+
 function SignalsTable({ signals }: { signals: SignalRow[] }) {
-  if (!signals.length)
-    return <div className="empty">No signals received yet. Wire up TradingView in Settings.</div>
+  const [srcFilter, setSrcFilter] = useState<SigSource>('all')
+  const [actFilter, setActFilter] = useState<SigAction>('all')
+
+  // Per-symbol rating strip from the LATEST analyzer verdict per symbol. Signals
+  // arrive newest-first, so the first analyzer row seen for a symbol is current.
+  // Built only from real logged verdicts — a symbol with none is never shown.
+  const ratings = useMemo(() => {
+    const seen = new Map<string, SignalRow>()
+    for (const s of signals) {
+      if (s.source !== 'analyzer' || !s.symbol) continue
+      if (!seen.has(s.symbol)) seen.set(s.symbol, s)
+    }
+    return Array.from(seen.values())
+  }, [signals])
+
+  const filtered = useMemo(
+    () =>
+      signals.filter((s) => {
+        if (srcFilter !== 'all' && s.source !== srcFilter) return false
+        if (actFilter !== 'all' && (s.action ?? 'hold') !== actFilter) return false
+        return true
+      }),
+    [signals, srcFilter, actFilter],
+  )
+
+  const fmtTime = (iso: string) => {
+    const d = new Date(iso)
+    return Number.isNaN(d.getTime()) ? '-' : d.toLocaleString()
+  }
+  const actionClass = (a: string | null) =>
+    a === 'buy' ? 'sig-buy' : a === 'sell' ? 'sig-sell' : 'sig-hold'
+
   return (
-    <table>
-      <thead>
-        <tr>
-          <th>Source</th>
-          <th>Action</th>
-          <th>Symbol</th>
-          <th>OK</th>
-        </tr>
-      </thead>
-      <tbody>
-        {signals.map((s) => (
-          <tr key={s.id}>
-            <td>{s.source}</td>
-            <td>{s.action ?? '-'}</td>
-            <td>{s.symbol ?? '-'}</td>
-            <td>{s.accepted ? '✅' : '❌'}</td>
-          </tr>
-        ))}
-      </tbody>
-    </table>
+    <div className="signals-wrap">
+      {ratings.length > 0 && (
+        <div className="rating-strip">
+          {ratings.map((r) => {
+            const rt = ratingFor(r.action, r.confidence)
+            const pct = r.confidence != null ? Math.round(r.confidence * 100) : null
+            return (
+              <div key={r.symbol} className="rating-card" title={r.message ?? undefined}>
+                <div className="rating-sym">{r.symbol}</div>
+                <div className={`rating-badge ${rt.cls}`}>{rt.label}</div>
+                <div className="conf-bar">
+                  <span
+                    className={`conf-fill ${rt.cls}`}
+                    style={{ width: pct != null ? `${pct}%` : '0%' }}
+                  />
+                </div>
+                <div className="muted rating-conf">
+                  {pct != null ? `confidence ${pct}%` : 'no confidence'}
+                </div>
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      <div className="sig-filters">
+        <div className="seg">
+          {(['all', 'analyzer', 'tradingview'] as SigSource[]).map((v) => (
+            <button
+              key={v}
+              type="button"
+              className={`seg-btn ${srcFilter === v ? 'active' : ''}`}
+              onClick={() => setSrcFilter(v)}
+            >
+              {v === 'all' ? 'All sources' : v === 'analyzer' ? 'Brain' : 'TradingView'}
+            </button>
+          ))}
+        </div>
+        <div className="seg">
+          {(['all', 'buy', 'sell', 'hold'] as SigAction[]).map((v) => (
+            <button
+              key={v}
+              type="button"
+              className={`seg-btn ${actFilter === v ? 'active' : ''}`}
+              onClick={() => setActFilter(v)}
+            >
+              {v === 'all' ? 'All' : v.toUpperCase()}
+            </button>
+          ))}
+        </div>
+        <span className="spacer" />
+        <span className="hint">{filtered.length} shown</span>
+      </div>
+
+      {!signals.length ? (
+        <div className="empty">
+          No signals yet. The built-in analyzer records its own live verdicts here
+          every few seconds while the bot is running — even with autonomous trading
+          off — alongside any TradingView alerts you wire up in Settings.
+        </div>
+      ) : !filtered.length ? (
+        <div className="empty">No signals match the current filters.</div>
+      ) : (
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Source</th>
+              <th>Action</th>
+              <th>Symbol</th>
+              <th>Confidence</th>
+              <th>Acted</th>
+              <th>Detail</th>
+            </tr>
+          </thead>
+          <tbody>
+            {filtered.map((s) => {
+              const pct = s.confidence != null ? Math.round(s.confidence * 100) : null
+              return (
+                <tr key={s.id}>
+                  <td className="muted">{fmtTime(s.created_at)}</td>
+                  <td>
+                    <span className={`src-badge src-${s.source}`}>
+                      {s.source === 'analyzer' ? 'Brain' : s.source}
+                    </span>
+                  </td>
+                  <td>
+                    <span className={actionClass(s.action)}>
+                      {(s.action ?? '-').toUpperCase()}
+                    </span>
+                  </td>
+                  <td>{s.symbol ?? '-'}</td>
+                  <td>
+                    {pct != null ? (
+                      <div className="conf-cell">
+                        <div className="conf-bar sm">
+                          <span
+                            className={`conf-fill ${actionClass(s.action)}`}
+                            style={{ width: `${pct}%` }}
+                          />
+                        </div>
+                        <span className="mono muted">{pct}%</span>
+                      </div>
+                    ) : (
+                      <span className="muted">—</span>
+                    )}
+                  </td>
+                  <td>{s.accepted ? '✅' : '—'}</td>
+                  <td className="muted sig-detail">{s.message ?? '-'}</td>
+                </tr>
+              )
+            })}
+          </tbody>
+        </table>
+      )}
+    </div>
+  )
+}
+
+function AutonomyToggle({
+  settings,
+  status,
+  onSaved,
+  onError,
+}: {
+  settings: Settings | null
+  status: BotStatus | null
+  onSaved: (s: Settings) => void
+  onError: (msg: string) => void
+}) {
+  const [saving, setSaving] = useState(false)
+  if (!settings) return null
+
+  const auto = settings.auto_trade_enabled
+  const symbols = settings.auto_symbols?.trim() ? settings.auto_symbols : '—'
+
+  const setAuto = async (next: boolean) => {
+    if (saving) return
+    // Enabling autonomous execution outside paper risks REAL funds with no
+    // per-order click -> require an explicit, honest confirmation first.
+    if (next && status && status.trading_mode !== 'paper') {
+      const warn =
+        status.trading_mode === 'live'
+          ? 'Enable AUTONOMOUS LIVE trading? The bot will place REAL orders on its own, within your risk limits, with no manual click per trade.'
+          : 'Trading mode is not confirmed as paper — enabling autonomous trading may place REAL orders on its own. Continue?'
+      if (!window.confirm(warn)) return
+    }
+    setSaving(true)
+    try {
+      onSaved(await api.updateSettings({ auto_trade_enabled: next }))
+    } catch (e) {
+      onError((e as Error).message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <section className="panel autonomy">
+      <div className="panel-head">
+        <span>Autonomy</span>
+        <span className={`mode-pill ${auto ? 'on' : ''}`}>
+          {auto ? '🤖 Auto' : '✋ Manual'}
+        </span>
+      </div>
+      <div className="panel-body">
+        <div className="switch-row">
+          <div>
+            <div className="switch-title">
+              Autonomous trading is {auto ? 'ON' : 'OFF'}
+            </div>
+            <div className="hint">
+              {auto
+                ? `The bot analyses ${symbols} on ${settings.auto_timeframe} and places orders itself, within your risk limits.`
+                : `Manual mode: the bot still analyses ${symbols} and logs live verdicts to Signals, but never places an order on its own.`}
+            </div>
+          </div>
+          <button
+            type="button"
+            role="switch"
+            aria-checked={auto}
+            className={`toggle ${auto ? 'on' : ''}`}
+            onClick={() => setAuto(!auto)}
+            disabled={saving}
+            title={auto ? 'Switch to Manual' : 'Switch to Auto'}
+          >
+            <span className="knob" />
+          </button>
+        </div>
+        {settings.ai_trade_confirm && (
+          <div className="hint" style={{ marginTop: 8 }}>
+            🧠 AI trade review is on — it may VETO an autonomous entry it judges too
+            risky (it can never invent or force a trade).
+          </div>
+        )}
+      </div>
+    </section>
+  )
+}
+
+// Browser-native voice input via the Web Speech API. Not every browser ships it,
+// and some (e.g. Chrome) transcribe audio via a cloud service — so it's opt-in
+// and the UI says so honestly. `any` is used only for these vendor-typed events.
+type SpeechRec = {
+  lang: string
+  interimResults: boolean
+  continuous: boolean
+  onresult: ((e: any) => void) | null
+  onerror: (() => void) | null
+  onend: (() => void) | null
+  start: () => void
+  stop: () => void
+}
+function getSpeechRecognition(): (new () => SpeechRec) | null {
+  const w = window as any
+  return w.SpeechRecognition || w.webkitSpeechRecognition || null
+}
+
+function AssistantPanel({
+  symbol,
+  timeframe,
+  aiKeySet,
+  onError,
+}: {
+  symbol: string
+  timeframe: string
+  aiKeySet: boolean
+  onError: (msg: string) => void
+}) {
+  const [turns, setTurns] = useState<ChatTurn[]>([])
+  const [input, setInput] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [useSymbol, setUseSymbol] = useState(true)
+  const [useNews, setUseNews] = useState(false)
+  const [readAloud, setReadAloud] = useState(false)
+  const [listening, setListening] = useState(false)
+  const [news, setNews] = useState<NewsItem[]>([])
+  const [newsErrors, setNewsErrors] = useState<string[]>([])
+  const [newsLoading, setNewsLoading] = useState(false)
+  const recRef = useRef<SpeechRec | null>(null)
+  const listRef = useRef<HTMLDivElement | null>(null)
+
+  const speechSupported = typeof window !== 'undefined' && getSpeechRecognition() != null
+  const ttsSupported = typeof window !== 'undefined' && 'speechSynthesis' in window
+
+  // Keep the transcript pinned to the newest turn.
+  useEffect(() => {
+    listRef.current?.scrollTo({ top: listRef.current.scrollHeight })
+  }, [turns, busy])
+
+  // Stop listening / speaking if the user leaves the tab.
+  useEffect(
+    () => () => {
+      recRef.current?.stop()
+      if (typeof window !== 'undefined' && 'speechSynthesis' in window)
+        window.speechSynthesis.cancel()
+    },
+    [],
+  )
+
+  const loadNews = useCallback(async () => {
+    setNewsLoading(true)
+    try {
+      const res = await api.news(8)
+      setNews(res.items)
+      setNewsErrors(res.errors)
+    } catch (e) {
+      onError((e as Error).message)
+    } finally {
+      setNewsLoading(false)
+    }
+  }, [onError])
+
+  useEffect(() => {
+    loadNews()
+  }, [loadNews])
+
+  const speak = (text: string) => {
+    if (!readAloud || !ttsSupported) return
+    try {
+      window.speechSynthesis.cancel()
+      window.speechSynthesis.speak(new SpeechSynthesisUtterance(text))
+    } catch {
+      /* ignore */
+    }
+  }
+
+  const send = async (q: string) => {
+    const question = q.trim()
+    if (!question || busy) return
+    setTurns((t) => [...t, { role: 'you', text: question }])
+    setInput('')
+    setBusy(true)
+    try {
+      const res = await api.aiChat({
+        question,
+        symbol: useSymbol ? symbol : undefined,
+        timeframe: useSymbol ? timeframe : undefined,
+        include_news: useNews,
+      })
+      setTurns((t) => [...t, { role: 'ai', text: res.reply, usedNews: res.used_news }])
+      speak(res.reply)
+    } catch (e) {
+      const msg = (e as Error).message
+      onError(msg)
+      setTurns((t) => [...t, { role: 'ai', text: `(request failed: ${msg})` }])
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const toggleMic = () => {
+    const Rec = getSpeechRecognition()
+    if (!Rec) return
+    if (listening) {
+      recRef.current?.stop()
+      return
+    }
+    const rec = new Rec()
+    rec.lang = 'en-US'
+    rec.interimResults = false
+    rec.continuous = false
+    rec.onresult = (e: any) => {
+      const said = e?.results?.[0]?.[0]?.transcript ?? ''
+      if (said) setInput((cur) => (cur ? `${cur} ${said}` : said))
+    }
+    rec.onerror = () => setListening(false)
+    rec.onend = () => setListening(false)
+    recRef.current = rec
+    setListening(true)
+    try {
+      rec.start()
+    } catch {
+      setListening(false)
+    }
+  }
+
+  const fmtNewsTime = (iso: string) => {
+    if (!iso) return ''
+    const d = new Date(iso)
+    return Number.isNaN(d.getTime()) ? iso : d.toLocaleString()
+  }
+
+  const suggestions = [
+    'How is my bot doing right now?',
+    `What's your read on ${symbol} ${timeframe}?`,
+    'Given the latest news, what are the main risks today?',
+    'Should I be in cash or exposed right now, and why?',
+  ]
+
+  return (
+    <div className="assistant">
+      {!aiKeySet && (
+        <div className="alert-banner soft">
+          <span className="alert-icon">🔑</span>
+          <div>
+            <b>No AI key configured.</b> Add your own AI provider key in Settings to
+            chat with the assistant. It uses <b>your</b> key and receives only your
+            non-secret bot state and public headlines — never your exchange keys.
+          </div>
+        </div>
+      )}
+
+      <div className="assistant-grid">
+        <div className="chat-col">
+          <div className="chat-list" ref={listRef}>
+            {turns.length === 0 ? (
+              <div className="chat-empty">
+                <p>
+                  Ask about your bot, a market, or your risk. The assistant sees your
+                  live (non-secret) bot state and — if you enable it — real headlines.
+                  It advises only: it can’t place orders or change settings.
+                </p>
+                <div className="chip-row">
+                  {suggestions.map((s) => (
+                    <button
+                      key={s}
+                      type="button"
+                      className="chip"
+                      onClick={() => send(s)}
+                      disabled={busy}
+                    >
+                      {s}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              turns.map((t, i) => (
+                <div key={i} className={`bubble ${t.role}`}>
+                  <div className="bubble-role">{t.role === 'you' ? 'You' : '🤖 AI'}</div>
+                  <div className="bubble-text">{t.text}</div>
+                  {t.usedNews && <div className="bubble-note">grounded in live news</div>}
+                </div>
+              ))
+            )}
+            {busy && (
+              <div className="bubble ai">
+                <div className="bubble-role">🤖 AI</div>
+                <div className="bubble-text typing">Thinking…</div>
+              </div>
+            )}
+          </div>
+
+          <div className="chat-controls">
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={useSymbol}
+                onChange={(e) => setUseSymbol(e.target.checked)}
+              />
+              Include {symbol} {timeframe} analysis
+            </label>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={useNews}
+                onChange={(e) => setUseNews(e.target.checked)}
+              />
+              Attach live news
+            </label>
+            {ttsSupported && (
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={readAloud}
+                  onChange={(e) => setReadAloud(e.target.checked)}
+                />
+                Read replies aloud
+              </label>
+            )}
+          </div>
+
+          <div className="chat-input">
+            {speechSupported && (
+              <button
+                type="button"
+                className={`btn mic ${listening ? 'rec' : ''}`}
+                onClick={toggleMic}
+                title={listening ? 'Stop listening' : 'Speak your question'}
+              >
+                {listening ? '● Listening' : '🎤'}
+              </button>
+            )}
+            <input
+              className="input"
+              placeholder="Ask the AI anything about your bot or the market…"
+              value={input}
+              onChange={(e) => setInput(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && send(input)}
+              disabled={busy}
+            />
+            <button
+              className="btn primary"
+              onClick={() => send(input)}
+              disabled={busy || !input.trim()}
+            >
+              {busy ? '…' : 'Send'}
+            </button>
+          </div>
+          {speechSupported && (
+            <p className="hint tiny">
+              🎤 Voice uses your browser’s Web Speech API; some browsers send audio to
+              a cloud service to transcribe. It stays off until you press the mic.
+            </p>
+          )}
+        </div>
+
+        <div className="news-col">
+          <div className="news-head">
+            <span>📰 Live market news</span>
+            <button
+              type="button"
+              className="btn ghost sm"
+              onClick={loadNews}
+              disabled={newsLoading}
+              title="Refresh headlines"
+            >
+              {newsLoading ? '…' : '↻'}
+            </button>
+          </div>
+          {news.length === 0 && !newsLoading ? (
+            <div className="empty sm">
+              {newsErrors.length
+                ? 'News sources are unreachable right now. Nothing is fabricated — this is empty because the real feeds could not be fetched.'
+                : 'No headlines available.'}
+            </div>
+          ) : (
+            <ul className="news-list">
+              {news.map((n, i) => (
+                <li key={`${n.link ?? n.title}:${i}`}>
+                  {n.link ? (
+                    <a href={n.link} target="_blank" rel="noopener noreferrer">
+                      {n.title}
+                    </a>
+                  ) : (
+                    <span>{n.title}</span>
+                  )}
+                  <div className="news-meta muted">
+                    {n.source}
+                    {n.published ? ` · ${fmtNewsTime(n.published)}` : ''}
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+          {newsErrors.length > 0 && news.length > 0 && (
+            <p className="hint tiny">Some feeds failed: {newsErrors.join(', ')}.</p>
+          )}
+        </div>
+      </div>
+    </div>
   )
 }
 
@@ -1345,6 +1926,7 @@ function SettingsPanel({
         auto_symbols: form.auto_symbols,
         auto_timeframe: form.auto_timeframe,
         auto_confirm_timeframe: form.auto_confirm_timeframe,
+        ai_trade_confirm: form.ai_trade_confirm,
       })
       onSaved(saved)
     } catch (e) {
@@ -1518,6 +2100,24 @@ function SettingsPanel({
         symbol and only opens a long (or exits one) when confidence clears the
         threshold. Higher confidence = fewer, higher-conviction trades.{' '}
         {form.ai_enabled ? `✅ AI commentary is configured${form.ai_model ? ` (${form.ai_model}${form.ai_style ? `, ${form.ai_style}` : ''})` : ''}.` : 'AI commentary is off (set AI_API_KEY to enable).'}
+      </p>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <input
+          type="checkbox"
+          checked={form.ai_trade_confirm}
+          onChange={(e) => setForm({ ...form, ai_trade_confirm: e.target.checked })}
+          disabled={!form.ai_enabled}
+        />
+        AI trade review (AI may VETO an autonomous entry)
+      </label>
+      <p className="hint">
+        When on, and only while autonomous trading is on, the AI reviews each
+        deterministic entry and can <b>block</b> one it judges too risky. It can
+        never invent, size, or force a trade, and it never bypasses your risk
+        limits — if the AI is unavailable the analyzer's own decision stands.{' '}
+        {form.ai_enabled
+          ? 'Test it in paper mode before trusting it with live orders.'
+          : 'Add an AI key (Credentials) to enable this.'}
       </p>
       <p className="hint">
         Trailing stop ratchets an open long's stop-loss upward as price rises to

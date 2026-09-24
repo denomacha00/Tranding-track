@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+import json
 import logging
 import threading
 from typing import Any, Optional
@@ -20,7 +21,7 @@ from app.config import Settings
 from app.exchange import BinanceConnector
 from app.analysis import MarketAnalyzer
 from app.ai import AICommentator
-from app.models import Trade, TradeStatus
+from app.models import SignalLog, Trade, TradeStatus
 from app.risk import RiskManager
 from app.notifier import Notifier
 from app.state import (
@@ -51,6 +52,9 @@ class TradingEngine:
         self.ai = AICommentator(settings)
         self._lock = threading.Lock()
         self.running = False
+        # Last autonomous verdict per symbol, so a signal row is logged only when
+        # the brain's decision CHANGES (not an identical row every ~5s tick).
+        self._last_auto_verdict: dict[str, str] = {}
         # Paper wallet (quote currency, e.g. USDT).
         self.paper_balance = settings.paper_starting_balance
         # Event broadcaster set by the app on startup.
@@ -732,11 +736,23 @@ class TradingEngine:
             analysis = self.analyze_symbol(symbol, timeframe)
         except Exception as exc:
             return False, f"analysis failed for {symbol}: {exc}"
+        ok, msg = self._decide_and_act(db, symbol, timeframe, analysis)
+        # Persist the brain's OWN verdict (deduped on change) so the Signals tab
+        # shows an honest timeline of autonomous decisions, not just TradingView
+        # alerts. Logging must never break the trading loop.
+        try:
+            self._log_auto_verdict(db, symbol.upper(), analysis, ok, msg)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("verdict logging failed for %s: %s", symbol, exc)
+        return ok, msg
 
+    def _decide_and_act(
+        self, db: Session, symbol: str, timeframe: str, analysis
+    ) -> tuple[bool, str]:
+        """Decide and execute from a computed analysis. Returns (accepted, msg)."""
         if analysis.verdict == "hold":
             return False, f"{symbol}: hold ({analysis.confidence:.0%})"
 
-        existing = None
         # Multi-timeframe confirmation: refuse to act against a higher timeframe.
         _confirm_tf = (self.settings.auto_confirm_timeframe or "").strip()
         if _confirm_tf and _confirm_tf != timeframe:
@@ -754,6 +770,14 @@ class TradingEngine:
         if analysis.verdict == "buy":
             if existing:
                 return False, f"{symbol}: already long"
+            # Permission-gated AI review of the ENTRY. Risk-first and veto-only:
+            # it can BLOCK new risk but never invent a trade, and if the AI is
+            # unavailable it falls back to the deterministic decision. Governed by
+            # ai_trade_confirm (off by default) — the risk manager still applies.
+            if getattr(self.settings, "ai_trade_confirm", False) and self.ai.available:
+                proceed, reason = self.ai.confirm_trade(analysis)
+                if not proceed:
+                    return False, f"{symbol}: {reason}"
             ok, msg, _ = self.execute_signal(
                 db, action="buy", symbol=symbol, amount=None,
                 stop_loss=None, take_profit=None, source="auto",
@@ -769,6 +793,70 @@ class TradingEngine:
             )
             return ok, msg
         return False, f"{symbol}: sell signal, no long to close"
+
+    def _log_auto_verdict(
+        self, db: Session, symbol: str, analysis, acted: bool, message: str
+    ) -> None:
+        """Record an autonomous verdict — but only when it CHANGES for a symbol.
+
+        A stable trend would otherwise write a near-identical row every ~5s
+        tick; de-duping on the verdict keeps the log a compact, readable
+        timeline. These are the brain's real, already-made decisions (nothing
+        fabricated), so persisting them honours the "nothing fake" rule.
+        """
+        prev = self._last_auto_verdict.get(symbol)
+        if prev == analysis.verdict:
+            return
+        self._last_auto_verdict[symbol] = analysis.verdict
+        detail = analysis.summary
+        if message and message != analysis.summary:
+            detail = f"{analysis.summary} — {message}"
+        log = SignalLog(
+            user_id=self.user_id,
+            source="analyzer",
+            symbol=symbol,
+            action=analysis.verdict,
+            raw=json.dumps(analysis.as_dict()),
+            accepted=1 if acted else 0,
+            message=detail,
+        )
+        db.add(log)
+        db.commit()
+        db.refresh(log)
+        self._emit(
+            "signal",
+            {
+                "id": log.id,
+                "source": "analyzer",
+                "symbol": symbol,
+                "action": analysis.verdict,
+                "accepted": bool(acted),
+                "confidence": round(analysis.confidence, 3),
+                "message": detail,
+            },
+        )
+
+    def observe_symbol(
+        self, db: Session, symbol: str, timeframe: str = "1h"
+    ) -> tuple[bool, str]:
+        """Analyse a symbol and LOG the verdict WITHOUT trading.
+
+        Used when autonomous execution is off, so the Signals tab still shows the
+        brain's live read of the market (honest, deduped on change). No order is
+        ever placed here — this observes and records only.
+        """
+        try:
+            analysis = self.analyze_symbol(symbol, timeframe)
+        except Exception as exc:
+            return False, f"analysis failed for {symbol}: {exc}"
+        try:
+            self._log_auto_verdict(
+                db, symbol.upper(), analysis, False,
+                "monitoring — autonomous execution off",
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("verdict logging failed for %s: %s", symbol, exc)
+        return True, f"{symbol}: {analysis.verdict} ({analysis.confidence:.0%}) observed"
 
     # ---- status ------------------------------------------------------
 

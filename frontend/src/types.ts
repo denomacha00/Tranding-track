@@ -42,6 +42,27 @@ export interface SignalRow {
   accepted: number
   message: string | null
   created_at: string
+  // Real model confidence (0..1) for analyzer rows; null when the source
+  // (e.g. a raw TradingView alert) didn't carry one. Never fabricated.
+  confidence: number | null
+}
+
+// One real, live headline from a configured public trading/market RSS feed.
+// Fetched server-side; never fabricated (an empty list means the sources were
+// unreachable, not that nothing is happening).
+export interface NewsItem {
+  title: string
+  link: string
+  source: string
+  published: string
+}
+
+// A single turn in the AI assistant conversation (browser-local history).
+export interface ChatTurn {
+  role: 'you' | 'ai'
+  text: string
+  // Whether live news was attached to this question (shown as a small note).
+  usedNews?: boolean
 }
 
 export interface Settings {
@@ -59,6 +80,9 @@ export interface Settings {
   auto_symbols: string
   auto_timeframe: string
   auto_confirm_timeframe: string
+  // When on AND autonomous trading is on, the AI reviews each deterministic
+  // entry and may VETO it (it can never invent or force a trade). Off by default.
+  ai_trade_confirm: boolean
   ai_enabled: boolean
   ai_model?: string
   ai_style?: string
@@ -180,7 +204,15 @@ export type WsMessage =
   | { event: 'reconcile_adjusted'; data: { symbol: string; db_amount: number; exchange_amount: number } }
   | {
       event: 'signal'
-      data: { source: string; action: string; symbol: string; accepted: boolean; message: string }
+      data: {
+        id?: number
+        source: string
+        action: string
+        symbol: string
+        accepted: boolean
+        message: string
+        confidence?: number
+      }
     }
 
 export interface Me {

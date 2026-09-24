@@ -38,6 +38,17 @@ _SYSTEM_ANALYST = (
     "Be concrete and concise."
 )
 
+_SYSTEM_ASSISTANT = (
+    "You are the in-app assistant for the Tranding-track trading bot, talking to "
+    "its operator about THEIR own account. You can explain the bot, read the "
+    "current market analysis, reason about strategy/skills, weigh in on a "
+    "decision, and factor in recent real news. You are risk-first and honest: "
+    "you never promise profit, you flag weak/conflicted setups, and you remember "
+    "this is real money. You cannot place orders or change settings yourself — "
+    "recommend actions and tell the operator exactly which control to use; they "
+    "confirm and execute. Never ask for or repeat secrets/API keys."
+)
+
 
 def _looks_anthropic(model: str, base_url: str) -> bool:
     m = (model or "").lower()
@@ -176,6 +187,88 @@ class AICommentator:
             or "AI request failed; please try again."
         )
 
+    def chat(
+        self,
+        question: str,
+        *,
+        analysis: "MarketAnalysis | None" = None,
+        bot_context: str | None = None,
+        news: list[dict] | None = None,
+    ) -> str:
+        """Assistant answer grounded in the user's OWN bot state + optional news.
+
+        Privacy: the caller assembles ``bot_context`` from non-secret data only
+        (never exchange keys/passwords). Headlines are public. Everything is sent
+        to the USER'S OWN configured AI provider. If AI isn't configured we say so
+        plainly rather than pretending to answer.
+        """
+        if not self.available:
+            return (
+                "AI assistant is not configured. Add your AI key in Settings "
+                "(AI_API_KEY / AI_BASE_URL / AI_MODEL) to chat with the bot, ask "
+                "for a read on the market, or get a second opinion on a decision."
+            )
+        blocks: list[str] = []
+        if bot_context:
+            blocks.append("Live bot context (the user's own account):\n" + bot_context)
+        if analysis is not None:
+            blocks.append(self._analysis_block(analysis))
+        blocks.append(self._risk_block())
+        if news:
+            headlines = "\n".join(
+                f"- {n.get('title')} ({n.get('source')})"
+                for n in news
+                if n.get("title")
+            )
+            if headlines:
+                blocks.append(
+                    "Recent REAL market headlines (public feeds; use only if "
+                    "relevant, and don't overstate their certainty):\n" + headlines
+                )
+        prompt = (
+            question
+            + "\n\n---\n"
+            + "\n\n".join(blocks)
+            + "\n\n---\nAnswer helpfully and concretely for THIS bot and account. "
+            "You may recommend an action (and how to do it here), but you cannot "
+            "execute it — the operator stays in control and confirms every order. "
+            "Weigh downside first and never promise profit."
+        )
+        return self._post(_SYSTEM_ASSISTANT, prompt) or "AI request failed; please try again."
+
+    def confirm_trade(self, analysis: MarketAnalysis) -> tuple[bool, str]:
+        """Risk-first AI review of a proposed ENTRY. Returns (proceed, reason).
+
+        The deterministic brain already decided to act; the AI may only VETO
+        (block new risk) or approve — it cannot invent a trade or block an exit.
+        If the AI is unavailable or its reply can't be parsed we PROCEED with the
+        deterministic decision (never fabricate a veto or an approval).
+        """
+        if not self.available:
+            return True, "AI review unavailable; deterministic decision stands"
+        prompt = (
+            "The deterministic engine wants to OPEN this position. Review it "
+            "risk-first and decide whether to APPROVE or VETO the entry. Veto only "
+            "when the setup is low-quality, conflicted, or the risk clearly "
+            "outweighs the edge. Reply with STRICT JSON and nothing else: "
+            '{"decision": "approve" | "veto", "reason": "<one concise sentence>"}\n\n'
+            + self._analysis_block(analysis)
+            + "\n\n"
+            + self._risk_block()
+        )
+        reply = self._post(_SYSTEM_ANALYST, prompt, max_tokens=200)
+        if not reply:
+            return True, "AI review failed; deterministic decision stands"
+        try:
+            data = json.loads(_extract_json(reply))
+            decision = str(data.get("decision", "")).strip().lower()
+            reason = str(data.get("reason", "")).strip() or "no reason given"
+        except Exception:
+            return True, "AI review inconclusive; deterministic decision stands"
+        if decision == "veto":
+            return False, f"AI veto: {reason}"
+        return True, f"AI approved: {reason}"
+
     @staticmethod
     def _analysis_block(analysis: MarketAnalysis) -> str:
         factors = "\n".join(
@@ -205,6 +298,15 @@ class AICommentator:
             f"- Max total exposure: {getattr(s, 'max_total_exposure_pct', 0)}% "
             "(0 = uncapped)"
         )
+
+
+def _extract_json(text: str) -> str:
+    """Return the first {...} JSON-object substring (models sometimes wrap JSON)."""
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        return text[start : end + 1]
+    return text
 
 
 def _extract_anthropic_text(data: dict[str, Any]) -> Optional[str]:

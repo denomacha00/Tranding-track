@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from enum import Enum
 
 from sqlalchemy import DateTime, Float, Integer, String, Text
@@ -116,6 +117,23 @@ class SignalLog(Base):
     accepted: Mapped[int] = mapped_column(Integer, default=0)  # 0/1 as bool
     message: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), default=_utcnow)
+
+    @property
+    def confidence(self) -> float | None:
+        """Confidence parsed out of ``raw`` for analyzer rows, else None.
+
+        Analyzer rows store the full analysis JSON (which carries a real
+        confidence); TradingView payloads usually don't, so this returns None
+        rather than inventing a number — honouring the nothing-fake rule.
+        """
+        try:
+            data = json.loads(self.raw)
+        except Exception:
+            return None
+        val = data.get("confidence") if isinstance(data, dict) else None
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            return None
+        return float(val)
 
 
 class KeyValue(Base):

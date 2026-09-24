@@ -7,6 +7,7 @@ import type {
   ExecutionResult,
   MarketAnalysis,
   Me,
+  NewsItem,
   Settings,
   SignalRow,
   StrategyInfo,
@@ -151,5 +152,23 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ question, symbol, timeframe }),
     }),
+  // Assistant chat: grounded in the user's OWN non-secret bot state, an optional
+  // per-symbol analysis, and (opt-in) live public news. The AI advises only — it
+  // cannot place orders or change settings.
+  aiChat: (body: {
+    question: string
+    symbol?: string
+    timeframe?: string
+    include_news?: boolean
+  }) =>
+    req<{ reply: string; ai_enabled: boolean; used_news: boolean }>('/api/ai/chat', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  // Live, REAL market headlines from the configured public feeds. Returns any
+  // real items plus per-feed errors; an empty list means the sources were
+  // unreachable, never fabricated news.
+  news: (limit = 8) =>
+    req<{ items: NewsItem[]; errors: string[] }>(`/api/news?limit=${limit}`),
   exchangeAccess: () => req<ExchangeAccess>('/api/exchange/access'),
 }

@@ -69,6 +69,9 @@ class SignalOut(BaseModel):
     action: Optional[str]
     accepted: int
     message: Optional[str]
+    # Real model confidence for analyzer rows (0..1); None when the source didn't
+    # provide one (e.g. a TradingView webhook). Never fabricated.
+    confidence: Optional[float] = None
     created_at: dt.datetime
 
 
@@ -115,6 +118,7 @@ class SettingsOut(BaseModel):
     auto_symbols: str
     auto_timeframe: str
     auto_confirm_timeframe: str
+    ai_trade_confirm: bool = False
     ai_enabled: bool
     ai_model: str = ""
     ai_style: str = ""
@@ -136,6 +140,7 @@ class SettingsUpdate(BaseModel):
     auto_symbols: Optional[str] = None
     auto_timeframe: Optional[str] = None
     auto_confirm_timeframe: Optional[str] = None
+    ai_trade_confirm: Optional[bool] = None
     trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=100)
     max_total_exposure_pct: Optional[float] = Field(default=None, ge=0, le=1000)
 

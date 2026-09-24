@@ -35,6 +35,19 @@ def _tick_all(manager) -> list[dict]:
                                 "auto_trade user=%s %s failed: %s",
                                 user.id, symbol, exc,
                             )
+                else:
+                    # Autonomous execution OFF: still analyse + log the brain's
+                    # verdict so the Signals tab shows a live read (no orders).
+                    for symbol in engine.settings.auto_symbol_list:
+                        try:
+                            engine.observe_symbol(
+                                db, symbol, engine.settings.auto_timeframe
+                            )
+                        except Exception as exc:  # keep the loop resilient per-symbol
+                            logger.warning(
+                                "observe user=%s %s failed: %s",
+                                user.id, symbol, exc,
+                            )
                 engine.check_pending_orders(db)
                 engine.check_open_positions(db)
                 statuses.append({"user_id": user.id, "status": engine.status(db)})

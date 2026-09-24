@@ -71,6 +71,7 @@ from app.security import (
 )
 from app.usermgr import get_manager
 from app.learn import PARAM_GRIDS, train
+from app.news import fetch_market_news
 from app.strategies import STRATEGY_REGISTRY, build_strategy
 from app.tasks import monitor_loop
 from app.ws import Broadcaster
@@ -392,15 +393,18 @@ async def tradingview_webhook(
     if not user:
         raise HTTPException(status_code=404, detail="Unknown webhook token")
     raw = (await request.body()).decode("utf-8", errors="replace")
+    # Never persist a raw webhook body verbatim: it may carry a shared secret /
+    # token. Redact sensitive fields before it touches the signal log or any UI.
+    safe_raw = _redact_raw(raw)
     try:
         data = json.loads(raw)
         signal = TradingViewSignal(**data)
     except Exception as exc:
-        _log_signal(db, user.id, "tradingview", None, None, raw, False, f"parse error: {exc}")
+        _log_signal(db, user.id, "tradingview", None, None, safe_raw, False, f"parse error: {exc}")
         raise HTTPException(status_code=400, detail=f"Invalid signal payload: {exc}")
 
     if user.license_status != LicenseStatus.active.value:
-        _log_signal(db, user.id, "tradingview", signal.symbol, signal.action, raw, False,
+        _log_signal(db, user.id, "tradingview", signal.symbol, signal.action, safe_raw, False,
                     "account not licensed")
         raise HTTPException(status_code=403, detail="Account is not licensed")
 
@@ -417,7 +421,7 @@ async def tradingview_webhook(
         note=signal.note,
         limit_price=signal.limit_price,
     )
-    _log_signal(db, user.id, "tradingview", signal.symbol, signal.action, raw, accepted, message)
+    _log_signal(db, user.id, "tradingview", signal.symbol, signal.action, safe_raw, accepted, message)
     return ExecutionResult(
         accepted=accepted, message=message,
         trade=TradeOut.model_validate(trade) if trade else None,
@@ -432,6 +436,38 @@ def _log_signal(db, user_id, source, symbol, action, raw, accepted, message) -> 
         )
     )
     db.commit()
+
+
+# Field names (normalised to lower-case alphanumerics) we must never store from
+# an inbound webhook body — they can carry secrets that would otherwise rest in
+# the signal log and leak through the API/UI.
+_SENSITIVE_KEYS = {
+    "secret", "password", "passphrase", "token", "apikey", "apisecret",
+    "secretkey", "webhooksecret", "auth", "authorization", "key", "privatekey",
+    "accesstoken", "bearer",
+}
+
+
+def _redact_raw(raw: str) -> str:
+    """Scrub secret-like fields from a webhook body before it is persisted.
+
+    Best-effort and fail-safe: parse JSON and mask sensitive keys; if the body
+    isn't JSON we can't locate a secret inside it, so we store only its size
+    rather than the bytes. We never keep a plaintext secret at rest.
+    """
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return f"<non-JSON payload, {len(raw)} bytes (redacted)>"
+    if isinstance(data, dict):
+        for k in list(data.keys()):
+            norm = "".join(ch for ch in str(k).lower() if ch.isalnum())
+            if norm in _SENSITIVE_KEYS:
+                data[k] = "***redacted***"
+    try:
+        return json.dumps(data)
+    except Exception:
+        return "<unserializable payload (redacted)>"
 
 
 # ---- Manual orders -------------------------------------------------
@@ -574,6 +610,7 @@ def _settings_out(engine, user: User) -> SettingsOut:
         auto_symbols=s.auto_symbols,
         auto_timeframe=s.auto_timeframe,
         auto_confirm_timeframe=s.auto_confirm_timeframe,
+        ai_trade_confirm=getattr(s, "ai_trade_confirm", False),
         ai_enabled=bool(s.ai_api_key),
         ai_model=s.ai_model,
         ai_style=engine.ai._style() if s.ai_api_key else "",
@@ -768,6 +805,89 @@ def ai_ask(
     analysis = _analysis_for(engine, symbol, timeframe) if symbol else None
     answer = engine.ai.ask(question, analysis)
     return {"answer": answer, "ai_enabled": engine.ai.available}
+
+
+@app.get("/api/news")
+def market_news(
+    limit: int = 8,
+    user: User = Depends(require_licensed_user),
+):
+    """Live, REAL market headlines from the configured public feeds.
+
+    Returns whatever real items we could fetch plus any per-feed errors. Never
+    fabricates news — an empty list alongside errors means the sources were
+    unreachable, not that nothing is happening.
+    """
+    limit = max(1, min(limit, 30))
+    items, errors = fetch_market_news(get_settings().news_feed_list, limit=limit)
+    return {"items": items, "errors": errors}
+
+
+@app.post("/api/ai/chat")
+def ai_chat(
+    payload: dict,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    """Assistant chat grounded in the user's OWN bot state + optional live news.
+
+    Privacy: only NON-secret context (mode, risk config, position/PnL summary) and
+    public headlines are sent to the user's OWN configured AI provider — never
+    exchange keys, passwords, or any other user's data. The assistant advises; it
+    cannot place orders or change settings (the operator confirms and acts).
+    """
+    _enforce_rate_limit(request, "ai", limit=20, window_seconds=60)
+    question = str(payload.get("question", "")).strip()
+    if not question:
+        raise HTTPException(status_code=400, detail="question is required")
+    if len(question) > 2000:
+        raise HTTPException(
+            status_code=400, detail="question is too long (max 2000 characters)"
+        )
+    engine = _engine_for(db, user)
+    symbol = payload.get("symbol")
+    timeframe = payload.get("timeframe", "1h")
+    # Only compute analysis if a symbol was given; a bad symbol shouldn't 502 the
+    # whole chat, so degrade gracefully to no-analysis context.
+    analysis = None
+    if symbol:
+        try:
+            analysis = _analysis_for(engine, str(symbol), str(timeframe))
+        except Exception:
+            analysis = None
+
+    bot_context: str | None
+    try:
+        st = engine.status(db)
+        bot_context = (
+            f"- Mode: {st.get('trading_mode')} (testnet={st.get('testnet')}, "
+            f"running={st.get('running')})\n"
+            f"- Open positions: {st.get('open_positions')}/{st.get('max_open_positions')}\n"
+            f"- Balance: {st.get('balance')}; equity: {st.get('equity')}\n"
+            f"- Realized PnL: {st.get('realized_pnl')}; unrealized: "
+            f"{st.get('unrealized_pnl')}; today: {st.get('day_pnl')}\n"
+            f"- Autonomous trading: "
+            f"{'on' if engine.settings.auto_trade_enabled else 'off'}; "
+            f"AI trade review: "
+            f"{'on' if getattr(engine.settings, 'ai_trade_confirm', False) else 'off'}"
+        )
+    except Exception:
+        bot_context = None
+
+    news: list[dict] = []
+    used_news = False
+    if payload.get("include_news"):
+        try:
+            news, _errors = fetch_market_news(get_settings().news_feed_list, limit=8)
+        except Exception:
+            news = []
+        used_news = bool(news)
+
+    reply = engine.ai.chat(
+        question, analysis=analysis, bot_context=bot_context, news=news or None
+    )
+    return {"reply": reply, "ai_enabled": engine.ai.available, "used_news": used_news}
 
 
 # ---- Strategies & training -----------------------------------------
