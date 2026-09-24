@@ -1,34 +1,74 @@
 import { useEffect, useRef } from 'react'
-import { createChart, ColorType, type IChartApi, type ISeriesApi } from 'lightweight-charts'
+import {
+  createChart,
+  ColorType,
+  type CandlestickData,
+  type IChartApi,
+  type ISeriesApi,
+  type Time,
+} from 'lightweight-charts'
 import type { Candle } from './types'
+import type { Theme } from './theme'
 
 // Candlestick price chart powered by TradingView's lightweight-charts library.
-export function PriceChart({ candles }: { candles: Candle[] }) {
+//
+// Live like an exchange chart: `candles` seeds the history, and `last` (a live
+// ticker price polled every few seconds) moves the newest bar in real time via
+// series.update() — the forming candle's close/high/low track the market
+// without waiting for the next full OHLCV reload. Colours are read from the
+// active theme's CSS variables so it re-themes with the rest of the app.
+type Palette = {
+  bg: string
+  text: string
+  grid: string
+  up: string
+  down: string
+}
+
+function readPalette(): Palette {
+  const s = getComputedStyle(document.documentElement)
+  const v = (name: string, fallback: string) => s.getPropertyValue(name).trim() || fallback
+  return {
+    bg: v('--chart-bg', '#151b24'),
+    text: v('--muted', '#8b98a9'),
+    grid: v('--border', '#263241'),
+    up: v('--green', '#16c784'),
+    down: v('--red', '#ea3943'),
+  }
+}
+
+export function PriceChart({
+  candles,
+  theme,
+  last,
+}: {
+  candles: Candle[]
+  theme: Theme
+  last?: number | null
+}) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
+  // The newest bar, kept current so live ticks extend it rather than reset it.
+  const lastBarRef = useRef<CandlestickData | null>(null)
 
+  // Create the chart once on mount.
   useEffect(() => {
     if (!containerRef.current) return
+    const p = readPalette()
     const chart = createChart(containerRef.current, {
-      layout: {
-        background: { type: ColorType.Solid, color: '#151a21' },
-        textColor: '#8b98a9',
-      },
-      grid: {
-        vertLines: { color: '#232c38' },
-        horzLines: { color: '#232c38' },
-      },
-      timeScale: { borderColor: '#232c38', timeVisible: true },
-      rightPriceScale: { borderColor: '#232c38' },
+      layout: { background: { type: ColorType.Solid, color: p.bg }, textColor: p.text },
+      grid: { vertLines: { color: p.grid }, horzLines: { color: p.grid } },
+      timeScale: { borderColor: p.grid, timeVisible: true },
+      rightPriceScale: { borderColor: p.grid },
       autoSize: true,
     })
     const series = chart.addCandlestickSeries({
-      upColor: '#16c784',
-      downColor: '#ea3943',
+      upColor: p.up,
+      downColor: p.down,
       borderVisible: false,
-      wickUpColor: '#16c784',
-      wickDownColor: '#ea3943',
+      wickUpColor: p.up,
+      wickDownColor: p.down,
     })
     chartRef.current = chart
     seriesRef.current = series
@@ -39,19 +79,54 @@ export function PriceChart({ candles }: { candles: Candle[] }) {
     }
   }, [])
 
+  // Re-colour in place when the theme flips (no teardown, keeps the live bar).
+  useEffect(() => {
+    if (!chartRef.current || !seriesRef.current) return
+    const p = readPalette()
+    chartRef.current.applyOptions({
+      layout: { background: { type: ColorType.Solid, color: p.bg }, textColor: p.text },
+      grid: { vertLines: { color: p.grid }, horzLines: { color: p.grid } },
+      timeScale: { borderColor: p.grid },
+      rightPriceScale: { borderColor: p.grid },
+    })
+    seriesRef.current.applyOptions({
+      upColor: p.up,
+      downColor: p.down,
+      wickUpColor: p.up,
+      wickDownColor: p.down,
+    })
+  }, [theme])
+
+  // Seed / replace the full history when the candle set changes.
   useEffect(() => {
     if (!seriesRef.current || candles.length === 0) return
-    seriesRef.current.setData(
-      candles.map((c) => ({
-        time: c.time as never,
-        open: c.open,
-        high: c.high,
-        low: c.low,
-        close: c.close,
-      })),
-    )
+    const data: CandlestickData[] = candles.map((c) => ({
+      time: c.time as Time,
+      open: c.open,
+      high: c.high,
+      low: c.low,
+      close: c.close,
+    }))
+    seriesRef.current.setData(data)
+    lastBarRef.current = { ...data[data.length - 1] }
     chartRef.current?.timeScale().fitContent()
   }, [candles])
+
+  // Move the newest bar live as the ticker price updates.
+  useEffect(() => {
+    if (!seriesRef.current || last == null || !Number.isFinite(last) || last <= 0) return
+    const bar = lastBarRef.current
+    if (!bar) return
+    const updated: CandlestickData = {
+      time: bar.time,
+      open: bar.open,
+      high: Math.max(bar.high, last),
+      low: Math.min(bar.low, last),
+      close: last,
+    }
+    lastBarRef.current = updated
+    seriesRef.current.update(updated)
+  }, [last])
 
   return <div className="chart" ref={containerRef} />
 }

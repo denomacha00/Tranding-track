@@ -32,6 +32,7 @@ def client():
     s.secret_key = "unit-test-secret-key"
     s.auto_license_new_users = True  # signups start licensed for these tests
     s.admin_email = ADMIN_EMAIL
+    s.rate_limit_enabled = False  # don't throttle the many signups in this suite
 
     init_db()  # ensure tables exist regardless of lifespan ordering
     with TestClient(app) as c:

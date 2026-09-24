@@ -151,7 +151,7 @@ class TradingEngine:
                         {"symbol": t.symbol, "db_amount": t.amount,
                          "exchange_amount": held, "pnl": t.pnl},
                     )
-                    self.notifier.send(
+                    self._notify(
                         f"\u2699\ufe0f Reconciled {t.symbol}: exchange no longer holds it; "
                         f"closed stale record (PnL {t.pnl:.2f})."
                     )
@@ -166,7 +166,7 @@ class TradingEngine:
                         {"symbol": t.symbol, "db_amount": old,
                          "exchange_amount": held},
                     )
-                    self.notifier.send(
+                    self._notify(
                         f"\u2699\ufe0f Reconciled {t.symbol}: adjusted tracked amount "
                         f"{old} → {held} to match the exchange."
                     )
@@ -194,6 +194,21 @@ class TradingEngine:
                 self._broadcaster.broadcast(message),
                 self._loop,
             )
+
+    def _notify(self, text: str) -> None:
+        """Fire-and-forget Telegram notification.
+
+        ``notifier.send`` makes a blocking HTTP call (up to its timeout) and
+        several callers here hold ``self._lock``. Sending inline would stall the
+        whole order path for that user on a slow/unreachable Telegram. Dispatch
+        on a daemon thread instead so a notification can never block or break a
+        trade; ``send`` swallows its own errors.
+        """
+        if not self.notifier.enabled:
+            return
+        threading.Thread(
+            target=self.notifier.send, args=(text,), daemon=True
+        ).start()
 
     # ---- helpers -----------------------------------------------------
 
@@ -226,6 +241,25 @@ class TradingEngine:
             )
         )
         return db.scalars(stmt).first()
+
+    def _open_unrealized(self, db: Session) -> float:
+        """Sum current unrealized PnL across this account's OPEN positions.
+
+        Fed into the daily-loss circuit breaker so a large *open* drawdown blocks
+        NEW entries even before any losing trade is realized — capital
+        preservation ("less loss") shouldn't wait for a stop to fire.
+        """
+        open_trades = db.scalars(
+            self._scope(select(Trade).where(Trade.status == TradeStatus.open.value))
+        ).all()
+        total = 0.0
+        for t in open_trades:
+            try:
+                price = self._price(t.symbol, fallback=t.entry_price)
+            except Exception:
+                price = t.entry_price
+            total += self.unrealized_pnl(t, price)
+        return total
 
     # ---- core execution ---------------------------------------------
 
@@ -287,6 +321,8 @@ class TradingEngine:
                 price=ref_price,
                 requested_amount=amount,
                 is_opening=True,
+                stop_price=stop_loss,
+                day_unrealized=self._open_unrealized(db),
             )
             if not decision.allowed:
                 return False, f"Rejected by risk manager: {decision.reason}", None
@@ -341,7 +377,7 @@ class TradingEngine:
                     {"id": trade.id, "symbol": symbol, "side": action,
                      "limit_price": limit_price},
                 )
-                self.notifier.send(
+                self._notify(
                     f"\U0001F4DD Limit {action.upper()} {qty:.8f} {symbol} resting @ "
                     f"{limit_price:.2f} ({self.settings.trading_mode})"
                 )
@@ -402,7 +438,7 @@ class TradingEngine:
             db.commit()
             db.refresh(trade)
             self._emit("trade_opened", {"id": trade.id, "symbol": symbol, "side": action})
-            self.notifier.send(
+            self._notify(
                 f"\U0001F4C8 Opened <b>{action.upper()}</b> {qty:.8f} {symbol} @ "
                 f"{price:.2f} ({self.settings.trading_mode})"
             )
@@ -468,7 +504,7 @@ class TradingEngine:
             "trade_opened",
             {"id": trade.id, "symbol": trade.symbol, "side": trade.side},
         )
-        self.notifier.send(
+        self._notify(
             f"\U0001F4C8 Limit filled <b>{trade.side.upper()}</b> {trade.amount:.8f} "
             f"{trade.symbol} @ {fill_price:.2f} ({self.settings.trading_mode})"
         )
@@ -493,7 +529,9 @@ class TradingEngine:
                 status = (order.get("status") or "").lower()
                 if status in {"canceled", "cancelled", "rejected", "expired"}:
                     with self._lock:
-                        self._cancel_pending(db, trade, f"exchange {status}")
+                        db.refresh(trade)
+                        if trade.status == TradeStatus.pending.value:
+                            self._cancel_pending(db, trade, f"exchange {status}")
                     continue
                 if status not in {"closed", "filled"} and not order.get("filled"):
                     continue
@@ -512,6 +550,11 @@ class TradingEngine:
                     continue
                 fill_price = limit  # paper fills at the limit price
             with self._lock:
+                # Re-read under the lock so a concurrent cancel/fill on another
+                # session can't make us fill the same resting order twice.
+                db.refresh(trade)
+                if trade.status != TradeStatus.pending.value:
+                    continue
                 self._fill_pending(db, trade, fill_price)
             filled.append(trade)
         return filled
@@ -548,7 +591,7 @@ class TradingEngine:
         db.commit()
         db.refresh(trade)
         self._emit("trade_closed", {"id": trade.id, "symbol": trade.symbol, "pnl": pnl})
-        self.notifier.send(
+        self._notify(
             f"\U0001F4B0 Closed {trade.symbol} @ {price:.2f} | PnL <b>{pnl:.2f}</b> "
             f"({reason})"
         )
@@ -591,6 +634,12 @@ class TradingEngine:
                     hit = "take-profit"
             if hit:
                 with self._lock:
+                    # Re-read under the lock: a manual close (on a different DB
+                    # session) may have closed this trade between our SELECT and
+                    # acquiring the lock. Closing again would double the order.
+                    db.refresh(trade)
+                    if trade.status != TradeStatus.open.value:
+                        continue
                     ok, _msg, _t = self._close_trade(db, trade, f"{hit} triggered")
                 if ok:
                     closed.append((trade, hit))

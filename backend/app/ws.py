@@ -22,8 +22,14 @@ class Broadcaster:
         self._clients: dict[WebSocket, int | None] = {}
         self._lock = asyncio.Lock()
 
-    async def connect(self, ws: WebSocket, user_id: int | None = None) -> None:
-        await ws.accept()
+    async def connect(
+        self, ws: WebSocket, user_id: int | None = None, *, accept: bool = True
+    ) -> None:
+        # ``accept=False`` lets the caller perform the handshake itself (e.g. to
+        # negotiate a subprotocol or reject with a custom close code before
+        # registering). When True we accept here for the simple case.
+        if accept:
+            await ws.accept()
         async with self._lock:
             self._clients[ws] = user_id
         logger.info("Dashboard client connected (%d total)", len(self._clients))

@@ -53,6 +53,29 @@ def test_sizing_capped_at_equity():
     assert qty * 100 <= 10_000 + 1e-6
 
 
+def test_sizing_uses_actual_stop_distance():
+    # A wider stop than the default must yield a SMALLER position so the amount
+    # actually risked stays at risk_per_trade_pct rather than ballooning.
+    rm = RiskManager(_settings(risk_per_trade_pct=1.0, default_stop_loss_pct=2.0))
+    default_qty = rm.size_position(equity=10_000, price=100)  # 2% stop
+    wide_qty = rm.size_position(equity=10_000, price=100, stop_fraction=0.10)  # 10% stop
+    assert wide_qty < default_qty
+    # risk = 1% of 10000 = 100; with a 10% stop -> notional 1000 -> qty 10.
+    assert wide_qty == pytest.approx(10.0)
+
+
+def test_check_sizes_against_explicit_stop(db):
+    # With an explicit stop_price and no requested amount, sizing must use the
+    # real stop distance (entry 100 -> stop 90 = 10%), not the default 2%.
+    rm = RiskManager(_settings(risk_per_trade_pct=1.0, default_stop_loss_pct=2.0))
+    decision = rm.check(
+        db, equity=10_000, price=100, requested_amount=None,
+        is_opening=True, stop_price=90.0,
+    )
+    assert decision.allowed
+    assert decision.amount == pytest.approx(10.0)  # risk 100 / 0.10 / price 100
+
+
 def test_max_open_positions_blocks(db):
     rm = RiskManager(_settings(max_open_positions=1))
     db.add(Trade(symbol="BTC/USDT", side="buy", amount=1, entry_price=100,
@@ -117,3 +140,26 @@ def test_total_exposure_cap_disabled_by_default(db):
     db.commit()
     decision = rm.check(db, equity=10_000, price=100, requested_amount=5, is_opening=True)
     assert decision.allowed  # no exposure cap enforced
+
+
+def test_daily_loss_limit_includes_open_drawdown(db):
+    # No CLOSED losses today, but current OPEN drawdown of -600 already exceeds
+    # the 5% (=$500) daily limit, so new entries must be blocked before any
+    # stop fires — the breaker measures total current risk, not just realized.
+    rm = RiskManager(_settings(daily_loss_limit_pct=5.0))
+    decision = rm.check(
+        db, equity=10_000, price=100, requested_amount=1,
+        is_opening=True, day_unrealized=-600.0,
+    )
+    assert not decision.allowed
+    assert "loss limit" in decision.reason.lower()
+
+
+def test_daily_loss_limit_allows_small_open_drawdown(db):
+    # A small open drawdown (-100) stays under the $500 limit -> still allowed.
+    rm = RiskManager(_settings(daily_loss_limit_pct=5.0))
+    decision = rm.check(
+        db, equity=10_000, price=100, requested_amount=1,
+        is_opening=True, day_unrealized=-100.0,
+    )
+    assert decision.allowed

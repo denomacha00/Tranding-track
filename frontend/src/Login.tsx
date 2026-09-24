@@ -1,11 +1,21 @@
 import { useState } from 'react'
 import { api, setToken, AuthError } from './api'
+import { ThemeToggle } from './ThemeToggle'
+import type { Theme } from './theme'
 
 /**
  * Auth gate: email + password sign-in / sign-up. On success it stores the JWT
  * and calls onAuthed() so the app can load the authenticated dashboard.
  */
-export function Login({ onAuthed }: { onAuthed: () => void }) {
+export function Login({
+  onAuthed,
+  theme,
+  onToggleTheme,
+}: {
+  onAuthed: () => void
+  theme: Theme
+  onToggleTheme: () => void
+}) {
   const [mode, setMode] = useState<'login' | 'signup'>('login')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -42,9 +52,12 @@ export function Login({ onAuthed }: { onAuthed: () => void }) {
   return (
     <div className="auth-wrap">
       <form className="auth-card" onSubmit={submit}>
-        <div className="brand" style={{ fontSize: 20, marginBottom: 4 }}>
-          <span className="dot" />
-          Tranding-track
+        <div className="auth-top">
+          <div className="brand" style={{ fontSize: 20 }}>
+            <span className="dot" />
+            Tranding-track
+          </div>
+          <ThemeToggle theme={theme} onToggle={onToggleTheme} />
         </div>
         <p className="hint">
           {mode === 'login'
@@ -104,17 +117,24 @@ export function LicenseGate({
   status,
   email,
   onLogout,
+  theme,
+  onToggleTheme,
 }: {
   status: 'pending' | 'revoked'
   email: string
   onLogout: () => void
+  theme: Theme
+  onToggleTheme: () => void
 }) {
   return (
     <div className="auth-wrap">
       <div className="auth-card">
-        <div className="brand" style={{ fontSize: 20 }}>
-          <span className="dot" />
-          Tranding-track
+        <div className="auth-top">
+          <div className="brand" style={{ fontSize: 20 }}>
+            <span className="dot" />
+            Tranding-track
+          </div>
+          <ThemeToggle theme={theme} onToggle={onToggleTheme} />
         </div>
         <h3 style={{ margin: '8px 0' }}>
           {status === 'pending' ? 'Awaiting licence approval' : 'Licence revoked'}

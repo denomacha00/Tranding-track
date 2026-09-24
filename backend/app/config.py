@@ -104,6 +104,10 @@ class Settings(BaseSettings):
     telegram_bot_token: str = Field(default="")
     telegram_chat_id: str = Field(default="")
 
+    # Abuse protection: in-process rate limiting on auth + webhook endpoints.
+    # Enabled by default; set RATE_LIMIT_ENABLED=false only for tests/local dev.
+    rate_limit_enabled: bool = Field(default=True)
+
     @property
     def cors_origin_list(self) -> list[str]:
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]

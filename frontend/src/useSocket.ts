@@ -1,11 +1,14 @@
 import { useEffect, useRef, useState } from 'react'
-import { getToken } from './api'
+import { getToken, notifyAuthFailure } from './api'
 import type { BotStatus, WsMessage } from './types'
 
 type Handlers = {
   onStatus?: (s: BotStatus) => void
   onEvent?: (m: WsMessage) => void
 }
+
+// Close code the server uses when the token is missing/invalid/expired.
+const WS_AUTH_FAILED = 4401
 
 // Auto-reconnecting WebSocket to the backend /ws endpoint.
 export function useSocket({ onStatus, onEvent }: Handlers) {
@@ -25,12 +28,23 @@ export function useSocket({ onStatus, onEvent }: Handlers) {
         retry = setTimeout(connect, 2000)
         return
       }
-      ws = new WebSocket(`${proto}://${location.host}/ws?token=${encodeURIComponent(token)}`)
+      // Carry the token as a WebSocket subprotocol ("bearer", <token>) rather
+      // than in the query string, so it never lands in server/proxy access
+      // logs. The backend echoes the "bearer" subprotocol on accept.
+      ws = new WebSocket(`${proto}://${location.host}/ws`, ['bearer', token])
 
       ws.onopen = () => setConnected(true)
-      ws.onclose = () => {
+      ws.onclose = (ev) => {
         setConnected(false)
-        if (!closed) retry = setTimeout(connect, 2000)
+        if (closed) return
+        if (ev.code === WS_AUTH_FAILED) {
+          // Dead session: stop retrying and force a clean logout instead of
+          // reconnecting forever with a rejected token.
+          closed = true
+          notifyAuthFailure()
+          return
+        }
+        retry = setTimeout(connect, 2000)
       }
       ws.onerror = () => ws?.close()
       ws.onmessage = (ev) => {

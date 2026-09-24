@@ -185,15 +185,15 @@ class MeOut(BaseModel):
 
 
 class CredentialsUpdate(BaseModel):
-    """Per-user API-key entry. Any field omitted is left unchanged."""
+    """Per-user API-key entry. Any field omitted is left unchanged.
+
+    Only exchange keys are per-user. The AI/LLM is an app-wide, operator-provided
+    capability, so no AI fields are accepted here.
+    """
 
     binance_api_key: Optional[str] = None
     binance_api_secret: Optional[str] = None
     binance_testnet: Optional[bool] = None
-    ai_api_key: Optional[str] = None
-    ai_base_url: Optional[str] = None
-    ai_model: Optional[str] = None
-    ai_style: Optional[str] = None
 
 
 class LicenseUpdate(BaseModel):

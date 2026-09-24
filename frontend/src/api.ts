@@ -10,6 +10,7 @@ import type {
   Settings,
   SignalRow,
   StrategyInfo,
+  Ticker,
   Trade,
   TrainingReport,
   UserRow,
@@ -30,6 +31,18 @@ export function setToken(token: string | null) {
 // Raised on a 401 so the app can bounce the user back to the login screen.
 export class AuthError extends Error {}
 
+// Global handler invoked when an AUTHENTICATED request is rejected with 401
+// (expired/invalid session). The app registers this to force a clean logout.
+// Login/signup 401s (no token present) intentionally do NOT trigger it.
+let authFailureHandler: (() => void) | null = null
+export function setAuthFailureHandler(fn: (() => void) | null) {
+  authFailureHandler = fn
+}
+export function notifyAuthFailure() {
+  setToken(null)
+  authFailureHandler?.()
+}
+
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
   const token = getToken()
   const res = await fetch(path, {
@@ -47,7 +60,12 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
     } catch {
       /* ignore */
     }
-    if (res.status === 401) throw new AuthError(detail || 'Unauthorized')
+    if (res.status === 401) {
+      // Only a request that CARRIED a token is a dead session -> force logout.
+      // A 401 from login/signup (no token) is just bad credentials.
+      if (token) notifyAuthFailure()
+      throw new AuthError(detail || 'Unauthorized')
+    }
     throw new Error(detail)
   }
   return res.json() as Promise<T>
@@ -70,10 +88,6 @@ export const api = {
     binance_api_key?: string
     binance_api_secret?: string
     binance_testnet?: boolean
-    ai_api_key?: string
-    ai_base_url?: string
-    ai_model?: string
-    ai_style?: string
   }) => req<Me>('/api/credentials', { method: 'PUT', body: JSON.stringify(body) }),
 
   // ---- admin ----
@@ -101,11 +115,15 @@ export const api = {
     symbol: string
     amount?: number
     limit_price?: number
+    stop_loss?: number
+    take_profit?: number
   }) => req<ExecutionResult>('/api/order', { method: 'POST', body: JSON.stringify(body) }),
   closeTrade: (id: number) =>
     req<ExecutionResult>(`/api/trades/${id}/close`, { method: 'POST' }),
   ohlcv: (symbol: string, timeframe = '1h', limit = 200) =>
     req<Candle[]>(`/api/ohlcv/${encodeURIComponent(symbol)}?timeframe=${timeframe}&limit=${limit}`),
+  ticker: (symbol: string) =>
+    req<Ticker>(`/api/ticker/${encodeURIComponent(symbol)}`),
   backtest: (
     symbol: string,
     strategy: string,

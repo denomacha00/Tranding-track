@@ -75,3 +75,58 @@ def test_backtest_drawdown_non_negative():
     result = run_backtest(_candles(prices), MovingAverageCrossStrategy(2, 3),
                           starting_balance=1000)
     assert result.max_drawdown_pct >= 0.0
+
+
+# ---- resting exits: stop-loss / take-profit / trailing --------------
+
+
+def test_stop_loss_caps_downside():
+    # Rise (to trigger a long) then a hard crash. A stop-loss must exit early
+    # and lose LESS than the same run with no stop riding the crash down.
+    prices = [10, 10, 10, 10, 10, 11, 12, 13, 14, 15, 16, 8, 6, 4, 2]
+    df = _candles(prices)
+    no_stop = run_backtest(df, MovingAverageCrossStrategy(3, 5),
+                           starting_balance=1000, fee_pct=0.0, slippage_pct=0.0)
+    stopped = run_backtest(df, MovingAverageCrossStrategy(3, 5),
+                           starting_balance=1000, fee_pct=0.0, slippage_pct=0.0,
+                           stop_loss_pct=10.0)
+    assert stopped.num_trades >= 1
+    assert stopped.ending_balance > no_stop.ending_balance
+
+
+def test_take_profit_locks_gain_on_spike():
+    # Enter on the cross, spike above the +20% target, then collapse. The
+    # take-profit should bank the gain instead of giving it back.
+    prices = [10, 10, 10, 10, 10, 11, 12, 13, 14, 15, 30, 12, 11, 10, 9, 8]
+    df = _candles(prices)
+    none = run_backtest(df, MovingAverageCrossStrategy(3, 5), starting_balance=1000,
+                        fee_pct=0.0, slippage_pct=0.0)
+    tp = run_backtest(df, MovingAverageCrossStrategy(3, 5), starting_balance=1000,
+                      fee_pct=0.0, slippage_pct=0.0, take_profit_pct=20.0)
+    assert tp.num_trades >= 1
+    assert tp.ending_balance > none.ending_balance
+
+
+def test_trailing_stop_locks_in_after_peak():
+    # Ride an uptrend to a peak, then pull back. A trailing stop should exit on
+    # the pullback and beat holding through the round-trip back down.
+    prices = [10, 10, 10, 10, 10, 11, 12, 14, 16, 18, 20, 18, 16, 14, 12, 10]
+    df = _candles(prices)
+    none = run_backtest(df, MovingAverageCrossStrategy(3, 5), starting_balance=1000,
+                        fee_pct=0.0, slippage_pct=0.0)
+    trailed = run_backtest(df, MovingAverageCrossStrategy(3, 5), starting_balance=1000,
+                           fee_pct=0.0, slippage_pct=0.0, trailing_stop_pct=10.0)
+    assert trailed.num_trades >= 1
+    assert trailed.ending_balance > none.ending_balance
+
+
+def test_exits_disabled_by_default_match_signal_only():
+    # With all exit percentages at 0 the result must be identical to the plain
+    # signal-only backtest (guards the back-compat default path).
+    prices = [10, 9, 8, 7, 6, 5, 4, 3, 2, 1] + list(range(2, 40))
+    df = _candles(prices)
+    base = run_backtest(df, MovingAverageCrossStrategy(3, 5), starting_balance=1000)
+    zeroed = run_backtest(df, MovingAverageCrossStrategy(3, 5), starting_balance=1000,
+                          stop_loss_pct=0.0, take_profit_pct=0.0, trailing_stop_pct=0.0)
+    assert base.ending_balance == zeroed.ending_balance
+    assert base.num_trades == zeroed.num_trades

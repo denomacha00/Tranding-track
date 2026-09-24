@@ -92,6 +92,15 @@ export interface Candle {
   volume: number
 }
 
+export interface Ticker {
+  symbol: string
+  last: number
+  bid: number | null
+  ask: number | null
+  // 24h price change percent (may be null if the exchange omits it).
+  percentage: number | null
+}
+
 export interface BacktestResult {
   symbol: string
   strategy: string
@@ -103,6 +112,11 @@ export interface BacktestResult {
   win_rate_pct: number
   max_drawdown_pct: number
   total_fees?: number
+  // Exit rules the backtest applied (defaulted from live settings) so results
+  // reflect how the bot actually trades, not idealised buy-and-hold.
+  stop_loss_pct?: number
+  take_profit_pct?: number
+  trailing_stop_pct?: number
   equity_curve: number[]
 }
 

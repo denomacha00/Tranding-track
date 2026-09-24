@@ -1,12 +1,13 @@
 """Per-user trading engines (multi-tenant orchestration).
 
 Each licensed user gets their OWN :class:`TradingEngine` instance, built from a
-copy of the global env settings with that user's decrypted Binance/AI keys and
-their persisted per-user settings overrides layered on top. Engines are cached
-in memory and hydrated lazily on first use, and rebuilt when a user changes
-their keys or settings.
+copy of the global env settings with that user's decrypted Binance keys and
+their persisted per-user settings overrides layered on top. The AI/LLM key is
+app-wide (operator env), never per-user. Engines are cached in memory and
+hydrated lazily on first use, and rebuilt when a user changes their keys or
+settings.
 
-Security: a user's exchange/AI secrets are only ever held decrypted inside their
+Security: a user's exchange secrets are only ever held decrypted inside their
 own engine's Settings object in memory; they are stored on disk encrypted
 (Fernet, keyed off SECRET_KEY) and never logged.
 """
@@ -30,7 +31,14 @@ logger = logging.getLogger(__name__)
 
 
 def build_settings_for_user(user: User) -> Settings:
-    """Return a Settings copy carrying THIS user's decrypted keys + config."""
+    """Return a Settings copy carrying THIS user's decrypted Binance keys.
+
+    Only the EXCHANGE keys are per-user — each user trades their own Binance
+    account. The AI/LLM is APP-WIDE and "inbuilt": every user shares the single
+    operator-provided key from the global env Settings (``AI_API_KEY`` etc.), so
+    no user ever enters an AI key. We therefore leave ``ai_*`` at the global
+    values and never layer per-user AI config on top.
+    """
     base = get_settings()
     data = base.model_dump()
     sk = base.secret_key
@@ -39,14 +47,6 @@ def build_settings_for_user(user: User) -> Settings:
         decrypt_secret(sk, user.binance_api_secret_enc or "") or ""
     )
     data["binance_testnet"] = bool(user.binance_testnet)
-    if user.ai_api_key_enc:
-        data["ai_api_key"] = decrypt_secret(sk, user.ai_api_key_enc) or ""
-    if user.ai_base_url:
-        data["ai_base_url"] = user.ai_base_url
-    if user.ai_model:
-        data["ai_model"] = user.ai_model
-    if user.ai_style:
-        data["ai_api_style"] = user.ai_style
     return Settings(**data)
 
 

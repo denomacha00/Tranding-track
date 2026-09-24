@@ -95,6 +95,9 @@ def train(
     starting_balance: float = 10_000.0,
     fee_pct: float = 0.1,
     slippage_pct: float = 0.05,
+    stop_loss_pct: float = 0.0,
+    take_profit_pct: float = 0.0,
+    trailing_stop_pct: float = 0.0,
     top_n: int = 5,
     train_fraction: float = 0.7,
 ) -> TrainingReport:
@@ -144,6 +147,8 @@ def train(
         result = run_backtest(
             train_df, strat, starting_balance=starting_balance,
             fee_pct=fee_pct, slippage_pct=slippage_pct,
+            stop_loss_pct=stop_loss_pct, take_profit_pct=take_profit_pct,
+            trailing_stop_pct=trailing_stop_pct,
         )
         candidate = TrainingCandidate(
             params=params,
@@ -168,6 +173,9 @@ def train(
                 starting_balance=starting_balance,
                 fee_pct=fee_pct,
                 slippage_pct=slippage_pct,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_pct=take_profit_pct,
+                trailing_stop_pct=trailing_stop_pct,
             )
             candidate.validation_return_pct = round(v.total_return_pct, 2)
             candidate.validation_num_trades = v.num_trades

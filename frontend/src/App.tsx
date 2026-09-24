@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
-import { api, setToken, getToken } from './api'
+import { api, setToken, getToken, setAuthFailureHandler } from './api'
 import { PriceChart } from './PriceChart'
 import { Login, LicenseGate } from './Login'
 import { Admin } from './Admin'
 import { useSocket } from './useSocket'
-import type { BotStatus, BacktestResult, Candle, ExchangeAccess, MarketAnalysis, Me, Settings, SignalRow, StrategyInfo, Trade, TrainingReport } from './types'
+import { useTheme, type Theme } from './theme'
+import { ThemeToggle } from './ThemeToggle'
+import type { BotStatus, BacktestResult, Candle, ExchangeAccess, MarketAnalysis, Me, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
 
 const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
@@ -19,6 +21,7 @@ type Toast = { kind: 'ok' | 'error'; text: string } | null
 export default function App() {
   const [me, setMe] = useState<Me | null>(null)
   const [checking, setChecking] = useState(true)
+  const [theme, toggleTheme] = useTheme()
 
   const loadMe = useCallback(async () => {
     if (!getToken()) {
@@ -45,11 +48,19 @@ export default function App() {
     setMe(null)
   }, [])
 
+  // Force a clean logout when any authenticated request (REST or WebSocket)
+  // reports the session is dead (401 / ws 4401), instead of leaving the user
+  // on a broken dashboard that silently fails every call.
+  useEffect(() => {
+    setAuthFailureHandler(() => setMe(null))
+    return () => setAuthFailureHandler(null)
+  }, [])
+
   if (checking) {
     return <div className="auth-wrap"><div className="auth-card">Loading…</div></div>
   }
   if (!me) {
-    return <Login onAuthed={() => { setChecking(true); loadMe() }} />
+    return <Login onAuthed={() => { setChecking(true); loadMe() }} theme={theme} onToggleTheme={toggleTheme} />
   }
   if (me.license_status !== 'active') {
     return (
@@ -57,38 +68,74 @@ export default function App() {
         status={me.license_status as 'pending' | 'revoked'}
         email={me.email}
         onLogout={logout}
+        theme={theme}
+        onToggleTheme={toggleTheme}
       />
     )
   }
-  return <Dashboard me={me} onLogout={logout} onMeChanged={setMe} />
+  return <Dashboard me={me} onLogout={logout} onMeChanged={setMe} theme={theme} onToggleTheme={toggleTheme} />
 }
+
+type TabKey = 'trades' | 'signals' | 'analyze' | 'train' | 'backtest' | 'settings' | 'admin'
+
+// Left-drawer navigation. `admin: true` items only render for admins. The same
+// keys drive the in-panel tab strip, so the two stay in sync off one `tab`.
+const NAV: { key: TabKey; label: string; icon: string; admin?: boolean }[] = [
+  { key: 'trades', label: 'Trades', icon: '📈' },
+  { key: 'signals', label: 'Signals', icon: '📡' },
+  { key: 'analyze', label: 'Analyze', icon: '🔍' },
+  { key: 'train', label: 'Train', icon: '🧠' },
+  { key: 'backtest', label: 'Backtest', icon: '↺' },
+  { key: 'settings', label: 'Settings', icon: '⚙' },
+  { key: 'admin', label: 'Admin', icon: '🛡', admin: true },
+]
 
 function Dashboard({
   me,
   onLogout,
   onMeChanged,
+  theme,
+  onToggleTheme,
 }: {
   me: Me
   onLogout: () => void
   onMeChanged: (m: Me) => void
+  theme: Theme
+  onToggleTheme: () => void
 }) {
   const [status, setStatus] = useState<BotStatus | null>(null)
   const [settings, setSettings] = useState<Settings | null>(null)
   const [trades, setTrades] = useState<Trade[]>([])
   const [signals, setSignals] = useState<SignalRow[]>([])
   const [candles, setCandles] = useState<Candle[]>([])
+  const [ticker, setTicker] = useState<Ticker | null>(null)
   const [symbol, setSymbol] = useState(SYMBOLS[0])
   const [timeframe, setTimeframe] = useState('1h')
   const [amount, setAmount] = useState('')
   const [limitPrice, setLimitPrice] = useState('')
+  const [stopLoss, setStopLoss] = useState('')
+  const [takeProfit, setTakeProfit] = useState('')
+  const [placing, setPlacing] = useState(false)
+  const [closing, setClosing] = useState<number | null>(null)
   const [toast, setToast] = useState<Toast>(null)
-  const [tab, setTab] = useState<'trades' | 'signals' | 'analyze' | 'train' | 'backtest' | 'settings' | 'admin'>('trades')
+  const [tab, setTab] = useState<TabKey>('trades')
   const [access, setAccess] = useState<ExchangeAccess | null>(null)
+  const [menuOpen, setMenuOpen] = useState(false)
 
   const showToast = useCallback((kind: 'ok' | 'error', text: string) => {
     setToast({ kind, text })
     setTimeout(() => setToast(null), 4000)
   }, [])
+
+  // Close the nav drawer on Escape so it behaves like a normal modal drawer.
+  useEffect(() => {
+    if (!menuOpen) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setMenuOpen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [menuOpen])
 
   const refreshTrades = useCallback(async () => {
     try {
@@ -133,7 +180,9 @@ function Dashboard({
     refreshSignals()
   }, [refreshTrades, refreshSignals])
 
-  // Load candles when symbol/timeframe changes, and poll periodically.
+  // Load candles when symbol/timeframe changes, and poll periodically. The
+  // poll is fairly frequent so a new closed bar shows up quickly; the live
+  // ticker (below) keeps the forming bar moving in between reloads.
   useEffect(() => {
     let alive = true
     const load = () =>
@@ -142,12 +191,33 @@ function Dashboard({
         .then((c) => alive && setCandles(c))
         .catch(() => alive && setCandles([]))
     load()
-    const id = setInterval(load, 15000)
+    const id = setInterval(load, 10000)
     return () => {
       alive = false
       clearInterval(id)
     }
   }, [symbol, timeframe])
+
+  // Live price feed: poll the ticker fast so the chart's newest bar and the
+  // header last-price move in near-real-time, like an exchange chart. Reset on
+  // symbol change so a stale price from the previous market never lingers.
+  useEffect(() => {
+    let alive = true
+    setTicker(null)
+    const load = () =>
+      api
+        .ticker(symbol)
+        .then((t) => alive && setTicker(t))
+        .catch(() => {
+          /* transient ticker failures are non-fatal; keep the last price */
+        })
+    load()
+    const id = setInterval(load, 3000)
+    return () => {
+      alive = false
+      clearInterval(id)
+    }
+  }, [symbol])
 
   const openTrades = useMemo(
     () => trades.filter((t) => t.status === 'open' || t.status === 'pending'),
@@ -155,27 +225,72 @@ function Dashboard({
   )
 
   const doOrder = async (action: 'buy' | 'sell') => {
+    if (placing) return // guard against double-submit / duplicate orders
+    const amt = amount ? Number(amount) : undefined
+    const lim = limitPrice ? Number(limitPrice) : undefined
+    const sl = stopLoss ? Number(stopLoss) : undefined
+    const tp = takeProfit ? Number(takeProfit) : undefined
+    // Client-side numeric validation: any provided value must be > 0.
+    const fields: [string, number | undefined][] = [
+      ['Amount', amt],
+      ['Limit price', lim],
+      ['Stop loss', sl],
+      ['Take profit', tp],
+    ]
+    for (const [label, v] of fields) {
+      if (v !== undefined && (!Number.isFinite(v) || v <= 0)) {
+        showToast('error', `${label} must be a positive number.`)
+        return
+      }
+    }
+    // Confirm before spending REAL money in live mode.
+    if (status?.trading_mode === 'live') {
+      const parts = [
+        `${action.toUpperCase()} ${symbol}`,
+        amt ? `amount ${amt}` : 'auto-sized by risk',
+        lim ? `limit ${lim}` : 'market',
+      ]
+      if (sl) parts.push(`stop-loss ${sl}`)
+      if (tp) parts.push(`take-profit ${tp}`)
+      const ok = window.confirm(
+        `LIVE ORDER — this uses real funds on your Binance account.\n\n` +
+          `${parts.join('  ·  ')}\n\nPlace this order?`,
+      )
+      if (!ok) return
+    }
+    setPlacing(true)
     try {
       const res = await api.order({
         action,
         symbol,
-        amount: amount ? Number(amount) : undefined,
-        limit_price: limitPrice ? Number(limitPrice) : undefined,
+        amount: amt,
+        limit_price: lim,
+        stop_loss: sl,
+        take_profit: tp,
       })
       showToast(res.accepted ? 'ok' : 'error', res.message)
       refreshTrades()
     } catch (e) {
       showToast('error', (e as Error).message)
+    } finally {
+      setPlacing(false)
     }
   }
 
   const closeTrade = async (id: number) => {
+    if (closing !== null) return // one close at a time; avoid double-close
+    if (status?.trading_mode === 'live' && !window.confirm('Close this LIVE position at market now?')) {
+      return
+    }
+    setClosing(id)
     try {
       const res = await api.closeTrade(id)
       showToast(res.accepted ? 'ok' : 'error', res.message)
       refreshTrades()
     } catch (e) {
       showToast('error', (e as Error).message)
+    } finally {
+      setClosing(null)
     }
   }
 
@@ -191,9 +306,64 @@ function Dashboard({
 
   const pnlClass = (n: number) => (n > 0 ? 'pos' : n < 0 ? 'neg' : '')
 
+  // Live price for the header readout + the chart's forming bar. Prefer the
+  // fast ticker; fall back to the newest candle close until it arrives.
+  const livePrice = ticker?.last ?? (candles.length ? candles[candles.length - 1].close : null)
+  const chgPct = ticker?.percentage ?? null
+
   return (
     <div className="app">
+      {/* Slide-in navigation drawer + click-away backdrop. The hamburger in the
+         topbar toggles `menuOpen`; picking an item sets the tab and closes it. */}
+      <div
+        className={`drawer-backdrop ${menuOpen ? 'show' : ''}`}
+        onClick={() => setMenuOpen(false)}
+      />
+      <aside className={`drawer ${menuOpen ? 'open' : ''}`} aria-hidden={!menuOpen}>
+        <div className="drawer-head">
+          <div className="brand" style={{ fontSize: 16 }}>
+            <span className="dot" />
+            Tranding-track
+          </div>
+          <button
+            className="drawer-close"
+            onClick={() => setMenuOpen(false)}
+            aria-label="Close menu"
+            type="button"
+          >
+            ✕
+          </button>
+        </div>
+        <nav className="drawer-nav">
+          {NAV.filter((n) => !n.admin || me.role === 'admin').map((n) => (
+            <button
+              key={n.key}
+              className={`drawer-item ${tab === n.key ? 'active' : ''}`}
+              onClick={() => {
+                setTab(n.key)
+                setMenuOpen(false)
+              }}
+              type="button"
+            >
+              <span className="drawer-ico">{n.icon}</span>
+              <span>{n.label}</span>
+            </button>
+          ))}
+        </nav>
+      </aside>
+
       <header className="topbar">
+        <button
+          className={`hamburger ${menuOpen ? 'open' : ''}`}
+          onClick={() => setMenuOpen((v) => !v)}
+          aria-label="Toggle menu"
+          aria-expanded={menuOpen}
+          type="button"
+        >
+          <span />
+          <span />
+          <span />
+        </button>
         <div className="brand">
           <span className="dot" />
           Tranding-track
@@ -214,6 +384,7 @@ function Dashboard({
         {me.role === 'admin' && <span className="badge">admin</span>}
         <span className="hint">{connected ? 'live' : 'reconnecting…'}</span>
         <span className={`ws-dot ${connected ? 'connected' : ''}`} />
+        <ThemeToggle theme={theme} onToggle={onToggleTheme} />
         <button className="btn primary" onClick={toggleBot}>
           {status?.running ? 'Stop bot' : 'Start bot'}
         </button>
@@ -238,7 +409,20 @@ function Dashboard({
 
           <section className="panel">
             <div className="panel-head">
-              <span>Price</span>
+              <div className="price-ticker">
+                <span>Price</span>
+                {livePrice != null && (
+                  <>
+                    <span className="last">{fmt(livePrice, livePrice < 10 ? 4 : 2)}</span>
+                    {chgPct != null && (
+                      <span className={`chg ${pnlClass(chgPct)}`}>
+                        {chgPct > 0 ? '+' : ''}
+                        {fmt(chgPct, 2)}%
+                      </span>
+                    )}
+                  </>
+                )}
+              </div>
               <div className="row" style={{ alignItems: 'center' }}>
                 <select className="select" value={symbol} onChange={(e) => setSymbol(e.target.value)}>
                   {SYMBOLS.map((s) => (
@@ -258,7 +442,7 @@ function Dashboard({
             </div>
             <div className="panel-body">
               {candles.length ? (
-                <PriceChart candles={candles} />
+                <PriceChart candles={candles} theme={theme} last={livePrice} />
               ) : (
                 <div className="empty">
                   No candle data. Check the backend / Binance connection.
@@ -295,17 +479,39 @@ function Dashboard({
                     inputMode="decimal"
                   />
                 </div>
-                <button className="btn buy" onClick={() => doOrder('buy')}>
-                  Buy
+                <div className="field">
+                  <label>Stop-loss price (optional)</label>
+                  <input
+                    className="input"
+                    placeholder="auto"
+                    value={stopLoss}
+                    onChange={(e) => setStopLoss(e.target.value)}
+                    inputMode="decimal"
+                  />
+                </div>
+                <div className="field">
+                  <label>Take-profit price (optional)</label>
+                  <input
+                    className="input"
+                    placeholder="auto"
+                    value={takeProfit}
+                    onChange={(e) => setTakeProfit(e.target.value)}
+                    inputMode="decimal"
+                  />
+                </div>
+                <button className="btn buy" onClick={() => doOrder('buy')} disabled={placing}>
+                  {placing ? 'Placing…' : 'Buy'}
                 </button>
-                <button className="btn sell" onClick={() => doOrder('sell')}>
-                  Sell
+                <button className="btn sell" onClick={() => doOrder('sell')} disabled={placing}>
+                  {placing ? 'Placing…' : 'Sell'}
                 </button>
               </div>
               <p className="hint" style={{ marginTop: 10 }}>
-                Orders respect your risk settings. In <b>paper</b> mode nothing hits the exchange.
-                Set a <b>limit price</b> to rest the order until the market reaches it (a buy fills
-                at or below it, a sell at or above it); leave it blank for an immediate market order.
+                Orders respect your risk settings. In <b>paper</b> mode nothing hits the exchange;
+                in <b>live</b> mode you'll be asked to confirm before real funds are used. Set a
+                <b> limit price</b> to rest the order until the market reaches it (a buy fills at or
+                below it, a sell at or above it); leave it blank for an immediate market order. A
+                blank <b>stop-loss</b>/<b>take-profit</b> uses your configured default percentages.
               </p>
             </div>
           </section>
@@ -368,6 +574,7 @@ function Dashboard({
                   openTrades={openTrades}
                   onClose={closeTrade}
                   pnlClass={pnlClass}
+                  closingId={closing}
                 />
               )}
               {tab === 'signals' && <SignalsTable signals={signals} />}
@@ -429,6 +636,18 @@ function StatsRow({ status }: { status: BotStatus | null }) {
         </div>
       </div>
       <div className="stat">
+        <div className="label">Realized PnL</div>
+        <div className={`value ${cls(status?.realized_pnl ?? 0)}`}>
+          ${fmt(status?.realized_pnl)}
+        </div>
+      </div>
+      <div className="stat">
+        <div className="label">Today's PnL</div>
+        <div className={`value ${cls(status?.day_pnl ?? 0)}`}>
+          ${fmt(status?.day_pnl)}
+        </div>
+      </div>
+      <div className="stat">
         <div className="label">Open / Max</div>
         <div className="value">
           {status?.open_positions ?? 0} / {status?.max_open_positions ?? 0}
@@ -443,11 +662,13 @@ function TradesTable({
   openTrades,
   onClose,
   pnlClass,
+  closingId,
 }: {
   trades: Trade[]
   openTrades: Trade[]
   onClose: (id: number) => void
   pnlClass: (n: number) => string
+  closingId?: number | null
 }) {
   if (!trades.length) return <div className="empty">No trades yet.</div>
   const openIds = new Set(openTrades.map((t) => t.id))
@@ -481,8 +702,16 @@ function TradesTable({
             </td>
             <td>
               {openIds.has(t.id) && (
-                <button className="btn" onClick={() => onClose(t.id)}>
-                  {t.status === 'pending' ? 'Cancel' : 'Close'}
+                <button
+                  className="btn"
+                  onClick={() => onClose(t.id)}
+                  disabled={closingId !== null && closingId !== undefined}
+                >
+                  {closingId === t.id
+                    ? 'Working…'
+                    : t.status === 'pending'
+                      ? 'Cancel'
+                      : 'Close'}
                 </button>
               )}
             </td>
@@ -783,6 +1012,12 @@ function BacktestPanel({
               <div className="value">{fmt(result.total_fees ?? 0)}</div>
             </div>
           </div>
+          <p className="hint" style={{ marginTop: 8 }}>
+            Applied the bot's live exit rules — stop-loss{' '}
+            {fmt(result.stop_loss_pct ?? 0)}%, take-profit {fmt(result.take_profit_pct ?? 0)}%,
+            trailing {fmt(result.trailing_stop_pct ?? 0)}% — so these numbers reflect how the
+            bot would actually trade, not buy-and-hold.
+          </p>
           {result.equity_curve.length > 1 && (
             <div style={{ marginTop: 12 }}>
               <EquitySparkline values={result.equity_curve} />
@@ -967,6 +1202,7 @@ function SettingsPanel({
   onError: (msg: string) => void
 }) {
   const [form, setForm] = useState<Settings | null>(settings)
+  const [copied, setCopied] = useState(false)
   useEffect(() => setForm(settings), [settings])
   if (!form) return <div className="empty">Loading…</div>
 
@@ -1166,8 +1402,8 @@ function SettingsPanel({
       </p>
       <p className="hint">
         Trailing stop ratchets an open long's stop-loss upward as price rises to
-        lock in gains (never loosened). API auth:{' '}
-        {form.api_key_set ? '✅ X-API-Key required' : '⚠️ open — set API_KEY before exposing the port'}
+        lock in gains (never loosened). Binance keys:{' '}
+        {form.api_key_set ? '✅ set (live trading available)' : '⚠️ not set — add them below to trade live'}
         . Telegram alerts: {form.notifications_enabled ? '✅ on' : 'off'}.
       </p>
 
@@ -1181,7 +1417,23 @@ function SettingsPanel({
         <div className="panel-head">Your TradingView webhook</div>
         <div className="panel-body">
           <p className="hint">Point your TradingView alert's webhook URL here (unique to your account — keep it private, it acts as your secret):</p>
-          <code className="inline">{webhookUrl}</code>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <code className="inline" style={{ flex: 1, minWidth: 240, wordBreak: 'break-all' }}>{webhookUrl}</code>
+            <button
+              className="btn"
+              onClick={async () => {
+                try {
+                  await navigator.clipboard.writeText(webhookUrl)
+                  setCopied(true)
+                  setTimeout(() => setCopied(false), 1500)
+                } catch {
+                  /* clipboard blocked — user can select manually */
+                }
+              }}
+            >
+              {copied ? 'Copied ✓' : 'Copy'}
+            </button>
+          </div>
           <p className="hint" style={{ marginTop: 10 }}>Alert message (JSON) — no secret needed, the URL token authenticates you:</p>
           <pre className="code">{alertExample}</pre>
           <details className="help" style={{ marginTop: 10 }}>
@@ -1222,8 +1474,6 @@ function CredentialsCard({
   const [binKey, setBinKey] = useState('')
   const [binSecret, setBinSecret] = useState('')
   const [testnet, setTestnet] = useState(me.binance_testnet)
-  const [aiKey, setAiKey] = useState('')
-  const [aiModel, setAiModel] = useState(me.ai_model || '')
   const [busy, setBusy] = useState(false)
   const [saved, setSaved] = useState('')
 
@@ -1236,13 +1486,10 @@ function CredentialsCard({
       const body: Record<string, unknown> = { binance_testnet: testnet }
       if (binKey.trim()) body.binance_api_key = binKey.trim()
       if (binSecret.trim()) body.binance_api_secret = binSecret.trim()
-      if (aiKey.trim()) body.ai_api_key = aiKey.trim()
-      if (aiModel.trim()) body.ai_model = aiModel.trim()
       const updated = await api.updateCredentials(body)
       onMeChanged(updated)
       setBinKey('')
       setBinSecret('')
-      setAiKey('')
       setSaved('Credentials saved (encrypted at rest).')
     } catch (e) {
       onError((e as Error).message)
@@ -1264,8 +1511,8 @@ function CredentialsCard({
           <p className="hint">
             Use <b>trade-only</b> keys (no withdrawal permission). Keys are encrypted
             at rest and never shown again. Binance keys currently{' '}
-            {me.binance_keys_set ? '✅ set' : '❌ not set'}; AI key{' '}
-            {me.ai_key_set ? '✅ set' : 'not set'}.
+            {me.binance_keys_set ? '✅ set' : '❌ not set'}. The AI assistant is{' '}
+            <b>built into the app</b> — {me.ai_key_set ? '✅ active for everyone' : 'not configured by the operator yet'}, so you don't enter any AI key.
           </p>
         )}
         <details className="help">
@@ -1329,30 +1576,6 @@ function CredentialsCard({
           />
           Use Binance testnet (recommended until you have verified everything)
         </label>
-        <div className="row">
-          <div className="field">
-            <label>AI API key (optional)</label>
-            <input
-              className="input"
-              type="password"
-              value={aiKey}
-              onChange={(e) => setAiKey(e.target.value)}
-              placeholder={me.ai_key_set ? 'unchanged' : 'optional'}
-              disabled={disabled}
-              autoComplete="off"
-            />
-          </div>
-          <div className="field">
-            <label>AI model (optional)</label>
-            <input
-              className="input"
-              value={aiModel}
-              onChange={(e) => setAiModel(e.target.value)}
-              placeholder="e.g. gpt-4o-mini"
-              disabled={disabled}
-            />
-          </div>
-        </div>
         {saved && <p className="hint" style={{ color: 'var(--green)' }}>{saved}</p>}
         <button className="btn primary" onClick={save} disabled={disabled || busy}>
           {busy ? 'Saving…' : 'Save API keys'}

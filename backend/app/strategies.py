@@ -85,10 +85,13 @@ class RsiStrategy(Strategy):
         delta = close.diff()
         gain = delta.clip(lower=0)
         loss = -delta.clip(upper=0)
-        avg_gain = gain.rolling(period).mean()
-        avg_loss = loss.rolling(period).mean()
-        # Base Wilder-style RSI. Divide-by-zero is handled explicitly below so
-        # the three degenerate cases are unambiguous:
+        # Wilder's smoothing (RMA): an EWMA with alpha = 1/period. This matches
+        # how TradingView (and most charting tools) compute RSI, so signals here
+        # line up with what the user sees on their chart — a simple rolling mean
+        # would diverge. Divide-by-zero is handled explicitly below so the three
+        # degenerate cases are unambiguous:
+        avg_gain = gain.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
+        avg_loss = loss.ewm(alpha=1 / period, adjust=False, min_periods=period).mean()
         rs = avg_gain / avg_loss
         rsi = 100 - (100 / (1 + rs))
         # Pure gains (no losses in the window) -> fully overbought (100).

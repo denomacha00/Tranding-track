@@ -34,6 +34,7 @@ from app.backtest import run_backtest
 from app.config import get_settings
 from app.database import get_db, init_db
 from app.deps import get_current_user, require_admin, require_licensed_user
+from app.ratelimit import client_ip, limiter
 from app.models import (
     LicenseStatus,
     SignalLog,
@@ -173,6 +174,49 @@ app.add_middleware(
 )
 
 
+# ---- Security headers ----------------------------------------------
+# Defence-in-depth for a dashboard that holds a bearer token in the browser:
+# a strict Content-Security-Policy plus anti-clickjacking/MIME-sniffing headers.
+# ``frame-ancestors 'none'`` + ``X-Frame-Options: DENY`` make the app
+# un-embeddable (no clickjacking). The built SPA loads only same-origin hashed
+# JS/CSS and connects to the same origin over ws/wss, so 'self' is sufficient
+# for scripts; inline styles are allowed because the charting library injects
+# them. If a future build needs inline scripts, prefer nonces over widening this.
+_CSP = (
+    "default-src 'self'; "
+    "script-src 'self'; "
+    "style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; "
+    "font-src 'self' data:; "
+    "connect-src 'self' ws: wss:; "
+    "object-src 'none'; "
+    "base-uri 'self'; "
+    "form-action 'self'; "
+    "frame-ancestors 'none'"
+)
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    resp = await call_next(request)
+    resp.headers.setdefault("Content-Security-Policy", _CSP)
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault(
+        "Permissions-Policy", "geolocation=(), microphone=(), camera=()"
+    )
+    # HSTS only when the request actually arrived over TLS (behind the edge
+    # proxy this shows up as x-forwarded-proto=https). Never send it over plain
+    # HTTP, which would wrongly pin http visitors.
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme)
+    if proto == "https":
+        resp.headers.setdefault(
+            "Strict-Transport-Security", "max-age=63072000; includeSubDomains"
+        )
+    return resp
+
+
 # ---- Health ---------------------------------------------------------
 
 
@@ -195,8 +239,24 @@ def _issue_token(user: User) -> str:
     )
 
 
+def _enforce_rate_limit(
+    request: Request, bucket: str, *, limit: int, window_seconds: float
+) -> None:
+    """Reject with HTTP 429 once ``limit`` hits for this IP+bucket are exceeded."""
+    if not get_settings().rate_limit_enabled:
+        return
+    key = f"{bucket}:{client_ip(request)}"
+    if not limiter.hit(key, limit=limit, window_seconds=window_seconds):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many attempts. Please wait a minute and try again.",
+        )
+
+
 @app.post("/api/auth/signup", response_model=TokenResponse)
-def signup(req: SignupRequest, db: Session = Depends(get_db)):
+def signup(req: SignupRequest, request: Request, db: Session = Depends(get_db)):
+    # Throttle account creation per source IP to blunt mass-signup abuse.
+    _enforce_rate_limit(request, "signup", limit=5, window_seconds=3600)
     s = get_settings()
     if not s.secret_key:
         raise HTTPException(
@@ -238,7 +298,9 @@ def signup(req: SignupRequest, db: Session = Depends(get_db)):
 
 
 @app.post("/api/auth/login", response_model=TokenResponse)
-def login(req: LoginRequest, db: Session = Depends(get_db)):
+def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
+    # Throttle password guessing per source IP.
+    _enforce_rate_limit(request, "login", limit=10, window_seconds=300)
     if not get_settings().secret_key:
         raise HTTPException(
             status_code=503, detail="Login is disabled (SECRET_KEY unset)."
@@ -252,6 +314,9 @@ def login(req: LoginRequest, db: Session = Depends(get_db)):
 
 @app.get("/api/auth/me", response_model=MeOut)
 def me(user: User = Depends(get_current_user)):
+    # AI is app-wide/inbuilt: report the OPERATOR's global config, not per-user,
+    # so every licensed user sees the same built-in AI availability.
+    gs = get_settings()
     return MeOut(
         id=user.id,
         email=user.email,
@@ -260,9 +325,9 @@ def me(user: User = Depends(get_current_user)):
         webhook_path=_webhook_path(user.webhook_token),
         binance_keys_set=bool(user.binance_api_key_enc and user.binance_api_secret_enc),
         binance_testnet=bool(user.binance_testnet),
-        ai_key_set=bool(user.ai_api_key_enc),
-        ai_model=user.ai_model or "",
-        secrets_storage_enabled=secrets_enabled(get_settings().secret_key),
+        ai_key_set=bool(gs.ai_api_key),
+        ai_model=gs.ai_model or "",
+        secrets_storage_enabled=secrets_enabled(gs.secret_key),
     )
 
 
@@ -293,18 +358,9 @@ def update_credentials(
         )
     if "binance_testnet" in data and data["binance_testnet"] is not None:
         user.binance_testnet = 1 if data["binance_testnet"] else 0
-    if "ai_api_key" in data and data["ai_api_key"] is not None:
-        user.ai_api_key_enc = (
-            encrypt_secret(s.secret_key, data["ai_api_key"])
-            if data["ai_api_key"]
-            else None
-        )
-    if "ai_base_url" in data and data["ai_base_url"] is not None:
-        user.ai_base_url = data["ai_base_url"]
-    if "ai_model" in data and data["ai_model"] is not None:
-        user.ai_model = data["ai_model"]
-    if "ai_style" in data and data["ai_style"] is not None:
-        user.ai_style = data["ai_style"]
+    # NOTE: AI credentials are intentionally NOT accepted here. The AI/LLM is an
+    # app-wide, operator-configured capability (see build_settings_for_user);
+    # users only ever manage their own exchange keys.
     db.commit()
     db.refresh(user)
     # Rebuild the user's engine so new keys take effect immediately.
@@ -325,6 +381,13 @@ async def tradingview_webhook(
     user, so alerts only ever touch that one account. The account must be
     licensed and running for the alert to act.
     """
+    # Per-token flood guard: a stuck/duplicated alert source can't hammer the
+    # execution path. Keyed by token (the account), not IP, since alert
+    # providers use rotating egress IPs.
+    if get_settings().rate_limit_enabled and not limiter.hit(
+        f"webhook:{token}", limit=60, window_seconds=60
+    ):
+        raise HTTPException(status_code=429, detail="Webhook rate limit exceeded")
     user = db.scalars(select(User).where(User.webhook_token == token)).first()
     if not user:
         raise HTTPException(status_code=404, detail="Unknown webhook token")
@@ -597,10 +660,20 @@ def backtest(
     starting_balance: float = 10_000.0,
     fee_pct: float = 0.1,
     slippage_pct: float = 0.05,
+    stop_loss_pct: float | None = None,
+    take_profit_pct: float | None = None,
+    trailing_stop_pct: float | None = None,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     engine = _engine_for(db, user)
+    # Default the exit rules to THIS user's live settings so a backtest reflects
+    # how the bot would actually trade; explicit query params override (pass 0
+    # to model a plain signal-only run with no stops).
+    s = engine.settings
+    sl = s.default_stop_loss_pct if stop_loss_pct is None else stop_loss_pct
+    tp = s.default_take_profit_pct if take_profit_pct is None else take_profit_pct
+    trail = s.trailing_stop_pct if trailing_stop_pct is None else trailing_stop_pct
     try:
         raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, min(limit, 1000))
     except Exception as exc:
@@ -620,6 +693,9 @@ def backtest(
         starting_balance=starting_balance,
         fee_pct=fee_pct,
         slippage_pct=slippage_pct,
+        stop_loss_pct=sl,
+        take_profit_pct=tp,
+        trailing_stop_pct=trail,
     )
     return {
         "symbol": symbol.upper(),
@@ -632,6 +708,9 @@ def backtest(
         "win_rate_pct": round(result.win_rate_pct, 2),
         "max_drawdown_pct": round(result.max_drawdown_pct, 2),
         "total_fees": result.total_fees,
+        "stop_loss_pct": sl,
+        "take_profit_pct": tp,
+        "trailing_stop_pct": trail,
         "equity_curve": [round(e, 2) for e in result.equity_curve],
     }
 
@@ -697,12 +776,22 @@ def train_strategy(
     starting_balance: float = 10_000.0,
     fee_pct: float = 0.1,
     slippage_pct: float = 0.05,
+    stop_loss_pct: float | None = None,
+    take_profit_pct: float | None = None,
+    trailing_stop_pct: float | None = None,
     db: Session = Depends(get_db),
     user: User = Depends(require_licensed_user),
 ):
     engine = _engine_for(db, user)
     if strategy not in STRATEGY_REGISTRY:
         raise HTTPException(status_code=400, detail=f"Unknown strategy '{strategy}'")
+    # Optimise against the SAME exit rules the bot trades with (from this user's
+    # settings unless overridden), so a "winning" config isn't one that only
+    # looks good without stops.
+    s = engine.settings
+    sl = s.default_stop_loss_pct if stop_loss_pct is None else stop_loss_pct
+    tp = s.default_take_profit_pct if take_profit_pct is None else take_profit_pct
+    trail = s.trailing_stop_pct if trailing_stop_pct is None else trailing_stop_pct
     try:
         raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, min(limit, 1000))
     except Exception as exc:
@@ -716,7 +805,8 @@ def train_strategy(
         report = train(
             df, strategy, symbol=symbol.upper(), timeframe=timeframe,
             starting_balance=starting_balance, fee_pct=fee_pct,
-            slippage_pct=slippage_pct,
+            slippage_pct=slippage_pct, stop_loss_pct=sl,
+            take_profit_pct=tp, trailing_stop_pct=trail,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
@@ -790,9 +880,27 @@ def admin_delete_user(
 
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket, token: str | None = None):
-    """Authenticated status stream. Pass the access token as ?token=... ."""
+    """Authenticated status stream.
+
+    The access token is read from the ``Sec-WebSocket-Protocol`` header — the
+    client connects with subprotocols ``["bearer", "<token>"]`` — so the token
+    never appears in the URL (and thus never in proxy/uvicorn access logs). A
+    legacy ``?token=`` query param is still accepted as a fallback.
+    """
     from app.security import decode_access_token
     from app.database import SessionLocal
+
+    # Prefer the token carried as a WebSocket subprotocol; fall back to query.
+    subprotocols = list(ws.scope.get("subprotocols") or [])
+    accept_subprotocol: str | None = None
+    if len(subprotocols) >= 2 and subprotocols[0] == "bearer":
+        token = subprotocols[1]
+        accept_subprotocol = "bearer"  # must echo an offered subprotocol
+
+    # Accept FIRST (echoing the offered subprotocol) so that an auth failure can
+    # be reported with a clean application close code (4401) the client can act
+    # on, rather than a bare handshake rejection (which surfaces as 1006).
+    await ws.accept(subprotocol=accept_subprotocol)
 
     secret = get_settings().secret_key
     payload = decode_access_token(secret, token or "")
@@ -804,7 +912,7 @@ async def websocket_endpoint(ws: WebSocket, token: str | None = None):
     except (TypeError, ValueError):
         await ws.close(code=4401)
         return
-    await broadcaster.connect(ws, user_id)
+    await broadcaster.connect(ws, user_id, accept=False)
     try:
         db = SessionLocal()
         try:
@@ -836,14 +944,24 @@ if _STATIC_DIR.is_dir() and (_STATIC_DIR / "index.html").is_file():
     def _spa_root() -> FileResponse:
         return FileResponse(str(_STATIC_DIR / "index.html"))
 
+    _STATIC_ROOT = _STATIC_DIR.resolve()
+
     @app.get("/{full_path:path}", include_in_schema=False)
     def _spa_fallback(full_path: str) -> FileResponse:
         if full_path.startswith(("api/", "ws")):
             raise HTTPException(status_code=404, detail="Not found")
-        candidate = _STATIC_DIR / full_path
+        index = _STATIC_ROOT / "index.html"
+        # Resolve the requested path and confirm it stays INSIDE the static root
+        # before serving it. Without this containment check a crafted path like
+        # "../../etc/passwd" could escape the static dir (path traversal).
+        candidate = (_STATIC_ROOT / full_path).resolve()
+        try:
+            candidate.relative_to(_STATIC_ROOT)
+        except ValueError:
+            return FileResponse(str(index))
         if candidate.is_file():
             return FileResponse(str(candidate))
-        return FileResponse(str(_STATIC_DIR / "index.html"))
+        return FileResponse(str(index))
 
     logger.info("Serving dashboard from %s", _STATIC_DIR)
 else:

@@ -53,17 +53,25 @@ class RiskManager:
         )
         return float(sum(t.pnl for t in db.scalars(stmt).all()))
 
-    def size_position(self, equity: float, price: float) -> float:
-        """Size a position from risk-per-trade % and the configured stop distance.
+    def size_position(
+        self, equity: float, price: float, stop_fraction: float | None = None
+    ) -> float:
+        """Size a position from risk-per-trade % and the actual stop distance.
 
         Risk amount = equity * risk_per_trade_pct%.
-        With a stop at default_stop_loss_pct away, the position notional that
-        risks exactly that amount is risk_amount / stop_fraction.
+        With a stop ``stop_fraction`` away (fraction of price), the position
+        notional that risks exactly that amount is risk_amount / stop_fraction.
+        When ``stop_fraction`` is omitted the configured ``default_stop_loss_pct``
+        is used. Passing the *real* stop distance is important: sizing against
+        the default while the order carries a wider stop would risk far more than
+        risk_per_trade_pct% intends.
         """
         if price <= 0:
             return 0.0
         risk_amount = equity * (self.settings.risk_per_trade_pct / 100.0)
-        stop_fraction = max(self.settings.default_stop_loss_pct / 100.0, 1e-6)
+        if stop_fraction is None:
+            stop_fraction = self.settings.default_stop_loss_pct / 100.0
+        stop_fraction = max(stop_fraction, 1e-6)
         notional = risk_amount / stop_fraction
         # Never risk more notional than the equity itself.
         notional = min(notional, equity)
@@ -77,8 +85,16 @@ class RiskManager:
         price: float,
         requested_amount: float | None,
         is_opening: bool,
+        stop_price: float | None = None,
+        day_unrealized: float = 0.0,
     ) -> RiskDecision:
-        """Validate a prospective trade and return a sized decision."""
+        """Validate a prospective trade and return a sized decision.
+
+        ``day_unrealized`` (optional) is the account's current open-position PnL.
+        When supplied it is added to today's realized PnL for the daily-loss
+        circuit breaker, so a large *unrealized* drawdown also halts new entries
+        rather than letting losses compound until a stop fires.
+        """
         if price <= 0:
             return RiskDecision(False, "Invalid price")
 
@@ -90,8 +106,9 @@ class RiskManager:
                     f"Max open positions reached ({self.settings.max_open_positions})",
                 )
 
-            # Daily loss limit (loss is negative pnl).
-            day_pnl = self.day_realized_pnl(db)
+            # Daily loss limit (loss is negative pnl). Include open drawdown so
+            # the breaker reflects TOTAL current risk, not just closed trades.
+            day_pnl = self.day_realized_pnl(db) + day_unrealized
             loss_limit = -abs(equity * (self.settings.daily_loss_limit_pct / 100.0))
             if day_pnl <= loss_limit:
                 return RiskDecision(
@@ -99,7 +116,16 @@ class RiskManager:
                     f"Daily loss limit hit (day PnL {day_pnl:.2f} <= {loss_limit:.2f})",
                 )
 
-        amount = requested_amount or self.size_position(equity, price)
+        if requested_amount:
+            amount = requested_amount
+        else:
+            # Size against the ACTUAL stop distance when a stop was supplied, so
+            # a wider-than-default stop doesn't silently risk more than the
+            # configured risk_per_trade_pct intends.
+            stop_fraction = None
+            if stop_price and stop_price > 0 and price > 0:
+                stop_fraction = abs(price - stop_price) / price
+            amount = self.size_position(equity, price, stop_fraction)
         if amount <= 0:
             return RiskDecision(False, "Computed position size is zero")
 

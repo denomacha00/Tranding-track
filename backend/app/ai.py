@@ -155,6 +155,8 @@ class AICommentator:
             "5. One-line verdict: act or wait, and why.\n"
             "Be honest when the edge is weak. Never promise profit.\n\n"
             + self._analysis_block(analysis)
+            + "\n\n"
+            + self._risk_block()
         )
         return self._post(_SYSTEM_ANALYST, prompt) or analysis.summary
 
@@ -184,6 +186,24 @@ class AICommentator:
             f"Symbol: {analysis.symbol}\nPrice: {analysis.price}\n"
             f"Verdict: {analysis.verdict} (confidence {analysis.confidence:.0%}, "
             f"score {analysis.score:+.2f})\nFactors:\n{factors}"
+        )
+
+    def _risk_block(self) -> str:
+        """The bot's own risk rules, so sizing/stop advice is grounded in the
+        real numbers this account trades with rather than generic guesses."""
+        s = self._settings
+        return (
+            "Bot risk configuration (these ARE the rules that will execute — "
+            "advise within them, do not tell the user to override them):\n"
+            f"- Mode: {getattr(s, 'trading_mode', 'paper')}\n"
+            f"- Risk per trade: {getattr(s, 'risk_per_trade_pct', 0)}% of equity\n"
+            f"- Default stop-loss: {getattr(s, 'default_stop_loss_pct', 0)}%; "
+            f"take-profit: {getattr(s, 'default_take_profit_pct', 0)}%; "
+            f"trailing stop: {getattr(s, 'trailing_stop_pct', 0)}%\n"
+            f"- Max open positions: {getattr(s, 'max_open_positions', 0)}; "
+            f"daily loss limit: {getattr(s, 'daily_loss_limit_pct', 0)}% of equity\n"
+            f"- Max total exposure: {getattr(s, 'max_total_exposure_pct', 0)}% "
+            "(0 = uncapped)"
         )
 
 
