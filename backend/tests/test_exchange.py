@@ -19,6 +19,11 @@ class FakeClient:
         self.orders = []
         self.canceled = []
 
+    def fetch_time(self):
+        # Public-read probe in check_trading_access(); a plain int epoch (ms) is
+        # enough. Individual tests override this to simulate a geo-block/451.
+        return 1700000000000
+
     def price_to_precision(self, symbol, price):
         return round(float(price), 2)
 

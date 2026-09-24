@@ -16,7 +16,7 @@ from typing import Any, Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.config import Settings, get_settings
+from app.config import Settings
 from app.exchange import BinanceConnector
 from app.analysis import MarketAnalyzer
 from app.ai import AICommentator
@@ -310,6 +310,18 @@ class TradingEngine:
                 return False, f"Already in a {state} position for {symbol}", None
 
             # ---- OPEN a new position ---------------------------------
+            # Spot markets can't be shorted: a live SELL with no existing long to
+            # close (all closing cases returned above) would attempt to sell base
+            # currency we don't hold and be rejected by Binance — or, worse, sell
+            # unrelated holdings. Refuse it explicitly on live. Paper still
+            # simulates sell-to-open for symmetry/backtest-style exploration.
+            if self.settings.is_live and action == "sell":
+                return (
+                    False,
+                    f"{symbol}: short selling is not supported on live spot "
+                    "(no open long to close).",
+                    None,
+                )
             price = self._price(symbol)
             # For a limit order, size and validate against the LIMIT price (the
             # intended fill), not the current market price.
@@ -520,6 +532,7 @@ class TradingEngine:
         stmt = self._scope(select(Trade).where(Trade.status == TradeStatus.pending.value))
         for trade in list(db.scalars(stmt).all()):
             limit = trade.limit_price or trade.entry_price
+            filled_amt: float | None = None  # live: exchange-reported fill qty
             if self.settings.is_live:
                 order = self.connector.fetch_order(
                     trade.exchange_order_id or "", trade.symbol
@@ -533,8 +546,14 @@ class TradingEngine:
                         if trade.status == TradeStatus.pending.value:
                             self._cancel_pending(db, trade, f"exchange {status}")
                     continue
-                if status not in {"closed", "filled"} and not order.get("filled"):
+                # Only promote a resting order once the exchange reports it FULLY
+                # filled. A partial fill ("open" with a nonzero filled amount) must
+                # keep resting — booking it as a complete position would track base
+                # we don't fully hold. Sync the tracked size to the actually-filled
+                # quantity so venue rounding never leaves us over-reporting.
+                if status not in {"closed", "filled"}:
                     continue
+                filled_amt = float(order.get("filled") or 0) or trade.amount
                 fill_price = float(
                     order.get("average") or order.get("price") or limit
                 )
@@ -555,6 +574,8 @@ class TradingEngine:
                 db.refresh(trade)
                 if trade.status != TradeStatus.pending.value:
                     continue
+                if filled_amt is not None:
+                    trade.amount = filled_amt
                 self._fill_pending(db, trade, fill_price)
             filled.append(trade)
         return filled
@@ -573,9 +594,18 @@ class TradingEngine:
                 trade.stop_order_id = None
             close_side = "sell" if trade.side == "buy" else "buy"
             try:
-                self.connector.create_market_order(trade.symbol, close_side, trade.amount)
+                close_order = self.connector.create_market_order(
+                    trade.symbol, close_side, trade.amount
+                )
             except Exception as exc:
                 return False, f"Exchange close failed: {exc}", None
+            # Book PnL at the price we ACTUALLY got, not the pre-trade ticker: a
+            # market-close fill can differ from the last quote (slippage/spread).
+            # Fall back to the ticker price if the venue reports no average.
+            if close_order:
+                price = float(
+                    close_order.get("average") or close_order.get("price") or price
+                )
 
         pnl = self._realized_pnl(trade, price)
         if not self.settings.is_live:
@@ -751,12 +781,20 @@ class TradingEngine:
             ).all()
         )
         unrealized = 0.0
+        position_value = 0.0
         for t in open_trades:
             try:
                 price = self._price(t.symbol, fallback=t.entry_price)
             except Exception:
                 price = t.entry_price
-            unrealized += self.unrealized_pnl(t, price)
+            u = self.unrealized_pnl(t, price)
+            unrealized += u
+            # Current market value of an open position = its entry notional plus
+            # its unrealized PnL. In BOTH modes `balance` is FREE cash *after* the
+            # entry notional was taken out (paper: reserved on open; live: spent
+            # on the real buy), so the position's value must be added back for an
+            # honest total-equity figure instead of understating by the notional.
+            position_value += t.entry_price * t.amount + u
 
         realized = float(
             sum(
@@ -776,21 +814,9 @@ class TradingEngine:
             "exchange_connected": self.connector.connected,
             "open_positions": len(open_trades),
             "balance": balance,
-            "equity": balance + unrealized,
+            "equity": balance + position_value,
             "realized_pnl": realized,
             "unrealized_pnl": unrealized,
             "day_pnl": self.risk.day_realized_pnl(db),
             "max_open_positions": self.settings.max_open_positions,
         }
-
-
-# Singleton engine instance, created on app startup.
-_engine: Optional[TradingEngine] = None
-
-
-def get_engine() -> TradingEngine:
-    global _engine
-    if _engine is None:
-        settings = get_settings()
-        _engine = TradingEngine(settings, BinanceConnector(settings))
-    return _engine

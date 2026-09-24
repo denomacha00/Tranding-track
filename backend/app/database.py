@@ -3,22 +3,41 @@ from __future__ import annotations
 
 from collections.abc import Generator
 
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.config import get_settings
 
 settings = get_settings()
 
+_is_sqlite = settings.database_url.startswith("sqlite")
+
 # check_same_thread=False is required for SQLite when used across threads
-# (FastAPI runs sync DB calls in a threadpool).
+# (FastAPI runs sync DB calls in a threadpool). ``timeout`` makes a connection
+# wait up to 30s for a lock to clear instead of raising "database is locked"
+# immediately — the in-process monitor loop and request handlers both write to
+# the single SQLite file.
 _connect_args = (
-    {"check_same_thread": False}
-    if settings.database_url.startswith("sqlite")
+    {"check_same_thread": False, "timeout": 30}
+    if _is_sqlite
     else {}
 )
 
 engine = create_engine(settings.database_url, connect_args=_connect_args, future=True)
+
+if _is_sqlite:
+
+    @event.listens_for(engine, "connect")
+    def _set_sqlite_pragmas(dbapi_conn, _record):  # pragma: no cover - driver glue
+        # WAL lets dashboard reads proceed while the monitor loop writes;
+        # busy_timeout waits out brief write locks; NORMAL keeps durability
+        # reasonable without an fsync on every commit.
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA journal_mode=WAL")
+        cur.execute("PRAGMA busy_timeout=30000")
+        cur.execute("PRAGMA synchronous=NORMAL")
+        cur.close()
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 

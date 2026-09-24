@@ -316,15 +316,26 @@ class BinanceConnector:
         if not self._client:
             result["detail"] = "exchange client not available"
             return result
-        if not self.has_credentials:
-            result["detail"] = "no API credentials configured (paper mode is fine)"
-            return result
-        # 1) public read
+        # 1) public read — run this BEFORE the credentials check so a regional
+        #    geo-block (HTTP 451) is surfaced clearly even for paper users with no
+        #    keys, who would otherwise only see opaque 502s on market data.
         try:
             self._client.fetch_time()
             result["can_read_public"] = True
         except Exception as exc:
-            result["detail"] = f"public data unreachable: {exc}"
+            msg = str(exc)
+            low = msg.lower()
+            if "451" in msg or "restricted location" in low or "eligibility" in low:
+                result["detail"] = (
+                    "Binance is geo-blocking this server's region (HTTP 451). "
+                    "Neither live trading nor market data will work from here — "
+                    "deploy in a Binance-supported region or route through a proxy."
+                )
+            else:
+                result["detail"] = f"public data unreachable: {exc}"
+            return result
+        if not self.has_credentials:
+            result["detail"] = "no API credentials configured (paper mode is fine)"
             return result
         # 2) private account read (this is what fails with -2015)
         try:

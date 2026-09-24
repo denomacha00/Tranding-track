@@ -41,16 +41,24 @@ export function PriceChart({
   candles,
   theme,
   last,
+  fitKey,
 }: {
   candles: Candle[]
   theme: Theme
   last?: number | null
+  // Changes when the symbol/timeframe changes. The chart re-fits the view only
+  // when this changes (or on first data) so periodic reloads don't yank the
+  // user's pan/zoom back — an exchange chart stays where you left it.
+  fitKey?: string
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
   const seriesRef = useRef<ISeriesApi<'Candlestick'> | null>(null)
   // The newest bar, kept current so live ticks extend it rather than reset it.
   const lastBarRef = useRef<CandlestickData | null>(null)
+  // Tracks whether we've fitted the view, and for which symbol/timeframe.
+  const didFitRef = useRef(false)
+  const fitKeyRef = useRef<string | undefined>(undefined)
 
   // Create the chart once on mount.
   useEffect(() => {
@@ -109,8 +117,15 @@ export function PriceChart({
     }))
     seriesRef.current.setData(data)
     lastBarRef.current = { ...data[data.length - 1] }
-    chartRef.current?.timeScale().fitContent()
-  }, [candles])
+    // Fit the view on the first load and whenever the symbol/timeframe changes
+    // (fitKey), but NOT on the periodic reloads of the same series — otherwise
+    // every 10s refresh would snap the user's pan/zoom back to the full range.
+    if (!didFitRef.current || fitKeyRef.current !== fitKey) {
+      chartRef.current?.timeScale().fitContent()
+      didFitRef.current = true
+      fitKeyRef.current = fitKey
+    }
+  }, [candles, fitKey])
 
   // Move the newest bar live as the ticker price updates.
   useEffect(() => {

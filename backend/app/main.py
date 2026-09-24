@@ -71,7 +71,6 @@ from app.security import (
 )
 from app.usermgr import get_manager
 from app.learn import PARAM_GRIDS, train
-from app.analysis import MarketAnalyzer
 from app.strategies import STRATEGY_REGISTRY, build_strategy
 from app.tasks import monitor_loop
 from app.ws import Broadcaster
@@ -85,7 +84,6 @@ logger = logging.getLogger("tranding_track")
 WEBHOOK_PATH_TEMPLATE = "/api/webhook/tradingview/{token}"
 
 broadcaster = Broadcaster()
-_analyzer = MarketAnalyzer()
 
 
 def _webhook_path(token: str) -> str:
@@ -107,7 +105,9 @@ def _analysis_for(engine, symbol: str, timeframe: str = "1h", limit: int = 200):
     df = pd.DataFrame(
         raw, columns=["timestamp", "open", "high", "low", "close", "volume"]
     )
-    return _analyzer.analyze(df, symbol.upper())
+    # Use THIS user's analyzer so the verdict honours their configured
+    # min_signal_confidence, not a module-global default.
+    return engine.analyzer.analyze(df, symbol.upper())
 
 
 def _bootstrap_admin(db: Session) -> None:
@@ -612,16 +612,22 @@ def update_settings(
 
 @app.get("/api/ticker/{symbol:path}", response_model=TickerOut)
 def ticker(
-    symbol: str, db: Session = Depends(get_db), user: User = Depends(get_current_user)
+    symbol: str, db: Session = Depends(get_db), user: User = Depends(require_licensed_user)
 ):
     engine = _engine_for(db, user)
     try:
         t = engine.connector.fetch_ticker(symbol.upper())
     except Exception as exc:
         raise HTTPException(status_code=502, detail=f"Ticker unavailable: {exc}")
+    # Never fabricate a price: if the exchange gives us no last/close, report the
+    # ticker as unavailable (502) so the UI shows its stale/offline state rather
+    # than a fake $0.00. A money task must not show a figure that isn't real.
+    last = t.get("last") or t.get("close")
+    if last is None:
+        raise HTTPException(status_code=502, detail="Ticker unavailable: no price")
     return TickerOut(
         symbol=symbol.upper(),
-        last=float(t.get("last") or t.get("close") or 0),
+        last=float(last),
         bid=t.get("bid"),
         ask=t.get("ask"),
         percentage=t.get("percentage"),
@@ -634,7 +640,7 @@ def ohlcv(
     timeframe: str = "1h",
     limit: int = 200,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_licensed_user),
 ):
     engine = _engine_for(db, user)
     try:
@@ -664,7 +670,7 @@ def backtest(
     take_profit_pct: float | None = None,
     trailing_stop_pct: float | None = None,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_licensed_user),
 ):
     engine = _engine_for(db, user)
     # Default the exit rules to THIS user's live settings so a backtest reflects
@@ -725,7 +731,7 @@ def analyze(
     explain: bool = False,
     assess: bool = False,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_licensed_user),
 ):
     engine = _engine_for(db, user)
     analysis = _analysis_for(engine, symbol, timeframe)
@@ -742,12 +748,20 @@ def analyze(
 @app.post("/api/ai/ask")
 def ai_ask(
     payload: dict,
+    request: Request,
     db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
+    user: User = Depends(require_licensed_user),
 ):
+    # The AI key is a shared, operator-funded resource. Rate-limit per IP and
+    # cap the prompt length so a single account can't run up the operator's bill.
+    _enforce_rate_limit(request, "ai", limit=20, window_seconds=60)
     question = str(payload.get("question", "")).strip()
     if not question:
         raise HTTPException(status_code=400, detail="question is required")
+    if len(question) > 2000:
+        raise HTTPException(
+            status_code=400, detail="question is too long (max 2000 characters)"
+        )
     engine = _engine_for(db, user)
     symbol = payload.get("symbol")
     timeframe = payload.get("timeframe", "1h")

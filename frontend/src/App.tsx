@@ -11,6 +11,21 @@ import type { BotStatus, BacktestResult, Candle, ExchangeAccess, MarketAnalysis,
 const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
 
+// WS events that mean the trades table on screen is now stale and must be
+// refetched: a position opened/closed, a resting order placed/cancelled, the
+// exchange reconciled a position (closed or resized it out from under us), or a
+// trailing stop moved. Missing any of these would leave the UI showing a trade
+// that no longer matches reality — unacceptable for a live-money view.
+const TRADE_EVENTS: ReadonlySet<string> = new Set([
+  'trade_opened',
+  'trade_closed',
+  'order_pending',
+  'order_canceled',
+  'reconcile_closed',
+  'reconcile_adjusted',
+  'stop_trailed',
+])
+
 function fmt(n: number | null | undefined, dp = 2): string {
   if (n === null || n === undefined || Number.isNaN(n)) return '-'
   return n.toLocaleString(undefined, { minimumFractionDigits: dp, maximumFractionDigits: dp })
@@ -105,10 +120,12 @@ function Dashboard({
 }) {
   const [status, setStatus] = useState<BotStatus | null>(null)
   const [settings, setSettings] = useState<Settings | null>(null)
+  const [settingsError, setSettingsError] = useState(false)
   const [trades, setTrades] = useState<Trade[]>([])
   const [signals, setSignals] = useState<SignalRow[]>([])
   const [candles, setCandles] = useState<Candle[]>([])
   const [ticker, setTicker] = useState<Ticker | null>(null)
+  const [tickerStale, setTickerStale] = useState(false)
   const [symbol, setSymbol] = useState(SYMBOLS[0])
   const [timeframe, setTimeframe] = useState('1h')
   const [amount, setAmount] = useState('')
@@ -153,15 +170,22 @@ function Dashboard({
     }
   }, [])
 
+  // Settings load is its own callback so the Settings panel can retry it after
+  // a failed fetch instead of being stuck on "Loading…" forever (the fetch
+  // failing is distinct from it still being in flight).
+  const loadSettings = useCallback(async () => {
+    try {
+      setSettings(await api.settings())
+      setSettingsError(false)
+    } catch (e) {
+      setSettingsError(true)
+    }
+  }, [])
+
   const { connected } = useSocket({
     onStatus: setStatus,
     onEvent: (m) => {
-      if (
-        m.event === 'trade_opened' ||
-        m.event === 'trade_closed' ||
-        m.event === 'order_pending' ||
-        m.event === 'order_canceled'
-      ) {
+      if (TRADE_EVENTS.has(m.event)) {
         refreshTrades()
       }
       if (m.event === 'signal') {
@@ -174,24 +198,39 @@ function Dashboard({
   // Initial load.
   useEffect(() => {
     api.status().then(setStatus).catch(() => {})
-    api.settings().then(setSettings).catch(() => {})
+    loadSettings()
     api.exchangeAccess().then(setAccess).catch(() => {})
     refreshTrades()
     refreshSignals()
-  }, [refreshTrades, refreshSignals])
+  }, [loadSettings, refreshTrades, refreshSignals])
+
+  // Poll the trades table on a slow cadence as a safety net. Trade changes are
+  // normally pushed over the WebSocket (see onEvent), but if the socket drops
+  // and reconnects, any events during the gap are missed; this also keeps an
+  // open position's unrealized PnL from going stale between pushes. Cheap GET.
+  useEffect(() => {
+    const id = setInterval(refreshTrades, 15000)
+    return () => clearInterval(id)
+  }, [refreshTrades])
 
   // Load candles when symbol/timeframe changes, and poll periodically. The
   // poll is fairly frequent so a new closed bar shows up quickly; the live
   // ticker (below) keeps the forming bar moving in between reloads.
   useEffect(() => {
     let alive = true
-    const load = () =>
+    setCandles([]) // drop the previous market's bars immediately on a switch
+    const load = (isInitial: boolean) =>
       api
         .ohlcv(symbol, timeframe, 200)
         .then((c) => alive && setCandles(c))
-        .catch(() => alive && setCandles([]))
-    load()
-    const id = setInterval(load, 10000)
+        .catch(() => {
+          // Only blank the chart if the very first fetch for this market
+          // fails (genuine "no data"); on background polls keep the last good
+          // bars rather than wiping the chart over a transient hiccup.
+          if (alive && isInitial) setCandles([])
+        })
+    load(true)
+    const id = setInterval(() => load(false), 10000)
     return () => {
       alive = false
       clearInterval(id)
@@ -204,12 +243,22 @@ function Dashboard({
   useEffect(() => {
     let alive = true
     setTicker(null)
+    setTickerStale(false)
+    let lastOk = Date.now()
     const load = () =>
       api
         .ticker(symbol)
-        .then((t) => alive && setTicker(t))
+        .then((t) => {
+          if (!alive) return
+          lastOk = Date.now()
+          setTicker(t)
+          setTickerStale(false)
+        })
         .catch(() => {
-          /* transient ticker failures are non-fatal; keep the last price */
+          // Keep the last price on screen, but once the feed has been down for
+          // several polls flag it stale so a frozen quote is never presented as
+          // live — "if it's offline, show it offline".
+          if (alive && Date.now() - lastOk > 12000) setTickerStale(true)
         })
     load()
     const id = setInterval(load, 3000)
@@ -243,8 +292,11 @@ function Dashboard({
         return
       }
     }
-    // Confirm before spending REAL money in live mode.
-    if (status?.trading_mode === 'live') {
+    // Confirm before spending REAL money. Confirm unless we positively KNOW the
+    // account is in paper mode: if status hasn't loaded yet (mode unknown) we
+    // must not silently wave through what could be a live, real-funds order.
+    if (status?.trading_mode !== 'paper') {
+      const knownLive = status?.trading_mode === 'live'
       const parts = [
         `${action.toUpperCase()} ${symbol}`,
         amt ? `amount ${amt}` : 'auto-sized by risk',
@@ -252,10 +304,10 @@ function Dashboard({
       ]
       if (sl) parts.push(`stop-loss ${sl}`)
       if (tp) parts.push(`take-profit ${tp}`)
-      const ok = window.confirm(
-        `LIVE ORDER — this uses real funds on your Binance account.\n\n` +
-          `${parts.join('  ·  ')}\n\nPlace this order?`,
-      )
+      const header = knownLive
+        ? 'LIVE ORDER — this uses real funds on your Binance account.'
+        : 'Trading mode not confirmed yet — this MAY place a REAL order on your Binance account.'
+      const ok = window.confirm(`${header}\n\n${parts.join('  ·  ')}\n\nPlace this order?`)
       if (!ok) return
     }
     setPlacing(true)
@@ -279,8 +331,13 @@ function Dashboard({
 
   const closeTrade = async (id: number) => {
     if (closing !== null) return // one close at a time; avoid double-close
-    if (status?.trading_mode === 'live' && !window.confirm('Close this LIVE position at market now?')) {
-      return
+    // Same conservative gate as doOrder: confirm unless we KNOW it's paper.
+    if (status?.trading_mode !== 'paper') {
+      const msg =
+        status?.trading_mode === 'live'
+          ? 'Close this LIVE position at market now?'
+          : 'Trading mode not confirmed yet — this may close a REAL position at market. Continue?'
+      if (!window.confirm(msg)) return
     }
     setClosing(id)
     try {
@@ -298,7 +355,10 @@ function Dashboard({
     if (!status) return
     try {
       const res = await api.setBot(status.running ? 'stop' : 'start')
-      setStatus({ ...status, running: res.running })
+      // Functional update: a fresh status may have arrived over the WS while
+      // the request was in flight, so merge onto the latest, not the closure's
+      // snapshot, and only touch `running`.
+      setStatus((prev) => (prev ? { ...prev, running: res.running } : prev))
     } catch (e) {
       showToast('error', (e as Error).message)
     }
@@ -413,11 +473,21 @@ function Dashboard({
                 <span>Price</span>
                 {livePrice != null && (
                   <>
-                    <span className="last">{fmt(livePrice, livePrice < 10 ? 4 : 2)}</span>
-                    {chgPct != null && (
+                    <span className="last" style={tickerStale ? { opacity: 0.5 } : undefined}>
+                      {fmt(livePrice, livePrice < 10 ? 4 : 2)}
+                    </span>
+                    {chgPct != null && !tickerStale && (
                       <span className={`chg ${pnlClass(chgPct)}`}>
                         {chgPct > 0 ? '+' : ''}
                         {fmt(chgPct, 2)}%
+                      </span>
+                    )}
+                    {tickerStale && (
+                      <span
+                        className="hint"
+                        title="Live price feed interrupted — showing the last known price, not a current quote"
+                      >
+                        ⚠ stale
                       </span>
                     )}
                   </>
@@ -442,7 +512,7 @@ function Dashboard({
             </div>
             <div className="panel-body">
               {candles.length ? (
-                <PriceChart candles={candles} theme={theme} last={livePrice} />
+                <PriceChart candles={candles} theme={theme} last={livePrice} fitKey={`${symbol}:${timeframe}`} />
               ) : (
                 <div className="empty">
                   No candle data. Check the backend / Binance connection.
@@ -594,6 +664,8 @@ function Dashboard({
               {tab === 'settings' && (
                 <SettingsPanel
                   settings={settings}
+                  loadError={settingsError}
+                  onReload={loadSettings}
                   access={access}
                   me={me}
                   onSaved={(s) => {
@@ -764,6 +836,13 @@ function AnalyzePanel({
   const [answer, setAnswer] = useState('')
   const [asking, setAsking] = useState(false)
 
+  // The verdict and AI answer are specific to one market; clear them when the
+  // symbol/timeframe changes so stale results aren't shown against a new chart.
+  useEffect(() => {
+    setAnalysis(null)
+    setAnswer('')
+  }, [symbol, timeframe])
+
   const run = async (explain: boolean) => {
     setBusy(true)
     try {
@@ -920,6 +999,12 @@ function BacktestPanel({
       })
       .catch(() => {})
   }, [])
+
+  // Results are tied to the selected market; drop them on a symbol/timeframe
+  // switch so the panel never shows a backtest for the wrong chart.
+  useEffect(() => {
+    setResult(null)
+  }, [symbol, timeframe])
 
   const run = async () => {
     setBusy(true)
@@ -1085,6 +1170,12 @@ function TrainPanel({
       .catch(() => {})
   }, [])
 
+  // A training report is for one market only; clear it on a symbol/timeframe
+  // switch so a stale leaderboard isn't shown against a different chart.
+  useEffect(() => {
+    setReport(null)
+  }, [symbol, timeframe])
+
   const run = async () => {
     setBusy(true)
     setReport(null)
@@ -1188,6 +1279,8 @@ function TrainPanel({
 
 function SettingsPanel({
   settings,
+  loadError,
+  onReload,
   access,
   me,
   onSaved,
@@ -1195,6 +1288,8 @@ function SettingsPanel({
   onError,
 }: {
   settings: Settings | null
+  loadError: boolean
+  onReload: () => void
   access: ExchangeAccess | null
   me: Me
   onSaved: (s: Settings) => void
@@ -1204,11 +1299,35 @@ function SettingsPanel({
   const [form, setForm] = useState<Settings | null>(settings)
   const [copied, setCopied] = useState(false)
   useEffect(() => setForm(settings), [settings])
-  if (!form) return <div className="empty">Loading…</div>
+  if (!form) {
+    // Distinguish a failed fetch from one still in flight so the panel never
+    // sits on "Loading…" forever when the request actually errored.
+    if (loadError) {
+      return (
+        <div className="empty">
+          Couldn't load your settings.
+          <button className="btn" style={{ marginLeft: 10 }} onClick={onReload}>
+            Retry
+          </button>
+        </div>
+      )
+    }
+    return <div className="empty">Loading…</div>
+  }
 
   const webhookUrl = `${location.origin}${form.webhook_path}`
-  const num = (k: keyof Settings, v: string) =>
-    setForm({ ...form, [k]: v === '' ? 0 : Number(v) } as Settings)
+  // Numeric field handler: empty clears to 0; anything that isn't a finite
+  // number is ignored (the field keeps its last valid value) so NaN/garbage can
+  // never be saved to a risk setting.
+  const num = (k: keyof Settings, v: string) => {
+    if (v === '') {
+      setForm({ ...form, [k]: 0 } as Settings)
+      return
+    }
+    const parsed = Number(v)
+    if (!Number.isFinite(parsed)) return
+    setForm({ ...form, [k]: parsed } as Settings)
+  }
 
   const save = async () => {
     try {

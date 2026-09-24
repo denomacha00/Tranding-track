@@ -42,6 +42,11 @@ def build_settings_for_user(user: User) -> Settings:
     base = get_settings()
     data = base.model_dump()
     sk = base.secret_key
+    # SAFETY: a brand-new user always starts in PAPER, regardless of the
+    # operator's global TRADING_MODE. Going live is an explicit, per-user opt-in
+    # (persisted via update_settings and re-applied in restore_state), so nobody
+    # ever trades real funds by merely being added to a live-configured server.
+    data["trading_mode"] = "paper"
     data["binance_api_key"] = decrypt_secret(sk, user.binance_api_key_enc or "") or ""
     data["binance_api_secret"] = (
         decrypt_secret(sk, user.binance_api_secret_enc or "") or ""

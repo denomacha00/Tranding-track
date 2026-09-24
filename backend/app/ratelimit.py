@@ -51,17 +51,20 @@ limiter = RateLimiter()
 
 
 def client_ip(request) -> str:
-    """Best-effort client IP, honouring a single proxy hop (Railway/Render).
+    """Best-effort client IP, honouring a single trusted proxy hop (Railway).
 
-    Uses the FIRST address in ``X-Forwarded-For`` when present (the original
-    client as seen by the edge proxy), else the direct peer. This is only used
-    for rate-limit bucketing, never for authorization, so a spoofed header at
-    worst lets an attacker rate-limit themselves.
+    Uses the RIGHT-most address in ``X-Forwarded-For``: behind one trusted edge
+    proxy that appends the real peer, the last entry is the address the proxy
+    actually saw, while any entries to its left are attacker-supplied and
+    spoofable. Taking the left-most (client-claimed) entry would let an attacker
+    rotate a fake header to dodge the per-IP limiter; the right-most entry can't
+    be forged past our single hop. Falls back to the direct peer. Used only for
+    rate-limit bucketing, never for authorization.
     """
     xff = request.headers.get("x-forwarded-for")
     if xff:
-        first = xff.split(",")[0].strip()
-        if first:
-            return first
+        last = xff.split(",")[-1].strip()
+        if last:
+            return last
     client = getattr(request, "client", None)
     return client.host if client and client.host else "unknown"
