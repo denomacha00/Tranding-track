@@ -67,7 +67,14 @@ class BinanceConnector:
                     "apiKey": self._settings.binance_api_key or None,
                     "secret": self._settings.binance_api_secret or None,
                     "enableRateLimit": True,
-                    "options": {"defaultType": "spot"},
+                    "options": {
+                        "defaultType": "spot",
+                        # Auto-sync our request timestamp to the exchange clock so
+                        # a skewed local/host clock doesn't trigger Binance -1021
+                        # "Timestamp outside recvWindow" rejections on private calls.
+                        "adjustForTimeDifference": True,
+                        "recvWindow": 10000,
+                    },
                 }
             )
             if self._settings.binance_testnet:

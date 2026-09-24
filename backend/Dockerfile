@@ -22,4 +22,6 @@ EXPOSE 8000
 
 # Single worker: the in-process monitor loop and paper wallet are per-process
 # state, so do NOT scale this to multiple workers without externalising them.
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# Railway (and most PaaS) inject $PORT at runtime; fall back to 8000 locally.
+# Shell form so ${PORT} is expanded at runtime.
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}

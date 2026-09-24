@@ -5,7 +5,9 @@ import asyncio
 import json
 import hmac
 import logging
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 import pandas as pd
 from fastapi import (
@@ -18,6 +20,8 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -574,3 +578,36 @@ async def websocket_endpoint(ws: WebSocket):
         await broadcaster.disconnect(ws)
     except Exception:
         await broadcaster.disconnect(ws)
+
+
+# ---- Static frontend (single-service deploy, e.g. Railway) ----------
+# When the built dashboard is present (frontend/dist copied into the image at
+# /app/static), serve it from this same FastAPI app so the whole bot runs as ONE
+# fast service: same origin (no CORS), same domain for REST + WebSocket, one
+# process to keep warm. API routes above always take precedence; anything else
+# falls back to index.html so client-side routing works.
+_STATIC_DIR = Path(os.getenv("STATIC_DIR", Path(__file__).resolve().parent.parent / "static"))
+if _STATIC_DIR.is_dir() and (_STATIC_DIR / "index.html").is_file():
+    app.mount(
+        "/assets",
+        StaticFiles(directory=str(_STATIC_DIR / "assets")),
+        name="assets",
+    )
+
+    @app.get("/", include_in_schema=False)
+    def _spa_root() -> FileResponse:
+        return FileResponse(str(_STATIC_DIR / "index.html"))
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def _spa_fallback(full_path: str) -> FileResponse:
+        # Never shadow the API/WS namespaces; let them 404 normally.
+        if full_path.startswith(("api/", "ws")):
+            raise HTTPException(status_code=404, detail="Not found")
+        candidate = _STATIC_DIR / full_path
+        if candidate.is_file():
+            return FileResponse(str(candidate))
+        return FileResponse(str(_STATIC_DIR / "index.html"))
+
+    logger.info("Serving dashboard from %s", _STATIC_DIR)
+else:
+    logger.info("No static dashboard at %s; running API-only", _STATIC_DIR)

@@ -76,6 +76,8 @@ TradingView alert ──▶ /webhook ──▶ risk checks ──▶ Binance ord
 ```
 backend/    FastAPI + CCXT + SQLAlchemy trading engine and REST/WebSocket API
 frontend/   React 18 + TypeScript + Vite dashboard
+Dockerfile           Single-service image (builds UI + serves it from FastAPI) — used by Railway
+railway.json         Railway build/deploy config (Dockerfile builder, healthcheck)
 docker-compose.yml   Full stack (API on :8000, dashboard on :8080)
 ```
 
@@ -108,6 +110,53 @@ npm run build      # production build
 docker compose up -d --build
 # Dashboard: http://localhost:8080   API: http://localhost:8000
 ```
+
+There is also a **root `Dockerfile`** that builds the dashboard and serves it
+from the FastAPI process as ONE service (same origin, no CORS) — this is what
+Railway uses (see below). Run it locally with:
+
+```bash
+docker build -t tranding-track . && docker run -p 8000:8000 --env-file backend/.env tranding-track
+# Everything on http://localhost:8000
+```
+
+## Deploy on Railway
+
+This repo deploys to [Railway](https://railway.app) as a **single service** —
+the root `Dockerfile` builds the React dashboard and the FastAPI backend serves
+it from the same process, so REST, WebSocket and the UI all share one domain
+(no CORS, one always-warm container = no cold-start lag).
+
+**Why the GitHub pull was failing:** Railway's default (Nixpacks) builder
+inspects the repo root and finds *both* a Python backend and a Node frontend in
+subfolders with **no root build config**, so it can't decide how to build and
+errors out. The added root `Dockerfile` + `railway.json` tell Railway exactly
+how to build, which fixes the pull/build.
+
+Steps:
+
+1. Push this repo to GitHub (already the `origin`).
+2. Railway → **New Project → Deploy from GitHub repo** → pick this repo. It
+   detects `railway.json` and builds the root `Dockerfile` (builder =
+   `DOCKERFILE`). No root/subfolder selection needed.
+3. In the service **Variables** tab set at least:
+   - `TRADING_MODE` (`paper` to start; `live` only when ready)
+   - `BINANCE_API_KEY`, `BINANCE_API_SECRET`, `BINANCE_TESTNET`
+   - `TRADINGVIEW_WEBHOOK_SECRET`, and `API_KEY` (**set this — the public URL is
+     internet-facing**)
+   - AI vars if used (`AI_API_KEY`, `AI_BASE_URL`, `AI_MODEL`, `AI_API_STYLE`)
+   - Do **not** set `PORT` — Railway injects it and the app binds to it.
+4. (Recommended) Add a **Volume** mounted at `/data` so the SQLite DB survives
+   redeploys. The image already points `DATABASE_URL` there.
+5. Deploy. Healthcheck is `GET /api/health`; the dashboard is the service root
+   `/`. On startup in live mode the logs run the exchange trading-access
+   self-check and warn loudly if the key can't trade.
+
+Notes:
+- The bot runs a **single worker** (in-process monitor loop + paper wallet are
+  per-process state) — do not scale replicas without externalising that state.
+- SQLite on a volume is fine for one instance; move `DATABASE_URL` to managed
+  Postgres if you later need multiple instances.
 
 ## Configuration
 
