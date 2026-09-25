@@ -1,10 +1,11 @@
 """Privacy redaction + news-parsing unit tests (no network, no credentials)."""
 from __future__ import annotations
 
+import datetime as dt
 import json
 
 from app.main import _redact_raw
-from app.news import _parse_feed, fetch_market_news
+from app.news import _parse_feed, _select_recent, fetch_market_news
 
 
 def test_redact_masks_secret_fields():
@@ -61,3 +62,39 @@ def test_fetch_news_no_feeds_reports_error_not_fake():
     items, errors = fetch_market_news([], limit=5)
     assert items == []
     assert errors  # honest: says why it's empty, never invents headlines
+
+
+# ---- freshness: show the latest day, drop old news, never fabricate ----
+
+_REF = dt.datetime(2026, 9, 25, 12, 0, tzinfo=dt.timezone.utc)
+
+
+def _aged(hours: float, title: str) -> dict:
+    """A real-looking item published `hours` before the fixed reference time."""
+    published = (_REF - dt.timedelta(hours=hours)).isoformat()
+    return {"title": title, "link": f"https://x/{title}", "published": published}
+
+
+def test_select_recent_keeps_today_drops_old():
+    items = [_aged(2, "fresh"), _aged(50, "old"), _aged(24 * 7, "ancient")]
+    out = _select_recent(items, 24.0, now=_REF.timestamp())
+    assert [i["title"] for i in out] == ["fresh"]  # only the last 24h
+
+
+def test_select_recent_falls_back_to_yesterday_when_quiet():
+    # Nothing in the last 24h -> widen to 48h ("yesterday") rather than show nothing.
+    items = [_aged(30, "yesterday"), _aged(200, "stale")]
+    out = _select_recent(items, 24.0, now=_REF.timestamp())
+    assert [i["title"] for i in out] == ["yesterday"]
+
+
+def test_select_recent_final_fallback_shows_real_older_items():
+    # Only old real items exist: show them (with real dates) instead of implying
+    # the feeds were unreachable (which is what an empty list means).
+    items = [_aged(500, "old-but-real")]
+    out = _select_recent(items, 24.0, now=_REF.timestamp())
+    assert [i["title"] for i in out] == ["old-but-real"]
+
+
+def test_select_recent_empty_stays_empty():
+    assert _select_recent([], 24.0, now=_REF.timestamp()) == []

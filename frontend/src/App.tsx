@@ -1571,6 +1571,8 @@ function AssistantPanel({
   const [news, setNews] = useState<NewsItem[]>([])
   const [newsErrors, setNewsErrors] = useState<string[]>([])
   const [newsLoading, setNewsLoading] = useState(false)
+  // When the headlines were last refreshed, so the panel can show it's live.
+  const [newsFetchedAt, setNewsFetchedAt] = useState<number | null>(null)
   // Live connection dashboard: real AI-provider reachability + exchange access,
   // so "the AI isn't working" / "am I connected?" show a concrete answer.
   const [aiHealth, setAiHealth] = useState<AiHealth | null>(null)
@@ -1603,6 +1605,7 @@ function AssistantPanel({
       const res = await api.news(8)
       setNews(res.items)
       setNewsErrors(res.errors)
+      setNewsFetchedAt(Date.now())
     } catch (e) {
       onError((e as Error).message)
     } finally {
@@ -1638,8 +1641,12 @@ function AssistantPanel({
     }
   }, [onRefreshAccess, onError])
 
+  // Load headlines on mount, then auto-refresh so the panel stays near-real-time
+  // (the backend already limits results to the last day and caches briefly).
   useEffect(() => {
     loadNews()
+    const id = setInterval(loadNews, 60000)
+    return () => clearInterval(id)
   }, [loadNews])
 
   const speak = (text: string) => {
@@ -1921,6 +1928,14 @@ function AssistantPanel({
         <div className="news-col">
           <div className="news-head">
             <span>📰 Live market news</span>
+            <span className="news-updated muted">
+              {newsFetchedAt
+                ? `updated ${new Date(newsFetchedAt).toLocaleTimeString([], {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                  })}`
+                : ''}
+            </span>
             <button
               type="button"
               className="btn ghost sm"
@@ -1931,6 +1946,10 @@ function AssistantPanel({
               {newsLoading ? '…' : '↻'}
             </button>
           </div>
+          <p className="hint tiny news-sub">
+            Real headlines from public feeds, newest first — today’s news (or the
+            most recent day if today is quiet). Never fabricated.
+          </p>
           {news.length === 0 && !newsLoading ? (
             <div className="empty sm">
               {newsErrors.length

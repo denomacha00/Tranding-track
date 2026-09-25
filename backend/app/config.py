@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 
-from pydantic import Field
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -177,6 +177,26 @@ class Settings(BaseSettings):
     # Abuse protection: in-process rate limiting on auth + webhook endpoints.
     # Enabled by default; set RATE_LIMIT_ENABLED=false only for tests/local dev.
     rate_limit_enabled: bool = Field(default=True)
+
+    @field_validator(
+        "ai_api_key", "ai_base_url", "ai_model", "ai_api_style", mode="before"
+    )
+    @classmethod
+    def _clean_ai_env(cls, v: object) -> object:
+        """Strip whitespace and one layer of matching surrounding quotes.
+
+        On hosts like Railway these AI_* values are real OS environment variables,
+        so quotes or stray spaces pasted around a value are sent to the provider
+        VERBATIM — a key wrapped in quotes is rejected as invalid (HTTP 401) even
+        though the key itself is correct. Cleaning here fixes the most common
+        "I pasted my real key but it says the key is wrong" case, without ever
+        logging or altering the actual credential characters.
+        """
+        if isinstance(v, str):
+            v = v.strip()
+            if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                v = v[1:-1].strip()
+        return v
 
     @property
     def cors_origin_list(self) -> list[str]:

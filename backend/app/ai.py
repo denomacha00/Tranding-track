@@ -128,6 +128,26 @@ def _looks_anthropic(model: str, base_url: str) -> bool:
     return "claude" in m or "anthropic" in b
 
 
+def _key_family(key: str) -> str:
+    """Best-effort provider guess from a key's PUBLIC prefix (never the secret).
+
+    Anthropic keys start ``sk-ant-``, OpenAI ``sk-``/``sk-proj-``. Knowing the
+    family lets the dashboard flag the classic mismatch — an OpenAI key sent
+    Anthropic-style (or vice versa) — which returns 401 even though the key is
+    real. Only the well-known prefix scheme is used; no key characters leak.
+    """
+    k = (key or "").strip()
+    if not k:
+        return "none"
+    if k.startswith("sk-ant-"):
+        return "anthropic (sk-ant-…)"
+    if k.startswith(("sk-proj-", "sk-")):
+        return "openai (sk-…)"
+    if k.startswith("gsk_"):
+        return "groq (gsk_…)"
+    return "unrecognized prefix"
+
+
 class AICommentator:
     """Wraps an OpenAI- or Anthropic-style chat endpoint to narrate + reason."""
 
@@ -356,7 +376,29 @@ class AICommentator:
                 f"model {self._settings.ai_model})."
             )
         else:
-            status["detail"] = self._last_error or "AI request failed."
+            # Reveal the RESOLVED provider settings (never the key) so a
+            # misconfiguration is self-evident. The key FAMILY (from its public
+            # prefix) vs the send STYLE is the usual smoking gun: an OpenAI key
+            # (sk-…) sent anthropic-style — or a Claude key (sk-ant-…) sent
+            # openai-style to api.openai.com — returns 401 with a real key.
+            style = self._style()
+            family = _key_family(self._settings.ai_api_key)
+            hint = ""
+            if (family.startswith("anthropic") and style != "anthropic") or (
+                family.startswith("openai") and style != "openai"
+            ):
+                hint = (
+                    f" — your key looks like {family} but it's being sent "
+                    f"{style}-style; set AI_API_STYLE + AI_BASE_URL to match the key"
+                )
+            elif family == "unrecognized prefix":
+                hint = " — the key's format isn't a known OpenAI/Anthropic prefix"
+            status["detail"] = (
+                f"{self._last_error or 'AI request failed'} "
+                f"[resolved: style={style}, key={family}, "
+                f"model={self._settings.ai_model or '(unset)'}, "
+                f"base_url={self._settings.ai_base_url or '(unset)'}]{hint}"
+            )
         return status
 
     def confirm_trade(self, analysis: MarketAnalysis) -> tuple[bool, str]:

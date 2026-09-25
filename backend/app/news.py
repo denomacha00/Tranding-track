@@ -57,6 +57,34 @@ def _sort_key(published: str | None) -> float:
         return 0.0
 
 
+def _select_recent(
+    items: list[dict], max_age_hours: float, *, now: float | None = None
+) -> list[dict]:
+    """Keep only the freshest REAL items so the panel shows the latest news.
+
+    Preference order, newest-first (items must already be sorted newest-first):
+      1. Everything published within ``max_age_hours`` (i.e. "today").
+      2. If that's empty (a quiet day), widen to twice the window ("yesterday").
+      3. If STILL empty but we did receive real items, return them all with their
+         real dates — better than implying the feeds were unreachable.
+    Undated items are excluded from the timed passes (we can't prove they're
+    fresh) but kept in the final fallback. Nothing is ever fabricated.
+    """
+    if not items:
+        return []
+    if max_age_hours <= 0:
+        return list(items)
+    ref = time.time() if now is None else now
+    for window in (max_age_hours, max_age_hours * 2.0):
+        cutoff = ref - window * 3600.0
+        fresh = [
+            it for it in items if (ts := _sort_key(it.get("published"))) > 0 and ts >= cutoff
+        ]
+        if fresh:
+            return fresh
+    return list(items)
+
+
 def _parse_feed(xml_text: str, source: str) -> list[dict]:
     """Parse an RSS or Atom document into a list of {title, link, source, published}."""
     items: list[dict] = []
@@ -96,9 +124,12 @@ def _source_name(url: str) -> str:
 
 
 def fetch_market_news(
-    feeds: list[str], limit: int = 8, ttl: float = 120.0
+    feeds: list[str], limit: int = 8, ttl: float = 60.0, max_age_hours: float = 24.0
 ) -> tuple[list[dict], list[str]]:
-    """Return (items, errors). Items are real, newest-first; errors names dead feeds."""
+    """Return (items, errors). Items are real, newest-first, and limited to the
+    most recent window (today; falls back to yesterday on a quiet day) so the UI
+    always shows current news and drops stale headlines. ``errors`` names dead
+    feeds. A short TTL keeps it near-real-time without hammering the sources."""
     if not feeds:
         return [], ["no news feeds configured"]
     key = "|".join(feeds)
@@ -129,5 +160,8 @@ def fetch_market_news(
             unique.append(it)
     unique.sort(key=lambda it: _sort_key(it.get("published")), reverse=True)
 
-    _CACHE[key] = (now, unique, errors)
-    return unique[:limit], errors
+    # Keep only the freshest items (today, else yesterday) so old news is dropped.
+    recent = _select_recent(unique, max_age_hours, now=now)
+
+    _CACHE[key] = (now, recent, errors)
+    return recent[:limit], errors
