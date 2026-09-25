@@ -32,6 +32,9 @@ function fmt(n: number | null | undefined, dp = 2): string {
 }
 
 type Toast = { kind: 'ok' | 'error'; text: string } | null
+// A persisted copy of a toast, kept in the header's notifications feed so bot
+// pings/alerts aren't lost the instant the transient toast auto-dismisses.
+type Notif = { id: number; kind: 'ok' | 'error'; text: string; ts: number }
 
 export default function App() {
   const [me, setMe] = useState<Me | null>(null)
@@ -197,9 +200,24 @@ function Dashboard({
   const [tab, setTab] = useState<TabKey>('trades')
   const [access, setAccess] = useState<ExchangeAccess | null>(null)
   const [menuOpen, setMenuOpen] = useState(false)
+  // Global connection status (shown in the slim bar under the header on every
+  // tab): the built-in AI provider's real reachability + the exchange access.
+  const [aiHealth, setAiHealth] = useState<AiHealth | null>(null)
+  const [aiHealthLoading, setAiHealthLoading] = useState(false)
+  const [testingAccess, setTestingAccess] = useState(false)
+  // Header notifications feed: a capped, persistent log of recent alerts/pings
+  // behind the 🔔 bell, with an unread count.
+  const [notifs, setNotifs] = useState<Notif[]>([])
+  const [notifUnread, setNotifUnread] = useState(0)
 
   const showToast = useCallback((kind: 'ok' | 'error', text: string) => {
     setToast({ kind, text })
+    // Mirror every toast into the persistent notifications feed so it survives
+    // the 4s auto-dismiss. Newest first; capped so the log can't grow unbounded.
+    setNotifs((n) =>
+      [{ id: Date.now() + Math.random(), kind, text, ts: Date.now() }, ...n].slice(0, 50),
+    )
+    setNotifUnread((u) => Math.min(u + 1, 999))
     setTimeout(() => setToast(null), 4000)
   }, [])
 
@@ -276,14 +294,39 @@ function Dashboard({
     }
   }, [])
 
+  // Real AI-provider reachability probe (one honest ping, no secrets) so the
+  // global status bar can say "connected" or the concrete reason it can't answer.
+  const loadAiHealth = useCallback(async () => {
+    setAiHealthLoading(true)
+    try {
+      setAiHealth(await api.aiHealth())
+    } catch {
+      setAiHealth(null)
+    } finally {
+      setAiHealthLoading(false)
+    }
+  }, [])
+
+  // Re-run the exchange probe on demand from the status bar's "Test" button.
+  const testAccess = useCallback(async () => {
+    setTestingAccess(true)
+    try {
+      const a = await refreshAccess()
+      if (!a) showToast('error', 'Could not reach the connection check.')
+    } finally {
+      setTestingAccess(false)
+    }
+  }, [refreshAccess, showToast])
+
   // Initial load.
   useEffect(() => {
     api.status().then(setStatus).catch(() => {})
     loadSettings()
     refreshAccess()
+    loadAiHealth()
     refreshTrades()
     refreshSignals()
-  }, [loadSettings, refreshAccess, refreshTrades, refreshSignals])
+  }, [loadSettings, refreshAccess, loadAiHealth, refreshTrades, refreshSignals])
 
   // Poll the trades table on a slow cadence as a safety net. Trade changes are
   // normally pushed over the WebSocket (see onEvent), but if the socket drops
@@ -617,6 +660,15 @@ function Dashboard({
         {me.role === 'admin' && <span className="badge">admin</span>}
         <span className="hint">{connected ? 'live' : 'reconnecting…'}</span>
         <span className={`ws-dot ${connected ? 'connected' : ''}`} />
+        <NotificationsBell
+          items={notifs}
+          unread={notifUnread}
+          onOpen={() => setNotifUnread(0)}
+          onClear={() => {
+            setNotifs([])
+            setNotifUnread(0)
+          }}
+        />
         <ThemeToggle theme={theme} onToggle={onToggleTheme} />
         <button className="btn primary" onClick={toggleBot}>
           {status?.running ? 'Stop bot' : 'Start bot'}
@@ -625,6 +677,18 @@ function Dashboard({
           Sign out
         </button>
       </header>
+
+      {/* Slim, always-on status bar: the AI provider + exchange connection live
+          here so they show on every tab, not buried inside the chat panel. */}
+      <ConnectionBar
+        aiHealth={aiHealth}
+        aiHealthLoading={aiHealthLoading}
+        onRecheckAi={loadAiHealth}
+        access={access}
+        testing={testingAccess}
+        onTest={testAccess}
+        onFix={() => setTab('settings')}
+      />
 
       {access && status?.trading_mode === 'live' && !access.ok && (
         <div className="alert-banner">
@@ -930,9 +994,6 @@ function Dashboard({
                 <AssistantPanel
                   symbol={symbol}
                   timeframe={timeframe}
-                  aiKeySet={me.ai_key_set}
-                  access={access}
-                  onRefreshAccess={refreshAccess}
                   onNavigate={setTab}
                   onError={(m) => showToast('error', m)}
                 />
@@ -976,6 +1037,193 @@ function Dashboard({
       </div>
 
       {toast && <div className={`toast ${toast.kind}`}>{toast.text}</div>}
+    </div>
+  )
+}
+
+// Human-friendly "x minutes ago" for the notifications feed. Recomputed on each
+// render (no ticking timer) — good enough for a dropdown.
+function relativeTime(ts: number): string {
+  const s = Math.max(0, Math.round((Date.now() - ts) / 1000))
+  if (s < 60) return 'just now'
+  const m = Math.round(s / 60)
+  if (m < 60) return `${m}m ago`
+  const h = Math.round(m / 60)
+  if (h < 24) return `${h}h ago`
+  return `${Math.round(h / 24)}d ago`
+}
+
+// Slim, always-visible status strip under the header: the built-in AI provider's
+// real reachability and the exchange connection, each with a concrete state and
+// a one-click action. Lifted out of the AI chat panel so it shows on every tab.
+function ConnectionBar({
+  aiHealth,
+  aiHealthLoading,
+  onRecheckAi,
+  access,
+  testing,
+  onTest,
+  onFix,
+}: {
+  aiHealth: AiHealth | null
+  aiHealthLoading: boolean
+  onRecheckAi: () => void
+  access: ExchangeAccess | null
+  testing: boolean
+  onTest: () => void
+  onFix: () => void
+}) {
+  return (
+    <div className="conn-bar">
+      <div
+        className={`conn-pill ${aiHealth ? (aiHealth.ok ? 'ok' : 'bad') : 'muted'}`}
+        title={aiHealth?.detail || ''}
+      >
+        <span className="conn-dot" />
+        <span className="conn-label">Assistant AI</span>
+        <span className="conn-state">
+          {aiHealthLoading
+            ? 'checking…'
+            : aiHealth
+              ? aiHealth.ok
+                ? `connected (${aiHealth.model || 'model'})`
+                : `not working — ${aiHealth.detail}`
+              : 'status unknown'}
+        </span>
+        <button
+          type="button"
+          className="btn ghost sm"
+          onClick={onRecheckAi}
+          disabled={aiHealthLoading}
+          title="Re-check the AI provider"
+        >
+          {aiHealthLoading ? '…' : '↻'}
+        </button>
+      </div>
+      <div
+        className={`conn-pill ${access ? (access.ok ? 'ok' : 'bad') : 'muted'}`}
+        title={access?.detail || ''}
+      >
+        <span className="conn-dot" />
+        <span className="conn-label">Exchange</span>
+        <span className="conn-state">
+          {access
+            ? access.can_trade
+              ? `trade-ready on ${access.exchange ?? 'exchange'} (${access.testnet ? 'testnet' : 'live'})`
+              : access.can_read_account
+                ? 'connected, read-only (can’t trade yet)'
+                : access.can_read_public
+                  ? 'public data only — not signed in'
+                  : 'not connected'
+            : 'not tested'}
+        </span>
+        <button
+          type="button"
+          className="btn ghost sm"
+          onClick={onTest}
+          disabled={testing}
+          title="Test the exchange connection now"
+        >
+          {testing ? '…' : 'Test'}
+        </button>
+        {access && !access.can_trade && (
+          <button
+            type="button"
+            className="btn sm"
+            onClick={onFix}
+            title="Open Settings to add keys / fix the connection"
+          >
+            Fix in Settings →
+          </button>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// Header notifications: a 🔔 with an unread badge and a dropdown feed of recent
+// alerts/pings (fed from every showToast). Opening it clears the unread count;
+// transient toasts still flash for live events.
+function NotificationsBell({
+  items,
+  unread,
+  onOpen,
+  onClear,
+}: {
+  items: Notif[]
+  unread: number
+  onOpen: () => void
+  onClear: () => void
+}) {
+  const [open, setOpen] = useState(false)
+  const wrapRef = useRef<HTMLDivElement | null>(null)
+
+  // Close on outside-click / Escape, like a normal popover menu.
+  useEffect(() => {
+    if (!open) return
+    const onDown = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false)
+    }
+    window.addEventListener('mousedown', onDown)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('mousedown', onDown)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [open])
+
+  const toggle = () => {
+    setOpen((v) => {
+      if (!v) onOpen() // opening marks everything read
+      return !v
+    })
+  }
+
+  return (
+    <div className="notif-wrap" ref={wrapRef}>
+      <button
+        type="button"
+        className="notif-bell"
+        onClick={toggle}
+        aria-label={`Notifications${unread ? ` (${unread} unread)` : ''}`}
+        aria-expanded={open}
+        title="Notifications"
+      >
+        🔔
+        {unread > 0 && <span className="notif-badge">{unread > 99 ? '99+' : unread}</span>}
+      </button>
+      {open && (
+        <div className="notif-dropdown" role="menu">
+          <div className="notif-head">
+            <span>Notifications</span>
+            {items.length > 0 && (
+              <button type="button" className="btn ghost sm" onClick={onClear}>
+                Clear
+              </button>
+            )}
+          </div>
+          {items.length === 0 ? (
+            <div className="notif-empty">
+              No notifications yet. Bot pings and alerts will show up here.
+            </div>
+          ) : (
+            <div className="notif-list">
+              {items.map((n) => (
+                <div key={n.id} className={`notif-item ${n.kind}`}>
+                  <span className="n-dot" />
+                  <div className="notif-body">
+                    <div>{n.text}</div>
+                    <div className="notif-time">{relativeTime(n.ts)}</div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
     </div>
   )
 }
@@ -1554,17 +1802,11 @@ function getSpeechRecognition(): (new () => SpeechRec) | null {
 function AssistantPanel({
   symbol,
   timeframe,
-  aiKeySet,
-  access,
-  onRefreshAccess,
   onNavigate,
   onError,
 }: {
   symbol: string
   timeframe: string
-  aiKeySet: boolean
-  access: ExchangeAccess | null
-  onRefreshAccess: () => Promise<ExchangeAccess | null>
   onNavigate: (dest: TabKey) => void
   onError: (msg: string) => void
 }) {
@@ -1578,11 +1820,6 @@ function AssistantPanel({
   const [useNews, setUseNews] = useState(false)
   const [readAloud, setReadAloud] = useState(false)
   const [listening, setListening] = useState(false)
-  // Live connection dashboard: real AI-provider reachability + exchange access,
-  // so "the AI isn't working" / "am I connected?" show a concrete answer.
-  const [aiHealth, setAiHealth] = useState<AiHealth | null>(null)
-  const [aiHealthLoading, setAiHealthLoading] = useState(false)
-  const [testing, setTesting] = useState(false)
   const recRef = useRef<SpeechRec | null>(null)
   const listRef = useRef<HTMLDivElement | null>(null)
 
@@ -1603,34 +1840,6 @@ function AssistantPanel({
     },
     [],
   )
-
-  // Probe the built-in AI provider once on mount (real ping, no secrets) so the
-  // dashboard can say "connected" or the concrete reason it can't answer.
-  const loadAiHealth = useCallback(async () => {
-    setAiHealthLoading(true)
-    try {
-      setAiHealth(await api.aiHealth())
-    } catch {
-      setAiHealth(null)
-    } finally {
-      setAiHealthLoading(false)
-    }
-  }, [])
-
-  useEffect(() => {
-    loadAiHealth()
-  }, [loadAiHealth])
-
-  // Re-probe the exchange on demand from the assistant's dashboard.
-  const testConnection = useCallback(async () => {
-    setTesting(true)
-    try {
-      const a = await onRefreshAccess()
-      if (!a) onError('Could not reach the connection check.')
-    } finally {
-      setTesting(false)
-    }
-  }, [onRefreshAccess, onError])
 
   const speak = (text: string) => {
     if (!readAloud || !ttsSupported) return
@@ -1714,81 +1923,8 @@ function AssistantPanel({
 
   return (
     <div className="assistant">
-      {/* Honest connection dashboard: the built-in AI's real reachability and the
-          user's real exchange access, each with a concrete reason + a way to act.
-          Replaces the old "add your AI key" banner — the AI is operator-wide, so
-          users never enter a key. */}
-      <div className="conn-dash">
-        <div
-          className={`conn-pill ${aiHealth ? (aiHealth.ok ? 'ok' : 'bad') : 'muted'}`}
-          title={aiHealth?.detail || ''}
-        >
-          <span className="conn-dot" />
-          <span className="conn-label">Assistant AI</span>
-          <span className="conn-state">
-            {aiHealthLoading
-              ? 'checking…'
-              : aiHealth
-                ? aiHealth.ok
-                  ? `connected (${aiHealth.model || 'model'})`
-                  : `not working — ${aiHealth.detail}`
-                : aiKeySet
-                  ? 'status unknown'
-                  : 'not set up by the operator yet'}
-          </span>
-          <button
-            type="button"
-            className="btn ghost sm"
-            onClick={loadAiHealth}
-            disabled={aiHealthLoading}
-            title="Re-check the AI provider"
-          >
-            {aiHealthLoading ? '…' : '↻'}
-          </button>
-        </div>
-
-        <div
-          className={`conn-pill ${access ? (access.ok ? 'ok' : 'bad') : 'muted'}`}
-          title={access?.detail || ''}
-        >
-          <span className="conn-dot" />
-          <span className="conn-label">Exchange</span>
-          <span className="conn-state">
-            {access
-              ? access.can_trade
-                ? `trade-ready on ${access.exchange ?? 'exchange'} (${access.testnet ? 'testnet' : 'live'})`
-                : access.can_read_account
-                  ? 'connected, read-only (can’t trade yet)'
-                  : access.can_read_public
-                    ? 'public data only — not signed in'
-                    : 'not connected'
-              : 'not tested'}
-          </span>
-          <button
-            type="button"
-            className="btn ghost sm"
-            onClick={testConnection}
-            disabled={testing}
-            title="Test the exchange connection now"
-          >
-            {testing ? '…' : 'Test'}
-          </button>
-          {access && !access.can_trade && (
-            <button
-              type="button"
-              className="btn sm"
-              onClick={() => onNavigate('settings')}
-              title="Open Settings to add keys / fix the connection"
-            >
-              Fix in Settings →
-            </button>
-          )}
-        </div>
-      </div>
-
-      <div className="assistant-grid">
-        <div className="chat-col">
-          <div className="chat-list" ref={listRef}>
+      <div className="chat-col">
+        <div className="chat-list" ref={listRef}>
             {turns.length === 0 ? (
               <div className="chat-empty">
                 <p>
@@ -1902,7 +2038,6 @@ function AssistantPanel({
           )}
         </div>
       </div>
-    </div>
   )
 }
 

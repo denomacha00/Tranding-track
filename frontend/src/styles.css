@@ -1041,13 +1041,7 @@ pre.code {
 .btn.sm { padding: 4px 8px; font-size: 12px; }
 .hint.tiny { font-size: 11px; margin: 0; }
 
-/* Assistant connection dashboard: AI + exchange status pills. */
-.conn-dash {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-  margin-bottom: 12px;
-}
+/* AI + exchange status pills, shown in the slim .conn-bar under the header. */
 .conn-pill {
   display: flex;
   align-items: center;
@@ -1076,6 +1070,108 @@ pre.code {
 .conn-label { font-weight: 600; }
 .conn-state { color: var(--muted); flex: 1 1 120px; min-width: 0; overflow-wrap: anywhere; line-height: 1.4; }
 .nav-cta { margin-top: 8px; }
+
+/* Slim, always-on connection strip under the header (AI provider + exchange).
+   Reuses the .conn-pill visuals but keeps them compact and inline instead of
+   the old full-width dashboard that lived inside the chat panel. */
+.conn-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 20px;
+  background: var(--topbar);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+.conn-bar .conn-pill { flex: 0 1 auto; padding: 4px 10px; }
+.conn-bar .conn-state { flex: 0 1 auto; }
+
+/* Header notifications bell + dropdown feed. */
+.notif-wrap { position: relative; display: inline-flex; }
+.notif-bell {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+}
+.notif-bell:hover { border-color: var(--accent); }
+.notif-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--red);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 1;
+}
+.notif-dropdown {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: 320px;
+  max-width: 86vw;
+  max-height: 60vh;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  z-index: 60;
+}
+.notif-head {
+  position: sticky;
+  top: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+  font-weight: 600;
+  font-size: 13px;
+}
+.notif-list { display: flex; flex-direction: column; }
+.notif-item {
+  display: flex;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  line-height: 1.4;
+}
+.notif-item:last-child { border-bottom: none; }
+.notif-item .n-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-top: 4px;
+  flex: none;
+  background: var(--muted);
+}
+.notif-item.ok .n-dot { background: var(--green); }
+.notif-item.error .n-dot { background: var(--red); }
+.notif-body { min-width: 0; flex: 1 1 auto; overflow-wrap: anywhere; }
+.notif-time { color: var(--muted); font-size: 11px; margin-top: 2px; }
+.notif-empty { padding: 18px 12px; color: var(--muted); font-size: 12px; text-align: center; line-height: 1.5; }
 
 /* News has its own tab now, so it fills the panel body rather than sitting in a
    bordered side rail next to the chat. */
