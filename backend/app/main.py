@@ -764,6 +764,7 @@ def ticker(
         bid=t.get("bid"),
         ask=t.get("ask"),
         percentage=t.get("percentage"),
+        source=getattr(engine.connector, "last_data_source", None),
     )
 
 

@@ -32,6 +32,15 @@ class Settings(BaseSettings):
     # fake data, it changes where/what the app actually talks to.
     exchange_id: str = Field(default="binance")
     exchange_http_proxy: str = Field(default="")
+    # PUBLIC market-data fallback. If the primary exchange is unreachable from
+    # this server's region (the classic Binance HTTP 451 geo-block), read prices
+    # and candles from THIS venue instead, so the dashboard, analyzer and paper
+    # trading keep working with REAL market data. It powers read-only market data
+    # ONLY — live orders and balances always go to the real exchange above, never
+    # here. A ccxt exchange id with matching USDT symbols (e.g. "kucoin", "okx",
+    # "bybit"); empty disables it. Only activates when the primary actually fails,
+    # so a healthy Binance deployment is completely unaffected.
+    market_data_fallback_id: str = Field(default="kucoin")
 
     # TradingView webhook
     tradingview_webhook_secret: str = Field(default="change-me")

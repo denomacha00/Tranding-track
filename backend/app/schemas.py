@@ -87,6 +87,10 @@ class TickerOut(BaseModel):
     bid: Optional[float] = None
     ask: Optional[float] = None
     percentage: Optional[float] = None
+    # Which venue actually served this price: the primary exchange, or the
+    # public-data fallback when the primary is geo-blocked. Honest source label
+    # so the UI never implies a price came from somewhere it didn't.
+    source: Optional[str] = None
 
 
 class BotStatus(BaseModel):

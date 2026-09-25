@@ -103,6 +103,13 @@ shared by every user — not per-user.
 - **Structured logging** — `LOG_FORMAT=json` for log aggregators.
 - **Retry/backoff** — transient Binance network errors are retried with
   exponential backoff; auth/insufficient-funds errors fail fast.
+- **Geo-resilient market data** — if the primary exchange geo-blocks the server
+  (the Binance HTTP 451 "restricted location"), prices, candles, the analyzer and
+  paper trading automatically fall back to a public read-only venue
+  (`MARKET_DATA_FALLBACK_ID`, default KuCoin) so the dashboard keeps working with
+  real data. Orders, balances and reconciliation always stay on the real exchange
+  — the fallback never trades. Every price is labelled with the venue that served
+  it, so nothing is faked.
 - **Telegram notifications** — optional trade/event alerts.
 
 ## Project layout
@@ -210,6 +217,9 @@ All settings load from environment / `backend/.env`. Key variables:
 | `ACCESS_TOKEN_TTL_MINUTES` | `10080` | JWT lifetime (default 7 days) |
 | `BINANCE_API_KEY` / `BINANCE_API_SECRET` | – | Optional global fallback (users normally set their own) |
 | `BINANCE_TESTNET` | `true` | Use Binance testnet |
+| `EXCHANGE_ID` | `binance` | ccxt exchange id for trading + primary data (e.g. `binanceus` for US) |
+| `EXCHANGE_HTTP_PROXY` | – | Route exchange traffic through a proxy in a supported region (fixes geo-block for LIVE trading too) |
+| `MARKET_DATA_FALLBACK_ID` | `kucoin` | Read-only venue for prices/candles used **only** when the primary is geo-blocked/unreachable; empty = off. Never used for orders |
 | `MAX_OPEN_POSITIONS` | `5` | Max concurrent positions |
 | `RISK_PER_TRADE_PCT` | `1.0` | Equity risked per trade |
 | `DAILY_LOSS_LIMIT_PCT` | `5.0` | Halt new trades after this daily loss |

@@ -75,6 +75,14 @@ class BinanceConnector:
         self._client: Optional[ccxt.Exchange] = None
         self._markets: Optional[dict[str, Any]] = None
         self._exchange_id: str = "binance"
+        # Optional secondary client used for PUBLIC market data ONLY when the
+        # primary exchange is unreachable (see _build_data_fallback). Orders and
+        # account reads never touch this — live execution always uses the primary.
+        self._fallback_client: Optional[ccxt.Exchange] = None
+        self._fallback_id: str = ""
+        # Which venue actually served the most recent public read — an honest
+        # label for the UI/logs: the primary exchange id, or the fallback id.
+        self.last_data_source: str = "binance"
         self._connect()
 
     def _connect(self) -> None:
@@ -128,9 +136,44 @@ class BinanceConnector:
                         exc,
                     )
             self._client = client
+            self.last_data_source = self._exchange_id
         except Exception as exc:  # pragma: no cover - defensive
             logger.warning("Failed to initialise exchange client: %s", exc)
             self._client = None
+        # Build the optional PUBLIC market-data fallback regardless of whether the
+        # primary initialised, so prices/candles still work when the primary is
+        # unreachable (e.g. the Binance HTTP 451 geo-block). See below.
+        self._build_data_fallback()
+
+    def _build_data_fallback(self) -> None:
+        """Build an optional keyless client for PUBLIC market data ONLY.
+
+        When the primary exchange is unreachable from this server's region (the
+        classic Binance HTTP 451 geo-block), prices and candles are read from
+        this venue so the dashboard, analyzer and paper trading keep working with
+        REAL market data. It is NEVER used for orders, balances or reconciliation
+        — those always go to the primary (the user's real exchange keys). Uses a
+        direct connection (no proxy): the fallback exists precisely for the case
+        where the primary can't be reached directly. Empty id = disabled.
+        """
+        self._fallback_client = None
+        self._fallback_id = ""
+        fb = (
+            getattr(self._settings, "market_data_fallback_id", "") or ""
+        ).strip().lower()
+        if not fb or fb == self._exchange_id:
+            return
+        fb_cls = getattr(ccxt, fb, None)
+        if fb_cls is None:
+            logger.warning("unknown market_data_fallback_id %r; fallback disabled", fb)
+            return
+        try:
+            self._fallback_client = fb_cls(
+                {"enableRateLimit": True, "options": {"defaultType": "spot"}}
+            )
+            self._fallback_id = fb
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("could not init market-data fallback %s: %s", fb, exc)
 
     @property
     def connected(self) -> bool:
@@ -203,10 +246,46 @@ class BinanceConnector:
 
     # ---- Market data -------------------------------------------------
 
-    def fetch_ticker(self, symbol: str) -> dict[str, Any]:
-        if not self._client:
+    def _fetch_public(self, call: Callable[[ccxt.Exchange], T]) -> T:
+        """Run a READ-ONLY public market-data call, falling back to the secondary
+        venue when the primary is unreachable.
+
+        `call` receives the ccxt client to use. The fallback is engaged ONLY when
+        the primary raises a regional geo-block (HTTP 451) or a transient/network
+        error — never for a genuine data error like a bad symbol, which would be
+        masked. When there is no fallback the original exception propagates, so an
+        honest 451 still surfaces. Trading/account calls never use this path.
+        """
+        primary = self._client
+        if primary is not None:
+            try:
+                result = _with_retry(lambda: call(primary))
+                self.last_data_source = self._exchange_id
+                return result
+            except Exception as exc:
+                can_fallback = self._fallback_client is not None and (
+                    _is_geo_block(exc) or isinstance(exc, _RETRYABLE)
+                )
+                if not can_fallback:
+                    raise
+                logger.warning(
+                    "%s market data unavailable (%s); serving from fallback %s",
+                    self._exchange_id,
+                    exc,
+                    self._fallback_id,
+                )
+                result = _with_retry(lambda: call(self._fallback_client))
+                self.last_data_source = self._fallback_id
+                return result
+        # No primary client at all — use the fallback if we have one.
+        if self._fallback_client is None:
             raise RuntimeError("Exchange client not available")
-        return _with_retry(lambda: self._client.fetch_ticker(symbol))
+        result = _with_retry(lambda: call(self._fallback_client))
+        self.last_data_source = self._fallback_id
+        return result
+
+    def fetch_ticker(self, symbol: str) -> dict[str, Any]:
+        return self._fetch_public(lambda c: c.fetch_ticker(symbol))
 
     def fetch_price(self, symbol: str) -> float:
         ticker = self.fetch_ticker(symbol)
@@ -223,10 +302,10 @@ class BinanceConnector:
         bid and an ask (we refuse to *fabricate* a spread and block on it — the
         caller then proceeds rather than inventing a reason to skip).
         """
-        if not self._client:
+        if self._client is None and self._fallback_client is None:
             return None
         try:
-            ticker = _with_retry(lambda: self._client.fetch_ticker(symbol))
+            ticker = self._fetch_public(lambda c: c.fetch_ticker(symbol))
         except Exception as exc:
             logger.warning("spread probe failed for %s: %s", symbol, exc)
             return None
@@ -247,10 +326,8 @@ class BinanceConnector:
     def fetch_ohlcv(
         self, symbol: str, timeframe: str = "1h", limit: int = 200
     ) -> list[list[float]]:
-        if not self._client:
-            raise RuntimeError("Exchange client not available")
-        return _with_retry(
-            lambda: self._client.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
+        return self._fetch_public(
+            lambda c: c.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         )
 
     # ---- Account -----------------------------------------------------
@@ -388,6 +465,8 @@ class BinanceConnector:
             "can_trade": False,
             "testnet": self._settings.binance_testnet,
             "exchange": self._exchange_id,
+            "data_source": self.last_data_source,
+            "fallback": self._fallback_id or None,
             "detail": "",
         }
         if not self._client:
@@ -403,15 +482,29 @@ class BinanceConnector:
             msg = str(exc)
             low = msg.lower()
             if "451" in msg or "restricted location" in low or "eligibility" in low:
-                result["detail"] = (
-                    f"{self._exchange_id} is geo-blocking this server's region "
-                    "(HTTP 451). This is Binance refusing the request based on "
-                    "where the server runs — not a bug, and no API key can undo "
-                    "it. Nothing here works (not even public prices) until you "
-                    "either deploy in a supported region, set EXCHANGE_HTTP_PROXY "
-                    "to route through an allowed region, or (US only) set "
-                    "EXCHANGE_ID=binanceus."
-                )
+                if self._fallback_client is not None:
+                    result["detail"] = (
+                        f"{self._exchange_id} is geo-blocking this server's region "
+                        "(HTTP 451) — it refuses requests based on where the server "
+                        "runs, and no API key can undo it. Public market data "
+                        "(prices, candles, paper trading) is being served from "
+                        f"{self._fallback_id} instead, so the dashboard keeps "
+                        "working. LIVE trading still needs the real exchange "
+                        "reachable: set EXCHANGE_HTTP_PROXY to route through an "
+                        "allowed region, deploy in a supported region, or (US only) "
+                        "set EXCHANGE_ID=binanceus."
+                    )
+                else:
+                    result["detail"] = (
+                        f"{self._exchange_id} is geo-blocking this server's region "
+                        "(HTTP 451). This is the exchange refusing the request based "
+                        "on where the server runs — not a bug, and no API key can "
+                        "undo it. Nothing works (not even public prices) until you "
+                        "either deploy in a supported region, set EXCHANGE_HTTP_PROXY "
+                        "to route through an allowed region, (US only) set "
+                        "EXCHANGE_ID=binanceus, or set MARKET_DATA_FALLBACK_ID to a "
+                        "reachable venue for read-only market data."
+                    )
             else:
                 result["detail"] = f"public data unreachable: {exc}"
             return result

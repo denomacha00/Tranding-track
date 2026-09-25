@@ -93,6 +93,22 @@ Autonomous: `AUTO_TRADE_ENABLED` (keep `false` for now), `AUTO_SYMBOLS`,
 Other: `LOG_FORMAT=json`, `LOG_LEVEL=INFO`, `PAPER_STARTING_BALANCE`,
 `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`, `ACCESS_TOKEN_TTL_MINUTES`.
 
+### If Binance geo-blocks your server (HTTP 451)
+
+Binance refuses requests from some server regions (this includes
+`testnet.binance.vision`), which otherwise shows up as `502 Bad Gateway` on
+`/api/ticker` and a dead dashboard. The app now handles this automatically:
+
+- **Read-only market data** (prices, candles, the analyzer, paper trading) falls
+  back to **`MARKET_DATA_FALLBACK_ID`** (default `kucoin`) whenever the primary is
+  geo-blocked/unreachable, so the dashboard keeps working with **real** data. Set
+  it empty to disable the fallback. Prices are labelled with the venue that
+  served them — nothing is faked.
+- **Live trading** still needs Binance itself reachable (the fallback never places
+  orders or reads balances). For live orders from a blocked region set
+  `EXCHANGE_HTTP_PROXY=<proxy URL in a supported region>`, or — US only —
+  `EXCHANGE_ID=binanceus`.
+
 ---
 
 ## 3. Deploy & verify (order matters)

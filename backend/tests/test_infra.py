@@ -277,3 +277,101 @@ def test_with_retry_retries_true_transient_error():
     with pytest.raises(ccxt.NetworkError):
         ex._with_retry(flaky, attempts=3, base_delay=0.0)
     assert calls["n"] == 3  # a real transient error uses the full retry budget
+
+
+# ---- public market-data fallback (works despite a geo-blocked primary) ----
+
+
+class _FakeExchange:
+    """Minimal stand-in for a ccxt client — no network, records call counts."""
+
+    def __init__(self, *, ticker=None, ohlcv=None, raises: Exception | None = None):
+        self._ticker = ticker
+        self._ohlcv = ohlcv
+        self._raises = raises
+        self.ticker_calls = 0
+        self.ohlcv_calls = 0
+
+    def fetch_ticker(self, symbol):
+        self.ticker_calls += 1
+        if self._raises is not None:
+            raise self._raises
+        return self._ticker
+
+    def fetch_ohlcv(self, symbol, timeframe="1h", limit=200):
+        self.ohlcv_calls += 1
+        if self._raises is not None:
+            raise self._raises
+        return self._ohlcv
+
+
+def _connector(**over):
+    """A BinanceConnector with no real fallback wired (we inject fakes)."""
+    from app.exchange import BinanceConnector
+
+    over.setdefault("market_data_fallback_id", "")
+    return BinanceConnector(_settings(**over))
+
+
+def test_build_data_fallback_selects_configured_venue():
+    conn = _connector(market_data_fallback_id="kucoin", exchange_id="binance")
+    assert conn._fallback_id == "kucoin"
+    assert conn._fallback_client is not None  # constructed, keyless, offline
+
+
+def test_build_data_fallback_disabled_when_empty_or_same_as_primary():
+    assert _connector(market_data_fallback_id="")._fallback_client is None
+    same = _connector(market_data_fallback_id="binance", exchange_id="binance")
+    assert same._fallback_client is None
+
+
+def test_market_data_falls_back_on_geo_block():
+    conn = _connector()
+    conn._exchange_id = "binance"
+    conn._client = _FakeExchange(raises=ccxt.ExchangeNotAvailable("451 restricted location"))
+    conn._fallback_client = _FakeExchange(
+        ticker={"last": 123.0, "bid": 122.0, "ask": 124.0}, ohlcv=[[0, 1, 2, 0.5, 1.5, 10]]
+    )
+    conn._fallback_id = "kucoin"
+
+    t = conn.fetch_ticker("BTC/USDT")
+    assert t["last"] == 123.0
+    assert conn.last_data_source == "kucoin"  # honestly labelled as the fallback
+
+    ohlcv = conn.fetch_ohlcv("BTC/USDT")
+    assert ohlcv[0][4] == 1.5
+    assert conn.last_data_source == "kucoin"
+
+
+def test_market_data_uses_primary_when_healthy():
+    conn = _connector()
+    conn._exchange_id = "binance"
+    conn._client = _FakeExchange(ticker={"last": 99.0})
+    fallback = _FakeExchange(ticker={"last": 1.0})
+    conn._fallback_client = fallback
+    conn._fallback_id = "kucoin"
+
+    t = conn.fetch_ticker("BTC/USDT")
+    assert t["last"] == 99.0
+    assert conn.last_data_source == "binance"
+    assert fallback.ticker_calls == 0  # a healthy primary never touches the fallback
+
+
+def test_market_data_bad_symbol_is_not_masked_by_fallback():
+    conn = _connector()
+    conn._client = _FakeExchange(raises=ccxt.BadSymbol("no such market"))
+    fallback = _FakeExchange(ticker={"last": 1.0})
+    conn._fallback_client = fallback
+    conn._fallback_id = "kucoin"
+
+    with pytest.raises(ccxt.BadSymbol):
+        conn.fetch_ticker("NOPE/USDT")
+    assert fallback.ticker_calls == 0  # a genuine data error surfaces, not hidden
+
+
+def test_geo_block_without_fallback_reraises_honestly():
+    conn = _connector()
+    conn._client = _FakeExchange(raises=ccxt.ExchangeNotAvailable("451 restricted location"))
+    conn._fallback_client = None
+    with pytest.raises(ccxt.ExchangeNotAvailable):
+        conn.fetch_ticker("BTC/USDT")  # no fallback -> the real 451 still surfaces
