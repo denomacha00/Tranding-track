@@ -6,7 +6,7 @@ import { Admin } from './Admin'
 import { useSocket } from './useSocket'
 import { useTheme, type Theme } from './theme'
 import { ThemeToggle } from './ThemeToggle'
-import type { AiHealth, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, MarketAnalysis, Me, NewsItem, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
+import type { AiHealth, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, MarketAnalysis, Me, NewsItem, Performance, PerfBucket, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
 
 const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
@@ -100,12 +100,13 @@ export default function App() {
   return <Dashboard me={me} onLogout={logout} onMeChanged={setMe} theme={theme} onToggleTheme={toggleTheme} />
 }
 
-type TabKey = 'trades' | 'signals' | 'assistant' | 'analyze' | 'train' | 'backtest' | 'settings' | 'admin'
+type TabKey = 'trades' | 'performance' | 'signals' | 'assistant' | 'analyze' | 'train' | 'backtest' | 'settings' | 'admin'
 
 // Left-drawer navigation. `admin: true` items only render for admins. The same
 // keys drive the in-panel tab strip, so the two stay in sync off one `tab`.
 const NAV: { key: TabKey; label: string; icon: string; admin?: boolean }[] = [
   { key: 'trades', label: 'Trades', icon: '📈' },
+  { key: 'performance', label: 'Performance', icon: '🏆' },
   { key: 'signals', label: 'Signals', icon: '📡' },
   { key: 'assistant', label: 'AI Assistant', icon: '🤖' },
   { key: 'analyze', label: 'Analyze', icon: '🔍' },
@@ -118,6 +119,7 @@ const NAV: { key: TabKey; label: string; icon: string; admin?: boolean }[] = [
 // Human labels for a nav destination, used when the AI asks to "take me to X".
 const NAV_LABEL: Record<TabKey, string> = {
   trades: 'Trades',
+  performance: 'Performance',
   signals: 'Signals',
   assistant: 'AI Assistant',
   analyze: 'Analyze',
@@ -131,6 +133,8 @@ const NAV_LABEL: Record<TabKey, string> = {
 // accept synonyms so "keys", "connect", "credentials" etc. all land on Settings.
 const NAV_ALIAS: Record<string, TabKey> = {
   trades: 'trades', trade: 'trades', positions: 'trades', dashboard: 'trades', home: 'trades',
+  performance: 'performance', perf: 'performance', stats: 'performance', results: 'performance',
+  pnl: 'performance', analytics: 'performance',
   signals: 'signals', signal: 'signals',
   assistant: 'assistant', ai: 'assistant', chat: 'assistant',
   analyze: 'analyze', analysis: 'analyze', analyse: 'analyze',
@@ -572,6 +576,20 @@ function Dashboard({
                         ⚠ stale
                       </span>
                     )}
+                    {/* Honest source label: when the primary exchange is
+                        geo-blocked, market data is served from the configured
+                        public fallback venue. Show it so the price is never
+                        implied to come from somewhere it didn't. */}
+                    {ticker?.source &&
+                      access?.exchange &&
+                      ticker.source !== access.exchange && (
+                        <span
+                          className="hint"
+                          title={`${access.exchange} market data is unavailable here (e.g. geo-blocked); this price is served from the public fallback ${ticker.source}. Orders and balances still use ${access.exchange}.`}
+                        >
+                          via {ticker.source}
+                        </span>
+                      )}
                   </>
                 )}
               </div>
@@ -680,6 +698,12 @@ function Dashboard({
                   Trades
                 </span>
                 <span
+                  className={`tab ${tab === 'performance' ? 'active' : ''}`}
+                  onClick={() => setTab('performance')}
+                >
+                  Performance
+                </span>
+                <span
                   className={`tab ${tab === 'signals' ? 'active' : ''}`}
                   onClick={() => setTab('signals')}
                 >
@@ -736,6 +760,9 @@ function Dashboard({
                 />
               )}
               {tab === 'signals' && <SignalsTable signals={signals} />}
+              {tab === 'performance' && (
+                <PerformancePanel onError={(m) => showToast('error', m)} />
+              )}
               {tab === 'assistant' && (
                 <AssistantPanel
                   symbol={symbol}
@@ -1062,6 +1089,200 @@ function SignalsTable({ signals }: { signals: SignalRow[] }) {
             })}
           </tbody>
         </table>
+      )}
+    </div>
+  )
+}
+
+// Turn a duration in seconds into a compact human label (e.g. "2h 15m").
+function fmtHold(seconds: number | null): string {
+  if (seconds == null || !Number.isFinite(seconds)) return '—'
+  const s = Math.round(seconds)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m`
+  const h = Math.floor(m / 60)
+  const remM = m % 60
+  if (h < 24) return remM ? `${h}h ${remM}m` : `${h}h`
+  const d = Math.floor(h / 24)
+  const remH = h % 24
+  return remH ? `${d}d ${remH}h` : `${d}d`
+}
+
+// Realized performance analytics for the current user, computed live by the
+// backend from CLOSED trades only. Read-only: this panel never places or
+// changes an order. Paper and live are shown separately so simulated gains are
+// never mistaken for real money, and undefined metrics stay "—" (never faked).
+function PerformancePanel({ onError }: { onError: (msg: string) => void }) {
+  const [perf, setPerf] = useState<Performance | null>(null)
+  const [loading, setLoading] = useState(true)
+  const [failed, setFailed] = useState(false)
+
+  const load = useCallback(async () => {
+    setLoading(true)
+    setFailed(false)
+    try {
+      setPerf(await api.performance())
+    } catch (e) {
+      setFailed(true)
+      onError((e as Error).message)
+    } finally {
+      setLoading(false)
+    }
+  }, [onError])
+
+  useEffect(() => {
+    load()
+  }, [load])
+
+  const cls = (n: number) => (n > 0 ? 'pos' : n < 0 ? 'neg' : '')
+  const money = (n: number) => `${n < 0 ? '-' : ''}$${fmt(Math.abs(n))}`
+  const pf = (v: number | null) => (v == null ? '—' : fmt(v))
+
+  if (!perf) {
+    if (loading) return <div className="empty">Loading…</div>
+    return (
+      <div className="empty">
+        {failed ? "Couldn't load your performance." : 'No performance data.'}
+        <button className="btn" style={{ marginLeft: 10 }} onClick={load}>
+          Retry
+        </button>
+      </div>
+    )
+  }
+
+  if (perf.closed_trades === 0) {
+    return (
+      <div className="empty">
+        No closed trades yet. Your realized performance — win rate, profit
+        factor, expectancy and drawdown — appears here as soon as positions
+        close. Paper and live results are tracked separately, so simulated gains
+        are never counted as real money.
+      </div>
+    )
+  }
+
+  // One comparison row for a paper/live bucket. Drawdown is shown as a negative
+  // magnitude so a bigger drop reads as more red, consistent with PnL.
+  const bucketRow = (label: string, b: PerfBucket) => (
+    <tr>
+      <td>{label}</td>
+      <td className="mono">{b.closed_trades}</td>
+      <td className="mono">{fmt(b.win_rate_pct)}%</td>
+      <td className={`mono ${cls(b.total_pnl)}`}>{money(b.total_pnl)}</td>
+      <td className="mono">{pf(b.profit_factor)}</td>
+      <td className="mono neg">{b.max_drawdown ? money(-b.max_drawdown) : money(0)}</td>
+    </tr>
+  )
+
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
+      <div className="row" style={{ alignItems: 'center' }}>
+        <p className="hint" style={{ flex: 1, margin: 0 }}>
+          Realized results from your <b>closed</b> trades — computed live, never
+          fabricated. Open positions aren't counted (no realized result yet), and
+          an undefined metric shows “—”, not a fake number.
+        </p>
+        <button className="btn" onClick={load} disabled={loading}>
+          {loading ? '…' : '↻ Refresh'}
+        </button>
+      </div>
+
+      <div className="stats" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
+        <div className="stat">
+          <div className="label">Closed trades</div>
+          <div className="value">{perf.closed_trades}</div>
+        </div>
+        <div className="stat">
+          <div className="label">Win rate</div>
+          <div className="value">{fmt(perf.win_rate_pct)}%</div>
+        </div>
+        <div className="stat">
+          <div className="label">Total realized PnL</div>
+          <div className={`value ${cls(perf.total_pnl)}`}>{money(perf.total_pnl)}</div>
+        </div>
+        <div className="stat">
+          <div className="label">Profit factor</div>
+          <div
+            className="value"
+            title={perf.profit_factor == null ? 'Undefined — no losing trades yet' : undefined}
+          >
+            {pf(perf.profit_factor)}
+          </div>
+        </div>
+        <div className="stat">
+          <div className="label">Expectancy / trade</div>
+          <div className={`value ${cls(perf.expectancy)}`}>{money(perf.expectancy)}</div>
+        </div>
+        <div className="stat">
+          <div className="label">Max drawdown</div>
+          <div className="value neg">{perf.max_drawdown ? money(-perf.max_drawdown) : money(0)}</div>
+        </div>
+      </div>
+
+      <div className="row" style={{ flexWrap: 'wrap', gap: 20 }}>
+        <span className="hint">Wins <b className="pos">{perf.wins}</b></span>
+        <span className="hint">Losses <b className="neg">{perf.losses}</b></span>
+        <span className="hint">Breakeven <b>{perf.breakeven}</b></span>
+        <span className="hint">Avg win <b className="pos">{money(perf.avg_win)}</b></span>
+        <span className="hint">Avg loss <b className="neg">{money(perf.avg_loss)}</b></span>
+        <span className="hint">Largest win <b className="pos">{money(perf.largest_win)}</b></span>
+        <span className="hint">Largest loss <b className="neg">{money(perf.largest_loss)}</b></span>
+        <span className="hint">Avg hold <b>{fmtHold(perf.avg_hold_seconds)}</b></span>
+      </div>
+
+      <div>
+        <div className="panel-head" style={{ paddingLeft: 0, borderBottom: 'none' }}>
+          Paper vs live
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>Account</th>
+              <th className="mono">Closed</th>
+              <th className="mono">Win rate</th>
+              <th className="mono">Total PnL</th>
+              <th className="mono">Profit factor</th>
+              <th className="mono">Max DD</th>
+            </tr>
+          </thead>
+          <tbody>
+            {bucketRow('📝 Paper (simulated)', perf.paper)}
+            {bucketRow('💵 Live (real money)', perf.live)}
+          </tbody>
+        </table>
+        <p className="hint" style={{ marginTop: 6 }}>
+          Paper and live are kept strictly separate — simulated gains are never
+          added to your real-money results.
+        </p>
+      </div>
+
+      {perf.by_symbol.length > 0 && (
+        <div>
+          <div className="panel-head" style={{ paddingLeft: 0, borderBottom: 'none' }}>
+            By symbol (best first)
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>Symbol</th>
+                <th className="mono">Trades</th>
+                <th className="mono">Wins</th>
+                <th className="mono">Realized PnL</th>
+              </tr>
+            </thead>
+            <tbody>
+              {perf.by_symbol.map((s) => (
+                <tr key={s.symbol}>
+                  <td>{s.symbol}</td>
+                  <td className="mono">{s.trades}</td>
+                  <td className="mono">{s.wins}</td>
+                  <td className={`mono ${cls(s.pnl)}`}>{money(s.pnl)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
       )}
     </div>
   )

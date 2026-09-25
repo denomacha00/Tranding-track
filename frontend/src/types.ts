@@ -137,6 +137,48 @@ export interface Ticker {
   ask: number | null
   // 24h price change percent (may be null if the exchange omits it).
   percentage: number | null
+  // Which venue actually served this price: the primary exchange, or the
+  // public-data fallback when the primary is geo-blocked. Honest source label
+  // so the UI never implies a price came from somewhere it didn't.
+  source?: string | null
+}
+
+// Realized-P&L stats for a set of CLOSED trades. Every figure is derived from
+// trades that actually executed; `profit_factor` is null (never a fake
+// "infinity") when there are no losing trades. Mirrors the backend PerfBucket.
+export interface PerfBucket {
+  closed_trades: number
+  wins: number
+  losses: number
+  breakeven: number
+  win_rate_pct: number
+  total_pnl: number
+  gross_profit: number
+  gross_loss: number
+  profit_factor: number | null
+  avg_win: number
+  avg_loss: number
+  expectancy: number
+  largest_win: number
+  largest_loss: number
+  max_drawdown: number
+}
+
+export interface PerfSymbol {
+  symbol: string
+  trades: number
+  pnl: number
+  wins: number
+}
+
+// Overall realized performance plus paper/live splits and a per-symbol
+// breakdown. Paper and live are separate so simulated gains are never counted
+// as real money. Mirrors the backend PerformanceOut.
+export interface Performance extends PerfBucket {
+  avg_hold_seconds: number | null
+  paper: PerfBucket
+  live: PerfBucket
+  by_symbol: PerfSymbol[]
 }
 
 export interface BacktestResult {

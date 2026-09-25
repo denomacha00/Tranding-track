@@ -11,6 +11,7 @@ import type {
   MarketAnalysis,
   Me,
   NewsItem,
+  Performance,
   Settings,
   SignalRow,
   StrategyInfo,
@@ -142,6 +143,9 @@ export const api = {
     req<Settings>('/api/settings', { method: 'PATCH', body: JSON.stringify(patch) }),
   trades: (status?: string) =>
     req<Trade[]>(`/api/trades${status ? `?status=${status}` : ''}`),
+  // Realized performance analytics computed live from the user's CLOSED trades
+  // (win rate, profit factor, drawdown, per-symbol, paper/live splits).
+  performance: () => req<Performance>('/api/performance'),
   signals: () => req<SignalRow[]>('/api/signals'),
   setBot: (state: 'start' | 'stop') =>
     req<{ running: boolean }>(`/api/bot/${state}`, { method: 'POST' }),
