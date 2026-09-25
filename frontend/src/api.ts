@@ -4,6 +4,7 @@ import type {
   BotStatus,
   Candle,
   AiHealth,
+  CloseAllResult,
   ExchangeAccess,
   ExecutionResult,
   LicenseKeyCreated,
@@ -12,6 +13,7 @@ import type {
   Me,
   NewsItem,
   Performance,
+  ScaledResult,
   Settings,
   SignalRow,
   StrategyInfo,
@@ -157,6 +159,24 @@ export const api = {
     stop_loss?: number
     take_profit?: number
   }) => req<ExecutionResult>('/api/order', { method: 'POST', body: JSON.stringify(body) }),
+  // Scaled / DCA entry: split one BUY into N legs (first optionally at market,
+  // the rest resting limits stepped step_pct% below). Sized ONCE by the risk
+  // manager, then split — scaling never risks more than a single entry would.
+  scaledOrder: (body: {
+    symbol: string
+    amount?: number
+    legs: number
+    step_pct: number
+    first_at_market: boolean
+    stop_loss?: number
+    take_profit?: number
+  }) => req<ScaledResult>('/api/order/scaled', { method: 'POST', body: JSON.stringify(body) }),
+  // Close every open position AND cancel every resting order for a symbol — the
+  // one-click exit for a multi-leg DCA ladder so it's never left half-managed.
+  closeAll: (symbol: string) =>
+    req<CloseAllResult>(`/api/positions/${encodeURIComponent(symbol)}/close-all`, {
+      method: 'POST',
+    }),
   closeTrade: (id: number) =>
     req<ExecutionResult>(`/api/trades/${id}/close`, { method: 'POST' }),
   ohlcv: (symbol: string, timeframe = '1h', limit = 200) =>

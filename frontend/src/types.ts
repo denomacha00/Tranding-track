@@ -98,6 +98,23 @@ export interface ExecutionResult {
   trade: Trade | null
 }
 
+// Result of a scaled (DCA) entry: the legs that were actually placed. A market
+// leg comes back `open`; resting limit legs come back `pending`. On a partial
+// placement `accepted` is still true and `message` says which legs are live.
+export interface ScaledResult {
+  accepted: boolean
+  message: string
+  legs: Trade[]
+}
+
+// Result of closing every position + cancelling every resting order for one
+// symbol (the one-click exit for a multi-leg DCA ladder).
+export interface CloseAllResult {
+  closed: number
+  realized_pnl: number
+  message: string
+}
+
 export interface ExchangeAccess {
   ok: boolean
   can_read_public: boolean

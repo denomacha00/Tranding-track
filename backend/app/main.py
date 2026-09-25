@@ -52,6 +52,7 @@ from app.models import (
 from app.schemas import (
     AddLicenseDays,
     BotStatus,
+    CloseAllResult,
     CredentialsUpdate,
     ExecutionResult,
     LicenseKeyCreate,
@@ -63,6 +64,8 @@ from app.schemas import (
     MeOut,
     PerformanceOut,
     RedeemLicenseKey,
+    ScaledOrder,
+    ScaledResult,
     SettingsOut,
     SettingsUpdate,
     SignalOut,
@@ -590,6 +593,62 @@ async def manual_order(
     return ExecutionResult(
         accepted=accepted, message=message,
         trade=TradeOut.model_validate(trade) if trade else None,
+    )
+
+
+@app.post("/api/order/scaled", response_model=ScaledResult)
+async def scaled_order(
+    order: ScaledOrder,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    """Open a BUY in scaled (DCA) legs. Places NO order until the account trades
+    live; in paper it simulates the ladder against the paper wallet. The TOTAL
+    size is risk-checked once, then split across legs (see engine docs)."""
+    engine = _engine_for(db, user)
+    accepted, message, legs = await asyncio.to_thread(
+        engine.execute_scaled_entry,
+        db,
+        symbol=order.symbol,
+        amount=order.amount,
+        legs=order.legs,
+        step_pct=order.step_pct,
+        first_at_market=order.first_at_market,
+        stop_loss=order.stop_loss,
+        take_profit=order.take_profit,
+        source="manual",
+        note="scaled entry",
+    )
+    return ScaledResult(
+        accepted=accepted,
+        message=message,
+        legs=[TradeOut.model_validate(t) for t in legs],
+    )
+
+
+@app.post("/api/positions/{symbol:path}/close-all", response_model=CloseAllResult)
+async def close_all_for_symbol(
+    symbol: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    """Close every open position and cancel every resting order for one symbol —
+    the one-action exit for a multi-leg DCA entry."""
+    engine = _engine_for(db, user)
+    count, pnl, _msgs = await asyncio.to_thread(engine.close_symbol, db, symbol)
+    if count == 0:
+        return CloseAllResult(
+            closed=0,
+            realized_pnl=0.0,
+            message=f"No open positions or resting orders for {symbol.upper()}.",
+        )
+    return CloseAllResult(
+        closed=count,
+        realized_pnl=pnl,
+        message=(
+            f"Closed/cancelled {count} for {symbol.upper()} "
+            f"(realized PnL {pnl:.2f})."
+        ),
     )
 
 

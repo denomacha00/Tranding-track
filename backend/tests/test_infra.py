@@ -479,3 +479,259 @@ def test_performance_avg_hold_seconds_from_timestamps():
     o = _dt.datetime(2026, 1, 1, 12, 0, tzinfo=_dt.timezone.utc)
     p = compute_performance([_trade(1.0, opened=o, closed=o + _dt.timedelta(hours=2))])
     assert p["avg_hold_seconds"] == 7200.0
+
+
+# ---- scaled / DCA entries (offline paper engine, price pinned) -------
+#
+# These exercise the REAL execute_scaled_entry / close_symbol code paths on a
+# paper TradingEngine backed by a throwaway SQLite DB, with the price feed
+# stubbed so nothing touches the network. Paper mode places NO live order.
+
+
+class _FakeConn:
+    """Minimal offline connector: a fixed spot price, no network, no keys.
+
+    Enough surface for the paper execution path (market/limit/stop/cancel are
+    no-op stubs). Mirrors the fake used by the other engine tests.
+    """
+
+    has_credentials = False
+    connected = True
+
+    def __init__(self, price: float = 100.0):
+        self._price = price
+
+    def reload(self, settings):
+        pass
+
+    def fetch_price(self, symbol):
+        return self._price
+
+    def fetch_ohlcv(self, symbol, timeframe, limit):
+        return []
+
+    def fetch_position_amounts(self):
+        return {}
+
+    def fetch_balance(self, quote="USDT"):
+        return None
+
+    def normalize_amount(self, symbol, amount, price):
+        return amount, None
+
+    def create_market_order(self, symbol, side, amount):
+        return {"id": "m1", "average": self._price}
+
+    def create_limit_order(self, symbol, side, amount, price):
+        return {"id": "l1"}
+
+    def create_stop_loss_order(self, symbol, side, amount, stop_price):
+        return None
+
+    def cancel_order(self, order_id, symbol):
+        pass
+
+    def fetch_order(self, order_id, symbol):
+        return None
+
+
+@pytest.fixture
+def _paper_engine():
+    """A paper ``TradingEngine`` on an in-memory SQLite DB, price fixed at 100.
+
+    Yields ``(engine, db)``. Fully offline: a fake connector serves a constant
+    price and never touches the network, and paper mode means no exchange order
+    is ever placed. The drawdown kill-switch and exposure cap are disabled so
+    the DCA logic under test is what decides, not another safeguard.
+    """
+    from sqlalchemy import create_engine as _create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    import app.models  # noqa: F401  (registers ORM tables on Base.metadata)
+    from app.database import Base
+    from app.engine import TradingEngine
+
+    db_engine = _create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+    )
+    Base.metadata.create_all(db_engine)
+    db = sessionmaker(bind=db_engine)()
+
+    settings = _settings(
+        trading_mode="paper",         # is_live -> False; never a live order
+        paper_starting_balance=10_000.0,
+        max_open_positions=10,
+        risk_per_trade_pct=1.0,
+        daily_loss_limit_pct=50.0,    # daily-loss breaker out of the way
+        max_drawdown_pct=0.0,         # kill-switch off for deterministic tests
+        max_total_exposure_pct=0.0,   # exposure cap off
+        default_stop_loss_pct=2.0,
+        default_take_profit_pct=4.0,
+        min_signal_confidence=0.1,
+    )
+    engine = TradingEngine(settings, _FakeConn(100.0), user_id=None)
+    engine.paper_balance = 10_000.0
+    try:
+        yield engine, db
+    finally:
+        db.close()
+
+
+def _trades(db):
+    """Every Trade row in the test DB (any status)."""
+    from sqlalchemy import select as _sel
+
+    from app.models import Trade
+
+    return list(db.scalars(_sel(Trade)).all())
+
+
+def test_scaled_entry_creates_market_plus_resting_legs(_paper_engine):
+    from app.models import TradeStatus
+
+    engine, db = _paper_engine
+    ok, msg, legs = engine.execute_scaled_entry(
+        db, symbol="BTC/USDT", amount=3.0, legs=3, step_pct=1.0,
+        first_at_market=True, stop_loss=95.0, take_profit=110.0,
+        source="manual", note="scaled entry",
+    )
+    assert ok is True, msg
+    assert len(legs) == 3
+    # 1 leg at market (open now) + 2 resting limit legs (pending).
+    opens = [t for t in legs if t.status == TradeStatus.open.value]
+    pend = [t for t in legs if t.status == TradeStatus.pending.value]
+    assert len(opens) == 1 and len(pend) == 2
+    # Total base qty (3.0) split equally across the 3 legs.
+    assert all(abs(t.amount - 1.0) < 1e-9 for t in legs)
+    # Ladder DOWN from the current price, 1% apart: 100, 99, 98.
+    assert sorted(t.entry_price for t in legs) == pytest.approx([98.0, 99.0, 100.0])
+    # The provided SL/TP protect EVERY leg (the open one now; resting on fill).
+    assert all(abs(t.stop_loss - 95.0) < 1e-9 for t in legs)
+    assert all(abs(t.take_profit - 110.0) < 1e-9 for t in legs)
+    # Paper wallet reserved exactly the sum of leg notionals: 100+99+98 = 297.
+    assert engine.paper_balance == pytest.approx(10_000.0 - 297.0)
+
+
+def test_scaled_entry_all_resting_when_not_first_at_market(_paper_engine):
+    from app.models import TradeStatus
+
+    engine, db = _paper_engine
+    ok, msg, legs = engine.execute_scaled_entry(
+        db, symbol="ETH/USDT", amount=2.0, legs=2, step_pct=1.0,
+        first_at_market=False, stop_loss=None, take_profit=None,
+        source="manual", note=None,
+    )
+    assert ok is True, msg
+    assert len(legs) == 2
+    assert all(t.status == TradeStatus.pending.value for t in legs)
+    # Both rest as limits: first at the current price, the next 1% below.
+    assert sorted(t.limit_price for t in legs) == pytest.approx([99.0, 100.0])
+    # Resting legs with no explicit stop stay unset until they FILL (when
+    # _fill_pending assigns the auto SL/TP) — nothing fake is written early.
+    assert all(t.stop_loss is None and t.take_profit is None for t in legs)
+    assert engine.paper_balance == pytest.approx(10_000.0 - 199.0)
+
+
+def test_scaled_entry_rejects_when_not_enough_slots(_paper_engine):
+    engine, db = _paper_engine
+    engine.settings.max_open_positions = 2  # only 2 free, entry needs 3
+    ok, msg, legs = engine.execute_scaled_entry(
+        db, symbol="BTC/USDT", amount=3.0, legs=3, step_pct=1.0,
+        first_at_market=True, stop_loss=None, take_profit=None,
+        source="manual", note=None,
+    )
+    assert ok is False
+    assert "slots" in msg.lower() or "free" in msg.lower()
+    assert legs == []
+    assert _trades(db) == []                       # nothing placed on rejection
+    assert engine.paper_balance == pytest.approx(10_000.0)  # wallet untouched
+
+
+def test_scaled_entry_rejects_existing_position(_paper_engine):
+    engine, db = _paper_engine
+    ok, _msg, _legs = engine.execute_scaled_entry(
+        db, symbol="BTC/USDT", amount=2.0, legs=2, step_pct=1.0,
+        first_at_market=True, stop_loss=None, take_profit=None,
+        source="manual", note=None,
+    )
+    assert ok is True
+    # A second scale-in on the same symbol must be refused, not stacked.
+    ok2, msg2, legs2 = engine.execute_scaled_entry(
+        db, symbol="BTC/USDT", amount=2.0, legs=2, step_pct=1.0,
+        first_at_market=True, stop_loss=None, take_profit=None,
+        source="manual", note=None,
+    )
+    assert ok2 is False
+    assert "already" in msg2.lower()
+    assert legs2 == []
+
+
+def test_scaled_entry_blocked_by_killswitch(_paper_engine):
+    engine, db = _paper_engine
+    # Arm the REAL drawdown kill-switch (needs a positive budget to be active).
+    engine.settings.max_drawdown_pct = 25.0
+    engine._killswitch_tripped = True
+    ok, msg, legs = engine.execute_scaled_entry(
+        db, symbol="BTC/USDT", amount=3.0, legs=3, step_pct=1.0,
+        first_at_market=True, stop_loss=None, take_profit=None,
+        source="manual", note=None,
+    )
+    assert ok is False
+    assert "kill-switch" in msg.lower()
+    assert legs == [] and _trades(db) == []
+
+
+def test_scaled_entry_rejects_below_two_legs(_paper_engine):
+    engine, db = _paper_engine
+    ok, msg, legs = engine.execute_scaled_entry(
+        db, symbol="BTC/USDT", amount=1.0, legs=1, step_pct=1.0,
+        first_at_market=True, stop_loss=None, take_profit=None,
+        source="manual", note=None,
+    )
+    assert ok is False
+    assert "2 legs" in msg
+    assert legs == [] and _trades(db) == []
+
+
+def test_scaled_entry_risk_sizes_when_amount_blank(_paper_engine):
+    engine, db = _paper_engine
+    # amount=None -> the risk manager sizes the WHOLE entry, then it's split.
+    ok, msg, legs = engine.execute_scaled_entry(
+        db, symbol="BTC/USDT", amount=None, legs=2, step_pct=1.0,
+        first_at_market=True, stop_loss=98.0, take_profit=None,
+        source="manual", note=None,
+    )
+    assert ok is True, msg
+    assert len(legs) == 2
+    # Equal slices of the risk-sized total, each a positive quantity.
+    assert legs[0].amount == pytest.approx(legs[1].amount)
+    assert all(t.amount > 0 for t in legs)
+    # Total notional stays within available equity (sizing respects the budget).
+    total_notional = sum(t.amount * t.entry_price for t in legs)
+    assert total_notional <= 10_000.0 + 1e-6
+
+
+def test_close_symbol_closes_and_cancels_all_legs(_paper_engine):
+    from app.models import TradeStatus
+
+    engine, db = _paper_engine
+    ok, _msg, legs = engine.execute_scaled_entry(
+        db, symbol="BTC/USDT", amount=3.0, legs=3, step_pct=1.0,
+        first_at_market=True, stop_loss=None, take_profit=None,
+        source="manual", note=None,
+    )
+    assert ok is True and len(legs) == 3
+
+    affected, realized, msgs = engine.close_symbol(db, "BTC/USDT")
+    assert affected == 3
+    assert len(msgs) == 3
+    # Closed at the same price it opened (100) and cancelled the rest -> ~0 PnL.
+    assert realized == pytest.approx(0.0)
+    # No open or resting leg remains for the symbol.
+    remaining = [
+        t for t in _trades(db)
+        if t.status in (TradeStatus.open.value, TradeStatus.pending.value)
+    ]
+    assert remaining == []
+    # Every reservation is returned: the paper wallet is whole again.
+    assert engine.paper_balance == pytest.approx(10_000.0)

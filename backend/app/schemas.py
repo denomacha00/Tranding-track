@@ -81,6 +81,35 @@ class ExecutionResult(BaseModel):
     trade: Optional[TradeOut] = None
 
 
+class ScaledOrder(BaseModel):
+    """Open a BUY in scaled (DCA) legs: the first optionally at market, the rest
+    as resting limits stepped ``step_pct``% apart below it. ``amount`` is the
+    TOTAL base quantity across all legs; omit it to let the risk manager size the
+    whole entry. ``stop_loss``/``take_profit`` apply to each filled leg."""
+
+    symbol: str
+    amount: Optional[float] = Field(default=None, gt=0)  # total base qty; blank = risk-sized
+    legs: int = Field(ge=2, le=20)
+    step_pct: float = Field(gt=0, le=50)  # price gap between legs, % of price
+    first_at_market: bool = True
+    stop_loss: Optional[float] = Field(default=None, gt=0)
+    take_profit: Optional[float] = Field(default=None, gt=0)
+
+
+class ScaledResult(BaseModel):
+    accepted: bool
+    message: str
+    legs: list[TradeOut] = []
+
+
+class CloseAllResult(BaseModel):
+    """Result of closing/cancelling every position + resting order for a symbol."""
+
+    closed: int
+    realized_pnl: float
+    message: str
+
+
 class TickerOut(BaseModel):
     symbol: str
     last: float

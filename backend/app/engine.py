@@ -627,6 +627,281 @@ class TradingEngine:
             )
             return True, f"Opened {action} {qty:.8f} {symbol} @ {price:.2f}", trade
 
+    # ---- scaled (DCA) entries ---------------------------------------
+    def _place_leg(
+        self,
+        db: Session,
+        *,
+        symbol: str,
+        qty: float,
+        kind: str,
+        limit_price: float | None,
+        stop_loss: float | None,
+        take_profit: float | None,
+        source: str,
+        note: str,
+    ) -> tuple[bool, str, Optional[Trade]]:
+        """Place ONE buy leg of a scaled entry. Caller holds the lock and has
+        already (a) risk-checked the TOTAL size, (b) confirmed slot capacity and
+        (c) confirmed there's no existing position and the kill-switch is clear.
+
+        Mirrors ``execute_signal``'s single-order placement for one tranche and
+        deliberately does NOT re-run risk checks (they apply to the whole entry,
+        not each slice). ``kind="market"`` opens immediately; ``kind="limit"``
+        rests at ``limit_price`` until price crosses it. Returns (ok, msg, trade).
+        """
+        if kind == "market":
+            price = self._price(symbol)
+            exchange_order_id: str | None = None
+            if self.settings.is_live:
+                spread_reason = self._spread_guard(symbol)
+                if spread_reason:
+                    return False, f"Rejected: {spread_reason}", None
+                adj_qty, err = self.connector.normalize_amount(symbol, qty, price)
+                if err:
+                    return False, f"Rejected: {err}", None
+                qty = adj_qty
+                try:
+                    order = self.connector.create_market_order(symbol, "buy", qty)
+                    exchange_order_id = str(order.get("id")) if order else None
+                    price = float(order.get("average") or order.get("price") or price)
+                except Exception as exc:
+                    return False, f"Exchange order failed: {exc}", None
+            else:
+                self.paper_balance -= qty * price
+                save_paper_balance(db, self.paper_balance, self.user_id)
+            sl = stop_loss or self._auto_stop(price, "buy")
+            tp = take_profit or self._auto_take(price, "buy")
+            stop_order_id: str | None = None
+            if self.settings.is_live and sl:
+                stop_order = self.connector.create_stop_loss_order(
+                    symbol, "sell", qty, sl
+                )
+                if stop_order:
+                    stop_order_id = str(stop_order.get("id"))
+            trade = Trade(
+                symbol=symbol, side="buy", amount=qty, entry_price=price,
+                stop_loss=sl, take_profit=tp, status=TradeStatus.open.value,
+                mode=self.settings.trading_mode, source=source,
+                exchange_order_id=exchange_order_id, stop_order_id=stop_order_id,
+                note=note, opened_at=_utcnow(), user_id=self.user_id,
+            )
+            db.add(trade)
+            db.commit()
+            db.refresh(trade)
+            self._emit("trade_opened", {"id": trade.id, "symbol": symbol, "side": "buy"})
+            self._notify(
+                f"\U0001F4C8 Opened <b>BUY</b> {qty:.8f} {symbol} @ {price:.2f} "
+                f"({self.settings.trading_mode}) [{note}]"
+            )
+            return True, f"Opened buy {qty:.8f} {symbol} @ {price:.2f}", trade
+
+        # ---- limit leg: rest until price crosses ----
+        lp = float(limit_price or 0.0)
+        if lp <= 0:
+            return False, "Invalid limit price for scaled leg", None
+        exchange_order_id = None
+        if self.settings.is_live:
+            adj_qty, err = self.connector.normalize_amount(symbol, qty, lp)
+            if err:
+                return False, f"Rejected: {err}", None
+            qty = adj_qty
+            try:
+                order = self.connector.create_limit_order(symbol, "buy", qty, lp)
+                exchange_order_id = str(order.get("id")) if order else None
+            except Exception as exc:
+                return False, f"Exchange limit order failed: {exc}", None
+        else:
+            self.paper_balance -= qty * lp
+            save_paper_balance(db, self.paper_balance, self.user_id)
+        trade = Trade(
+            symbol=symbol, side="buy", amount=qty, entry_price=lp,
+            status=TradeStatus.pending.value, order_type="limit", limit_price=lp,
+            stop_loss=stop_loss, take_profit=take_profit,
+            mode=self.settings.trading_mode, source=source,
+            exchange_order_id=exchange_order_id, note=note,
+            opened_at=_utcnow(), user_id=self.user_id,
+        )
+        db.add(trade)
+        db.commit()
+        db.refresh(trade)
+        self._emit(
+            "order_pending",
+            {"id": trade.id, "symbol": symbol, "side": "buy", "limit_price": lp},
+        )
+        self._notify(
+            f"\U0001F4DD Limit BUY {qty:.8f} {symbol} resting @ {lp:.2f} "
+            f"({self.settings.trading_mode}) [{note}]"
+        )
+        return True, f"Limit buy {qty:.8f} {symbol} resting @ {lp:.2f}", trade
+
+    def execute_scaled_entry(
+        self,
+        db: Session,
+        *,
+        symbol: str,
+        amount: float | None,
+        legs: int,
+        step_pct: float,
+        first_at_market: bool,
+        stop_loss: float | None,
+        take_profit: float | None,
+        source: str,
+        note: str | None = None,
+    ) -> tuple[bool, str, list[Trade]]:
+        """Open a BUY position in scaled (DCA) legs to average the entry price.
+
+        Splits one buy into ``legs`` tranches: the first optionally at market, the
+        rest as resting limit orders stepped ``step_pct``% apart BELOW it. As the
+        price dips, more legs fill and the average entry improves; if it never
+        dips, only the market/first leg fills — so a single badly-timed entry is
+        avoided. Each filled leg becomes its OWN protected position (its own
+        SL/TP). Buy-side only (spot can't be scaled short); the caller opts in.
+
+        The TOTAL size is validated ONCE by the risk manager (slots, daily-loss,
+        exposure) then split equally across legs, so scaling never risks more than
+        a normal single entry. Returns (accepted, message, created_trades).
+        """
+        symbol = symbol.upper().strip()
+        if legs < 2:
+            return False, "Scaled entry needs at least 2 legs", []
+        if legs > 20:
+            return False, "Scaled entry allows at most 20 legs", []
+        if step_pct <= 0:
+            return False, "Scaled entry step % must be positive", []
+
+        with self._lock:
+            # Don't stack onto an existing position/resting order for this symbol.
+            existing = self._open_trade_for_symbol(db, symbol)
+            if existing:
+                state = (
+                    "resting limit"
+                    if existing.status == TradeStatus.pending.value
+                    else "open"
+                )
+                return False, (
+                    f"Already in a {state} position for {symbol}; close it before "
+                    "scaling in"
+                ), []
+            # Account-level kill-switch: refuse ALL new entries on drawdown halt.
+            blocked, why = self._drawdown_block(db)
+            if blocked:
+                return False, f"Rejected by risk manager: {why}", []
+            # Reserve slots for ALL legs up front so we never place a few then
+            # fail partway for lack of capacity.
+            current = len(self.risk.open_positions(db))
+            if current + legs > self.settings.max_open_positions:
+                free = max(self.settings.max_open_positions - current, 0)
+                return False, (
+                    f"Scaled entry needs {legs} slots but only {free} free "
+                    f"(max {self.settings.max_open_positions}). Reduce legs or "
+                    "close positions."
+                ), []
+            price = self._price(symbol)
+            if price <= 0:
+                return False, f"Could not fetch a valid price for {symbol}", []
+            equity = self._equity(db)
+            # Size the TOTAL once (validates daily-loss, notional, exposure), then
+            # split equally. Sizing uses the CURRENT price, which is conservative
+            # because most legs rest below it (slightly less notional than sized).
+            decision = self.risk.check(
+                db, equity=equity, price=price, requested_amount=amount,
+                is_opening=True, stop_price=stop_loss,
+                day_unrealized=self._open_unrealized(db),
+            )
+            if not decision.allowed:
+                return False, f"Rejected by risk manager: {decision.reason}", []
+            leg_qty = decision.amount / legs
+            if leg_qty <= 0:
+                return False, (
+                    "Per-leg size rounds to zero — reduce legs or increase amount"
+                ), []
+
+            # Ladder DOWN for a long: leg 0 at current price, each next leg
+            # step_pct% lower, so dips improve the average entry.
+            step = step_pct / 100.0
+            created: list[Trade] = []
+            for i in range(legs):
+                leg_price = price * (1 - i * step)
+                if leg_price <= 0:
+                    break  # ladder walked to/below zero — stop adding legs
+                tag = f"{(note + ' | ') if note else ''}DCA {i + 1}/{legs}"
+                if i == 0 and first_at_market:
+                    ok, msg, trade = self._place_leg(
+                        db, symbol=symbol, qty=leg_qty, kind="market",
+                        limit_price=None, stop_loss=stop_loss,
+                        take_profit=take_profit, source=source,
+                        note=f"{tag} market",
+                    )
+                else:
+                    ok, msg, trade = self._place_leg(
+                        db, symbol=symbol, qty=leg_qty, kind="limit",
+                        limit_price=leg_price, stop_loss=stop_loss,
+                        take_profit=take_profit, source=source,
+                        note=f"{tag} @ {leg_price:.2f}",
+                    )
+                if not ok or trade is None:
+                    # Legs already placed are REAL orders — don't silently roll
+                    # them back. Report honestly what was placed and why the next
+                    # leg failed. If none placed, it's a clean rejection.
+                    if not created:
+                        return False, f"Scaled entry rejected: {msg}", []
+                    return True, (
+                        f"Scaled entry partially placed: {len(created)} of {legs} "
+                        f"legs for {symbol}. Leg {len(created) + 1} failed: {msg}"
+                    ), created
+                created.append(trade)
+
+            if not created:
+                return False, "Scaled entry placed no legs", []
+            n_market = 1 if first_at_market else 0
+            n_rest = max(len(created) - n_market, 0)
+            return True, (
+                f"Scaled buy: {len(created)} legs for {symbol} "
+                f"({n_market} at market, {n_rest} resting, step {step_pct:.2f}%)."
+            ), created
+
+    def close_symbol(self, db: Session, symbol: str) -> tuple[int, float, list[str]]:
+        """Close every OPEN position and cancel every RESTING order for a symbol.
+
+        One-action exit for a scaled (multi-leg) DCA entry so a ladder is never
+        left half-managed. Acquires the lock once and reuses the existing close/
+        cancel helpers (which assume the caller holds it). Returns
+        (num_affected, total_realized_pnl, messages).
+        """
+        symbol = symbol.upper().strip()
+        affected = 0
+        total_pnl = 0.0
+        msgs: list[str] = []
+        with self._lock:
+            rows = list(
+                db.scalars(
+                    self._scope(
+                        select(Trade).where(
+                            Trade.symbol == symbol,
+                            Trade.status.in_(
+                                [TradeStatus.open.value, TradeStatus.pending.value]
+                            ),
+                        )
+                    )
+                ).all()
+            )
+            for t in rows:
+                db.refresh(t)
+                if t.status == TradeStatus.pending.value:
+                    ok, msg, tr = self._cancel_pending(db, t, "close-all")
+                elif t.status == TradeStatus.open.value:
+                    ok, msg, tr = self._close_trade(db, t, "close-all")
+                else:
+                    continue
+                if ok:
+                    affected += 1
+                    if tr is not None:
+                        total_pnl += tr.pnl or 0.0
+                    msgs.append(msg)
+        return affected, total_pnl, msgs
+
+
     def _auto_stop(self, price: float, side: str) -> float:
         pct = self.settings.default_stop_loss_pct / 100.0
         return price * (1 - pct) if side == "buy" else price * (1 + pct)

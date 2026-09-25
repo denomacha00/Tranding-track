@@ -182,6 +182,13 @@ function Dashboard({
   const [stopLoss, setStopLoss] = useState('')
   const [takeProfit, setTakeProfit] = useState('')
   const [placing, setPlacing] = useState(false)
+  // Scaled / DCA entry controls (buy-only; splits one entry into laddered legs).
+  const [scaleIn, setScaleIn] = useState(false)
+  const [legs, setLegs] = useState('3')
+  const [stepPct, setStepPct] = useState('1')
+  const [firstAtMarket, setFirstAtMarket] = useState(true)
+  const [scaling, setScaling] = useState(false)
+  const [closingAll, setClosingAll] = useState(false)
   const [closing, setClosing] = useState<number | null>(null)
   const [toast, setToast] = useState<Toast>(null)
   const [tab, setTab] = useState<TabKey>('trades')
@@ -430,6 +437,90 @@ function Dashboard({
     }
   }
 
+  const doScaledOrder = async () => {
+    if (scaling) return // guard against double-submit
+    const amt = amount ? Number(amount) : undefined
+    const sl = stopLoss ? Number(stopLoss) : undefined
+    const tp = takeProfit ? Number(takeProfit) : undefined
+    const nLegs = Number(legs)
+    const step = Number(stepPct)
+    if (!Number.isInteger(nLegs) || nLegs < 2 || nLegs > 20) {
+      showToast('error', 'Legs must be a whole number between 2 and 20.')
+      return
+    }
+    if (!Number.isFinite(step) || step <= 0 || step > 50) {
+      showToast('error', 'Step % must be greater than 0 and at most 50.')
+      return
+    }
+    const nums: [string, number | undefined][] = [
+      ['Amount', amt],
+      ['Stop loss', sl],
+      ['Take profit', tp],
+    ]
+    for (const [label, v] of nums) {
+      if (v !== undefined && (!Number.isFinite(v) || v <= 0)) {
+        showToast('error', `${label} must be a positive number.`)
+        return
+      }
+    }
+    // Same real-money confirm gate as doOrder: confirm unless we KNOW it's paper.
+    if (status?.trading_mode !== 'paper') {
+      const knownLive = status?.trading_mode === 'live'
+      const parts = [
+        `Scaled BUY ${symbol}`,
+        `${nLegs} legs, ${step}% apart`,
+        firstAtMarket ? 'first leg at market' : 'all resting limits',
+        amt ? `total amount ${amt}` : 'auto-sized by risk',
+      ]
+      if (sl) parts.push(`stop-loss ${sl}`)
+      if (tp) parts.push(`take-profit ${tp}`)
+      const header = knownLive
+        ? 'LIVE SCALED ORDER — this uses real funds on your Binance account.'
+        : 'Trading mode not confirmed yet — this MAY place REAL orders on your Binance account.'
+      if (!window.confirm(`${header}\n\n${parts.join('  ·  ')}\n\nPlace this scaled entry?`)) return
+    }
+    setScaling(true)
+    try {
+      const res = await api.scaledOrder({
+        symbol,
+        amount: amt,
+        legs: nLegs,
+        step_pct: step,
+        first_at_market: firstAtMarket,
+        stop_loss: sl,
+        take_profit: tp,
+      })
+      showToast(res.accepted ? 'ok' : 'error', res.message)
+      refreshTrades()
+    } catch (e) {
+      showToast('error', (e as Error).message)
+    } finally {
+      setScaling(false)
+    }
+  }
+
+  const doCloseAll = async () => {
+    if (closingAll) return // one bulk-close at a time
+    // Same conservative gate as closeTrade: confirm unless we KNOW it's paper.
+    if (status?.trading_mode !== 'paper') {
+      const msg =
+        status?.trading_mode === 'live'
+          ? `Close ALL LIVE ${symbol} positions and cancel any resting orders at market now?`
+          : `Trading mode not confirmed yet — this may close REAL ${symbol} positions at market. Continue?`
+      if (!window.confirm(msg)) return
+    }
+    setClosingAll(true)
+    try {
+      const res = await api.closeAll(symbol)
+      showToast(res.closed > 0 ? 'ok' : 'error', res.message)
+      refreshTrades()
+    } catch (e) {
+      showToast('error', (e as Error).message)
+    } finally {
+      setClosingAll(false)
+    }
+  }
+
   const toggleBot = async () => {
     if (!status) return
     try {
@@ -630,7 +721,7 @@ function Dashboard({
                   <input className="input" value={symbol} readOnly />
                 </div>
                 <div className="field">
-                  <label>Amount (blank = auto-size by risk)</label>
+                  <label>{scaleIn ? 'Total amount across all legs (blank = auto)' : 'Amount (blank = auto-size by risk)'}</label>
                   <input
                     className="input"
                     placeholder="auto"
@@ -640,13 +731,14 @@ function Dashboard({
                   />
                 </div>
                 <div className="field">
-                  <label>Limit price (blank = market)</label>
+                  <label>{scaleIn ? 'Limit price (set by ladder)' : 'Limit price (blank = market)'}</label>
                   <input
                     className="input"
-                    placeholder="market"
-                    value={limitPrice}
+                    placeholder={scaleIn ? 'stepped per leg' : 'market'}
+                    value={scaleIn ? '' : limitPrice}
                     onChange={(e) => setLimitPrice(e.target.value)}
                     inputMode="decimal"
+                    disabled={scaleIn}
                   />
                 </div>
                 <div className="field">
@@ -669,12 +761,67 @@ function Dashboard({
                     inputMode="decimal"
                   />
                 </div>
-                <button className="btn buy" onClick={() => doOrder('buy')} disabled={placing}>
-                  {placing ? 'Placing…' : 'Buy'}
+                {scaleIn && (
+                  <>
+                    <div className="field">
+                      <label>Legs (2–20)</label>
+                      <input
+                        className="input"
+                        placeholder="3"
+                        value={legs}
+                        onChange={(e) => setLegs(e.target.value)}
+                        inputMode="numeric"
+                      />
+                    </div>
+                    <div className="field">
+                      <label>Step % between legs</label>
+                      <input
+                        className="input"
+                        placeholder="1"
+                        value={stepPct}
+                        onChange={(e) => setStepPct(e.target.value)}
+                        inputMode="decimal"
+                      />
+                    </div>
+                  </>
+                )}
+                {scaleIn ? (
+                  <button className="btn buy" onClick={doScaledOrder} disabled={scaling}>
+                    {scaling ? 'Placing…' : 'Scaled buy'}
+                  </button>
+                ) : (
+                  <>
+                    <button className="btn buy" onClick={() => doOrder('buy')} disabled={placing}>
+                      {placing ? 'Placing…' : 'Buy'}
+                    </button>
+                    <button className="btn sell" onClick={() => doOrder('sell')} disabled={placing}>
+                      {placing ? 'Placing…' : 'Sell'}
+                    </button>
+                  </>
+                )}
+                <button className="btn ghost" onClick={doCloseAll} disabled={closingAll}>
+                  {closingAll ? 'Closing…' : `Close all ${symbol}`}
                 </button>
-                <button className="btn sell" onClick={() => doOrder('sell')} disabled={placing}>
-                  {placing ? 'Placing…' : 'Sell'}
-                </button>
+              </div>
+              <div className="row" style={{ marginTop: 8 }}>
+                <label className="check">
+                  <input
+                    type="checkbox"
+                    checked={scaleIn}
+                    onChange={(e) => setScaleIn(e.target.checked)}
+                  />
+                  Scale in (DCA) — split one buy into a ladder of legs
+                </label>
+                {scaleIn && (
+                  <label className="check">
+                    <input
+                      type="checkbox"
+                      checked={firstAtMarket}
+                      onChange={(e) => setFirstAtMarket(e.target.checked)}
+                    />
+                    First leg at market (rest are resting limits)
+                  </label>
+                )}
               </div>
               <p className="hint" style={{ marginTop: 10 }}>
                 Orders respect your risk settings. In <b>paper</b> mode nothing hits the exchange;
@@ -682,6 +829,13 @@ function Dashboard({
                 <b> limit price</b> to rest the order until the market reaches it (a buy fills at or
                 below it, a sell at or above it); leave it blank for an immediate market order. A
                 blank <b>stop-loss</b>/<b>take-profit</b> uses your configured default percentages.
+                <br />
+                <b>Scale in (DCA)</b> splits a single buy into a ladder of legs stepped below the
+                current price. The <b>total</b> is sized once by your risk manager, then divided
+                equally — so a ladder never risks more than one entry. The first leg can fill at
+                market; the rest rest as limit orders and each filled leg gets its own
+                stop-loss/take-profit. <b>Close all {symbol}</b> exits every open position and
+                cancels every resting leg for the symbol in one click.
               </p>
             </div>
           </section>
