@@ -26,7 +26,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from app import __version__
@@ -36,6 +36,8 @@ from app.database import get_db, init_db
 from app.deps import get_current_user, require_admin, require_licensed_user
 from app.ratelimit import client_ip, limiter
 from app.models import (
+    LicenseKey,
+    LicenseKeyStatus,
     LicenseStatus,
     SignalLog,
     Trade,
@@ -47,10 +49,14 @@ from app.schemas import (
     BotStatus,
     CredentialsUpdate,
     ExecutionResult,
+    LicenseKeyCreate,
+    LicenseKeyCreated,
+    LicenseKeyOut,
     LicenseUpdate,
     LoginRequest,
     ManualOrder,
     MeOut,
+    RedeemLicenseKey,
     SettingsOut,
     SettingsUpdate,
     SignalOut,
@@ -64,7 +70,9 @@ from app.schemas import (
 from app.security import (
     create_access_token,
     encrypt_secret,
+    hash_license_key,
     hash_password,
+    new_license_key,
     new_webhook_token,
     secrets_enabled,
     verify_password,
@@ -823,6 +831,86 @@ def market_news(
     return {"items": items, "errors": errors}
 
 
+def _assistant_account_context(db: Session, user: User, engine) -> str:
+    """NON-secret snapshot of the asking user's OWN account for the assistant.
+
+    Privacy: only this user's own, non-secret data — never API keys, secrets,
+    passwords, the raw webhook token, or any other user's rows — sent solely to
+    the operator's configured AI provider so the assistant can be concrete about
+    *this* account. Best-effort: any part that can't be read is simply omitted.
+    """
+    gs = get_settings()
+    s = engine.settings
+    keys_set = bool(user.binance_api_key_enc and user.binance_api_secret_enc)
+    lines: list[str] = [
+        f"- Account: {user.email} (role={user.role}, licence={user.license_status})",
+        "- Exchange keys: "
+        + ("set" if keys_set else "NOT set")
+        + f"; testnet={'on' if user.binance_testnet else 'off'}; secure storage "
+        + ("on" if secrets_enabled(gs.secret_key) else "OFF (operator hasn't set SECRET_KEY)"),
+        "- Built-in AI: "
+        + ("configured" if gs.ai_api_key else "not configured")
+        + f"; TradingView webhook: {'configured (private)' if user.webhook_token else 'not set'}",
+    ]
+    try:
+        st = engine.status(db)
+        lines += [
+            f"- Mode: {st.get('trading_mode')} (testnet={st.get('testnet')}, running={st.get('running')})",
+            f"- Positions: {st.get('open_positions')}/{st.get('max_open_positions')}; "
+            f"balance {st.get('balance')}, equity {st.get('equity')}",
+            f"- PnL realized {st.get('realized_pnl')}, unrealized "
+            f"{st.get('unrealized_pnl')}, today {st.get('day_pnl')}",
+        ]
+    except Exception:
+        pass
+    lines.append(
+        f"- Autonomous: {'on' if s.auto_trade_enabled else 'off'} "
+        f"(symbols={s.auto_symbols or 'none'}, tf={s.auto_timeframe}, "
+        f"confirm_tf={s.auto_confirm_timeframe or 'off'}, min_conf={s.min_signal_confidence}); "
+        f"AI trade review {'on' if getattr(s, 'ai_trade_confirm', False) else 'off'}"
+    )
+    # __ACCOUNT_CONTEXT_TAIL__
+    try:
+        open_rows = db.scalars(
+            select(Trade)
+            .where(Trade.user_id == user.id, Trade.status == "open")
+            .order_by(Trade.opened_at.desc())
+            .limit(10)
+        ).all()
+        lines.append(
+            "- Open trades: "
+            + (
+                "; ".join(
+                    f"{t.symbol} {t.side} {t.amount}@{t.entry_price} (pnl {t.pnl})"
+                    for t in open_rows
+                )
+                if open_rows
+                else "none"
+            )
+        )
+    except Exception:
+        pass
+    try:
+        sig_rows = db.scalars(
+            select(SignalLog)
+            .where(SignalLog.user_id == user.id)
+            .order_by(SignalLog.created_at.desc())
+            .limit(5)
+        ).all()
+        if sig_rows:
+            lines.append(
+                "- Recent signals: "
+                + "; ".join(
+                    f"{x.source}:{x.symbol or '-'} {x.action or '-'} "
+                    f"({'accepted' if x.accepted else 'rejected'})"
+                    for x in sig_rows
+                )
+            )
+    except Exception:
+        pass
+    return "\n".join(lines)
+
+
 @app.post("/api/ai/chat")
 def ai_chat(
     payload: dict,
@@ -857,23 +945,37 @@ def ai_chat(
         except Exception:
             analysis = None
 
-    bot_context: str | None
+    # Full NON-secret snapshot of THIS user's own account so the assistant can
+    # answer concretely ("how am I doing", "am I set up") — never any secret or
+    # another user's data (see _assistant_account_context).
     try:
-        st = engine.status(db)
-        bot_context = (
-            f"- Mode: {st.get('trading_mode')} (testnet={st.get('testnet')}, "
-            f"running={st.get('running')})\n"
-            f"- Open positions: {st.get('open_positions')}/{st.get('max_open_positions')}\n"
-            f"- Balance: {st.get('balance')}; equity: {st.get('equity')}\n"
-            f"- Realized PnL: {st.get('realized_pnl')}; unrealized: "
-            f"{st.get('unrealized_pnl')}; today: {st.get('day_pnl')}\n"
-            f"- Autonomous trading: "
-            f"{'on' if engine.settings.auto_trade_enabled else 'off'}; "
-            f"AI trade review: "
-            f"{'on' if getattr(engine.settings, 'ai_trade_confirm', False) else 'off'}"
-        )
+        bot_context: str | None = _assistant_account_context(db, user, engine)
     except Exception:
         bot_context = None
+
+    # Ground the assistant in the REAL exchange-connection state so it can tell
+    # the user, honestly, whether they're connected to Binance and — if not —
+    # exactly why and what to do. Best-effort: a probe failure must not break chat.
+    try:
+        acc = engine.connector.check_trading_access()
+        if acc.get("ok"):
+            conn = (
+                f"connected & trade-ready on {acc.get('exchange', 'binance')} "
+                f"({'testnet' if acc.get('testnet') else 'live'})"
+            )
+        else:
+            conn = (
+                f"NOT trade-ready on {acc.get('exchange', 'binance')} "
+                f"({'testnet' if acc.get('testnet') else 'live'}): "
+                f"public_data={'ok' if acc.get('can_read_public') else 'FAIL'}, "
+                f"account_read={'ok' if acc.get('can_read_account') else 'FAIL'}, "
+                f"trading={'ok' if acc.get('can_trade') else 'FAIL'}. "
+                f"Reason: {acc.get('detail')}"
+            )
+        line = f"\n- Exchange connection: {conn}"
+        bot_context = (bot_context + line) if bot_context else line.strip("\n- ")
+    except Exception:
+        pass
 
     news: list[dict] = []
     used_news = False
@@ -888,6 +990,23 @@ def ai_chat(
         question, analysis=analysis, bot_context=bot_context, news=news or None
     )
     return {"reply": reply, "ai_enabled": engine.ai.available, "used_news": used_news}
+
+
+@app.get("/api/ai/health")
+def ai_health(
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    """Real reachability check for the app's AI provider (no secrets returned).
+
+    Makes one tiny live request so the assistant dashboard can show a concrete
+    status — "connected", "key rejected (401)", "model not found (404)",
+    "unreachable" — instead of a silent failure. Rate-limited because it costs
+    a provider call.
+    """
+    _enforce_rate_limit(request, "ai", limit=20, window_seconds=60)
+    return _engine_for(db, user).ai.health()
 
 
 # ---- Strategies & training -----------------------------------------
@@ -1007,6 +1126,132 @@ def admin_delete_user(
     db.delete(target)
     db.commit()
     return {"deleted": user_id}
+
+
+# ---- Admin: licence keys (self-service activation) -----------------
+
+
+@app.get("/api/admin/license-keys", response_model=list[LicenseKeyOut])
+def admin_list_license_keys(
+    db: Session = Depends(get_db), _admin: User = Depends(require_admin)
+):
+    """Newest-first list of licence keys. Never returns plaintext keys."""
+    return list(db.scalars(select(LicenseKey).order_by(LicenseKey.id.desc())).all())
+
+
+@app.post("/api/admin/license-keys", response_model=LicenseKeyCreated)
+def admin_create_license_key(
+    body: LicenseKeyCreate,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """Mint a new licence key. The plaintext is returned ONCE here and never
+    stored — only its SHA-256 hash is persisted, so copy it now."""
+    plaintext = new_license_key()
+    key = LicenseKey(
+        key_hash=hash_license_key(plaintext),
+        key_prefix=plaintext[:7],  # "TT-Ab3" — recognisable, not guessable
+        label=(body.label or "").strip() or None,
+        status=LicenseKeyStatus.unused.value,
+        created_by=admin.id,
+    )
+    db.add(key)
+    db.commit()
+    db.refresh(key)
+    return LicenseKeyCreated(
+        id=key.id,
+        key_prefix=key.key_prefix,
+        label=key.label,
+        status=key.status,
+        created_at=key.created_at,
+        redeemed_by=key.redeemed_by,
+        redeemed_at=key.redeemed_at,
+        key=plaintext,
+    )
+
+
+@app.post("/api/admin/license-keys/{key_id}/revoke", response_model=LicenseKeyOut)
+def admin_revoke_license_key(
+    key_id: int,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    """Invalidate an UNUSED key so it can no longer be redeemed. A key that was
+    already redeemed can't be revoked here — revoke that user's licence instead."""
+    key = db.get(LicenseKey, key_id)
+    if not key:
+        raise HTTPException(status_code=404, detail="Licence key not found")
+    if key.status == LicenseKeyStatus.redeemed.value:
+        raise HTTPException(
+            status_code=400,
+            detail="That key was already redeemed. Revoke the user's licence in Users instead.",
+        )
+    key.status = LicenseKeyStatus.revoked.value
+    db.commit()
+    db.refresh(key)
+    return key
+
+
+@app.post("/api/license/redeem", response_model=MeOut)
+def redeem_license_key(
+    body: RedeemLicenseKey,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """A logged-in *pending* user activates their own account with a valid key.
+
+    A revoked licence cannot be self-restored with a key — that was an admin
+    action. Keys are single-use and claimed atomically to avoid double-redeem.
+    """
+    # Blunt brute-forcing of keys: cap redeem attempts per source IP.
+    _enforce_rate_limit(request, "redeem", limit=10, window_seconds=600)
+    if user.license_status == LicenseStatus.active.value:
+        raise HTTPException(status_code=400, detail="Your licence is already active.")
+    if user.license_status == LicenseStatus.revoked.value:
+        raise HTTPException(
+            status_code=403,
+            detail="Your licence was revoked by the administrator; a key can't restore it.",
+        )
+    from app.models import _utcnow
+
+    now = _utcnow()
+    # Atomically claim the key: only an *unused* key with this hash flips to
+    # redeemed. rowcount != 1 means no such unused key (bad / used / revoked /
+    # a racing redeemer won) — reject without leaking which case it was.
+    claimed = db.execute(
+        update(LicenseKey)
+        .where(
+            LicenseKey.key_hash == hash_license_key(body.key),
+            LicenseKey.status == LicenseKeyStatus.unused.value,
+        )
+        .values(
+            status=LicenseKeyStatus.redeemed.value,
+            redeemed_by=user.id,
+            redeemed_at=now,
+        )
+    ).rowcount
+    if claimed != 1:
+        db.rollback()
+        raise HTTPException(status_code=400, detail="Invalid or already-used licence key.")
+    user.license_status = LicenseStatus.active.value
+    if user.licensed_at is None:
+        user.licensed_at = now
+    db.commit()
+    db.refresh(user)
+    gs = get_settings()
+    return MeOut(
+        id=user.id,
+        email=user.email,
+        role=user.role,
+        license_status=user.license_status,
+        webhook_path=_webhook_path(user.webhook_token),
+        binance_keys_set=bool(user.binance_api_key_enc and user.binance_api_secret_enc),
+        binance_testnet=bool(user.binance_testnet),
+        ai_key_set=bool(gs.ai_api_key),
+        ai_model=gs.ai_model or "",
+        secrets_storage_enabled=secrets_enabled(gs.secret_key),
+    )
 
 
 # ---- WebSocket ------------------------------------------------------

@@ -146,10 +146,12 @@ select {
 }
 
 .brand .dot {
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: var(--accent);
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  background: var(--accent) url('/favicon.svg') center / cover no-repeat;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  flex: 0 0 auto;
 }
 
 .badge {
@@ -559,6 +561,9 @@ pre.code {
   font-weight: 600;
   font-size: 13px;
   margin-bottom: 8px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
 }
 
 .access-rows {
@@ -1033,6 +1038,41 @@ pre.code {
 .btn.sm { padding: 4px 8px; font-size: 12px; }
 .hint.tiny { font-size: 11px; margin: 0; }
 
+/* Assistant connection dashboard: AI + exchange status pills. */
+.conn-dash {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+.conn-pill {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 1 260px;
+  border: 1px solid var(--border);
+  border-left-width: 4px;
+  border-radius: 10px;
+  padding: 8px 12px;
+  background: var(--panel-2);
+  font-size: 12px;
+}
+.conn-pill.ok { border-left-color: var(--green); background: rgba(22, 199, 132, 0.08); }
+.conn-pill.bad { border-left-color: var(--red); background: rgba(234, 57, 67, 0.08); }
+.conn-pill.muted { border-left-color: var(--border); }
+.conn-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--muted);
+  flex: none;
+}
+.conn-pill.ok .conn-dot { background: var(--green); }
+.conn-pill.bad .conn-dot { background: var(--red); }
+.conn-label { font-weight: 600; }
+.conn-state { color: var(--muted); flex: 1 1 auto; min-width: 0; }
+.nav-cta { margin-top: 8px; }
+
 .news-col {
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -1063,3 +1103,52 @@ pre.code {
 @media (prefers-reduced-motion: reduce) {
   .btn.mic.rec, .conf-fill, .toggle, .toggle .knob { animation: none; transition: none; }
 }
+
+/* ============================================================
+   Auth / activation screen polish + licence-key admin panel.
+   Makes the first screen read as a trading terminal, not a
+   generic form, and styles the one-time key reveal.
+   ============================================================ */
+.auth-wrap {
+  background:
+    radial-gradient(1100px 480px at 50% -10%, var(--accent-soft), transparent 70%),
+    var(--bg);
+}
+.auth-card {
+  position: relative;
+  overflow: hidden;
+}
+/* Thin brand accent bar across the top of the auth card. */
+.auth-card::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: 3px;
+  background: linear-gradient(90deg, var(--green), var(--accent), var(--red));
+}
+.auth-card .brand .dot { width: 30px; height: 30px; border-radius: 8px; }
+.auth-tagline {
+  font-size: 12px;
+  color: var(--muted);
+  letter-spacing: 0.3px;
+  margin: -4px 0 2px;
+}
+
+/* One-time licence-key reveal (admin) + generic key value display. */
+.callout {
+  border: 1px solid var(--accent);
+  border-left-width: 4px;
+  background: var(--accent-soft);
+  border-radius: 10px;
+  padding: 12px 14px;
+}
+.keyval {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 13px;
+}
+/* Status pills used in the admin users + keys tables. */
+.tag.on { background: rgba(22, 199, 132, 0.15); color: var(--green); }
+.tag.off { background: rgba(234, 57, 67, 0.15); color: var(--red); }

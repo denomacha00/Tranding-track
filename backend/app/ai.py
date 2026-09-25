@@ -40,13 +40,85 @@ _SYSTEM_ANALYST = (
 
 _SYSTEM_ASSISTANT = (
     "You are the in-app assistant for the Tranding-track trading bot, talking to "
-    "its operator about THEIR own account. You can explain the bot, read the "
-    "current market analysis, reason about strategy/skills, weigh in on a "
-    "decision, and factor in recent real news. You are risk-first and honest: "
+    "its operator about THEIR own account. You are also the app's guide: users may "
+    "ask how the app works or how to do something (add exchange keys, go live, run "
+    "a backtest, connect TradingView, read a signal) — walk them through it using "
+    "the APP GUIDE, and never invent features that aren't in it. You are given a "
+    "live, NON-secret snapshot of THIS user's own account; ground every answer in "
+    "it and be concrete about their real numbers and state. You can explain the "
+    "bot, read the current market analysis, reason about strategy/skills, weigh in "
+    "on a decision, and factor in recent real news. You are risk-first and honest: "
     "you never promise profit, you flag weak/conflicted setups, and you remember "
     "this is real money. You cannot place orders or change settings yourself — "
     "recommend actions and tell the operator exactly which control to use; they "
     "confirm and execute. Never ask for or repeat secrets/API keys."
+)
+
+# What the assistant knows about the product itself, so "how does this work?" and
+# "how do I…" questions get accurate, specific answers instead of generic ones.
+# Kept factual to the real features; do not describe anything the app can't do.
+_APP_GUIDE = (
+    "APP GUIDE — how Tranding-track works (answer how-to questions from this; don't "
+    "invent features):\n"
+    "• Purpose: a multi-user crypto trading bot. Each user has their own isolated "
+    "account, settings, trades and (optional) exchange keys — no user sees another's "
+    "data.\n"
+    "• Access: sign up with email + password, then activate an ACTIVE licence. A "
+    "pending user redeems a licence key (Login screen or the in-app banner); admins "
+    "mint keys and manage users in the Admin panel.\n"
+    "• Trading modes: 'paper' simulates orders with no real money (safe default); "
+    "'live' places REAL orders. Change it in Settings → Trading mode; always prove a "
+    "strategy in paper/testnet first.\n"
+    "• Exchange keys: Settings → 'Your Binance API keys'. Paste TRADE-ONLY keys "
+    "(withdrawals OFF); they're encrypted at rest and never shown again. Tick 'Use "
+    "Binance testnet' for fake-money testing. Saving immediately runs a live "
+    "connection test and reports whether it truly connected.\n"
+    "• Connection status: the Settings access-card and its 'Test connection' button "
+    "show — live — whether the app can read public data, read the account, and "
+    "trade. HTTP 451 means the exchange is geo-blocking the SERVER's region (not a "
+    "key problem): the operator must deploy in a supported region, set an "
+    "EXCHANGE_HTTP_PROXY, or (US) EXCHANGE_ID=binanceus.\n"
+    "• Manual trading (Trades tab / trade panel): buy, sell or close a symbol; "
+    "stop-loss / take-profit default from Settings. Open positions and history show "
+    "in Trades.\n"
+    "• Risk rules (Settings): risk per trade %, daily loss limit %, default "
+    "stop-loss / take-profit %, trailing stop %, max open positions, max total "
+    "exposure %, min signal confidence. The bot enforces these — advise within them.\n"
+    "• Autonomous trading: 'Enable autonomous trading' lets the bot act on its "
+    "analyzer for the chosen auto symbols/timeframe. Optional 'AI trade review' lets "
+    "the AI VETO a risky entry — it can never invent, size or force a trade.\n"
+    "• Tools: Analyze (deterministic buy/sell/hold verdict + factors, with optional "
+    "AI narration/assessment), Backtest (test a strategy on history), Train (search "
+    "strategy parameters on historical data).\n"
+    "• Signals tab: a timeline of every analyzer/webhook signal, whether it was "
+    "accepted, and its confidence.\n"
+    "• TradingView: each user has a private webhook URL (Settings). Point a "
+    "TradingView alert at it with a JSON message to trade from alerts — there is no "
+    "TradingView API key; the URL itself is the credential, keep it private.\n"
+    "• News: the assistant can attach REAL public market headlines on request; an "
+    "empty list means the feeds were unreachable, never fabricated.\n"
+    "• The AI assistant (you): built into the app and funded by the operator — users "
+    "never enter an AI key. You advise only; you cannot place orders or change "
+    "settings.\n"
+    "• Privacy & security: keys/secrets are encrypted at rest and isolated per user. "
+    "You receive only a NON-secret snapshot of the asking user's OWN account — never "
+    "keys, passwords, the webhook token, or any other user's data."
+)
+
+# The assistant has "hands": when the user asks to be shown or taken somewhere, it
+# can emit a navigation action the app executes (the frontend turns it into a
+# button that switches to that screen). This never changes data — it only moves
+# the user around the UI — so it's safe to act on without a confirmation step.
+_NAV_ACTIONS = (
+    "NAVIGATION: if the user asks to be shown or taken to part of the app (e.g. "
+    "\"show me my trades\", \"take me to settings\", \"where do I add my keys\", "
+    "\"open the assistant\"), answer briefly THEN append on its own final line a tag "
+    "of the form [[goto:<dest>]] where <dest> is exactly one of: trades, signals, "
+    "assistant, analyze, train, backtest, settings, admin. Use settings for adding "
+    "exchange keys, testing the connection, or changing risk/mode. Only ever emit "
+    "one tag, only when the user actually wants to go somewhere, and never invent a "
+    "destination outside that list. The tag is machine-read and hidden from the "
+    "user, so keep your sentence self-contained."
 )
 
 
@@ -61,6 +133,9 @@ class AICommentator:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
+        # Human-readable reason the last provider call failed (no secrets). Lets
+        # the UI/assistant say WHY the AI didn't answer instead of a vague retry.
+        self._last_error: str = ""
 
     def reload(self, settings: Settings) -> None:
         self._settings = settings
@@ -87,7 +162,9 @@ class AICommentator:
     ) -> Optional[str]:
         """Send one system+user turn and return the text reply, or None on failure."""
         if not self.available:
+            self._last_error = "no AI key configured"
             return None
+        self._last_error = ""
         max_tokens = max_tokens or self._settings.ai_max_tokens
         base = self._settings.ai_base_url.rstrip("/")
         timeout = self._settings.ai_timeout_seconds
@@ -132,7 +209,9 @@ class AICommentator:
                 data = resp.json()
                 return data["choices"][0]["message"]["content"].strip()
         except Exception as exc:
-            logger.warning("AI request failed: %s", exc)
+            self._last_error = _describe_ai_error(exc)
+            # Log the category, never the key or full payload.
+            logger.warning("AI request failed: %s", self._last_error)
             return None
 
     # ---- public API --------------------------------------------------
@@ -182,10 +261,10 @@ class AICommentator:
         context = ""
         if analysis is not None:
             context = "\n\nCurrent analysis JSON:\n" + json.dumps(analysis.as_dict())
-        return (
-            self._post(_SYSTEM_ANALYST, question + context)
-            or "AI request failed; please try again."
-        )
+        reply = self._post(_SYSTEM_ANALYST, question + context)
+        if reply is not None:
+            return reply
+        return f"AI request failed: {self._last_error}."
 
     def chat(
         self,
@@ -234,7 +313,51 @@ class AICommentator:
             "execute it — the operator stays in control and confirms every order. "
             "Weigh downside first and never promise profit."
         )
-        return self._post(_SYSTEM_ASSISTANT, prompt) or "AI request failed; please try again."
+        # System prompt = who you are + how the app works + how to navigate it, so
+        # the assistant can both explain the product and drive the UI on request.
+        system = _SYSTEM_ASSISTANT + "\n\n" + _APP_GUIDE + "\n\n" + _NAV_ACTIONS
+        reply = self._post(system, prompt)
+        if reply is not None:
+            return reply
+        return (
+            "I couldn't reach the AI provider right now — "
+            f"{self._last_error}. Your bot and its data are unaffected; this only "
+            "means the chat/LLM couldn't answer. The operator can check the "
+            "AI_API_KEY / AI_BASE_URL / AI_MODEL / AI_API_STYLE settings."
+        )
+
+    def health(self) -> dict[str, Any]:
+        """Live check that the configured AI provider actually answers.
+
+        Makes ONE tiny real request (no fabrication). Returns non-secret status
+        the UI can show so "the AI isn't working" becomes a concrete reason
+        (bad key, wrong model, unreachable) instead of a mystery. The API key
+        itself is never included.
+        """
+        status: dict[str, Any] = {
+            "enabled": self.available,
+            "ok": False,
+            "model": self._settings.ai_model,
+            "base_url": self._settings.ai_base_url,
+            "style": self._style(),
+            "detail": "",
+        }
+        if not self.available:
+            status["detail"] = (
+                "No AI key configured. The operator sets AI_API_KEY (and "
+                "optionally AI_BASE_URL / AI_MODEL / AI_API_STYLE) on the server."
+            )
+            return status
+        reply = self._post(_SYSTEM_ASSISTANT, "Reply with exactly: ok", max_tokens=5)
+        if reply:
+            status["ok"] = True
+            status["detail"] = (
+                f"AI provider reachable and the key works ({self._style()} style, "
+                f"model {self._settings.ai_model})."
+            )
+        else:
+            status["detail"] = self._last_error or "AI request failed."
+        return status
 
     def confirm_trade(self, analysis: MarketAnalysis) -> tuple[bool, str]:
         """Risk-first AI review of a proposed ENTRY. Returns (proceed, reason).
@@ -298,6 +421,38 @@ class AICommentator:
             f"- Max total exposure: {getattr(s, 'max_total_exposure_pct', 0)}% "
             "(0 = uncapped)"
         )
+
+
+def _describe_ai_error(exc: Exception) -> str:
+    """Turn a provider exception into a short, secret-free reason string.
+
+    Never includes the API key or full request/response body — only the failure
+    category, so it is safe to show the user and log.
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        if code in (401, 403):
+            return (
+                f"the AI provider rejected the key (HTTP {code}) — check AI_API_KEY "
+                "and that AI_API_STYLE matches the provider"
+            )
+        if code == 404:
+            return (
+                "the AI model or endpoint was not found (HTTP 404) — check "
+                "AI_MODEL and AI_BASE_URL"
+            )
+        if code == 429:
+            return "the AI provider is rate-limiting (HTTP 429) — wait and retry"
+        if 500 <= code < 600:
+            return f"the AI provider had a server error (HTTP {code}) — retry shortly"
+        return f"the AI provider returned HTTP {code}"
+    if isinstance(exc, httpx.TimeoutException):
+        return "the AI provider timed out — it may be slow or unreachable"
+    if isinstance(exc, httpx.ConnectError):
+        return "could not reach the AI provider — check the network or AI_BASE_URL"
+    if isinstance(exc, (KeyError, IndexError, ValueError)):
+        return "the AI provider returned an unexpected response format"
+    return f"AI request error ({type(exc).__name__})"
 
 
 def _extract_json(text: str) -> str:

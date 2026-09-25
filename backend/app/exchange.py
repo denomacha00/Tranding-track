@@ -56,13 +56,25 @@ class BinanceConnector:
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
-        self._client: Optional[ccxt.binance] = None
+        self._client: Optional[ccxt.Exchange] = None
         self._markets: Optional[dict[str, Any]] = None
+        self._exchange_id: str = "binance"
         self._connect()
 
     def _connect(self) -> None:
         try:
-            client = ccxt.binance(
+            exchange_id = (
+                getattr(self._settings, "exchange_id", "") or "binance"
+            ).strip().lower()
+            exchange_cls = getattr(ccxt, exchange_id, None)
+            if exchange_cls is None:
+                logger.warning(
+                    "unknown exchange id %r; falling back to binance", exchange_id
+                )
+                exchange_cls = ccxt.binance
+                exchange_id = "binance"
+            self._exchange_id = exchange_id
+            client = exchange_cls(
                 {
                     "apiKey": self._settings.binance_api_key or None,
                     "secret": self._settings.binance_api_secret or None,
@@ -77,12 +89,31 @@ class BinanceConnector:
                     },
                 }
             )
+            # Optional egress proxy: lets a server in a Binance-blocked region
+            # route requests through a proxy in an allowed region. Empty (the
+            # default) = direct connection, so existing setups are unchanged.
+            proxy = (getattr(self._settings, "exchange_http_proxy", "") or "").strip()
+            if proxy:
+                try:
+                    client.httpProxy = proxy
+                    client.httpsProxy = proxy
+                except Exception as exc:  # pragma: no cover - defensive
+                    logger.warning("could not set exchange proxy: %s", exc)
             if self._settings.binance_testnet:
-                # ccxt unified sandbox switch -> Binance spot testnet endpoints
-                client.set_sandbox_mode(True)
+                # ccxt unified sandbox switch -> exchange testnet endpoints. Not
+                # every exchange exposes a sandbox (e.g. binanceus); don't crash
+                # the whole connector if it isn't supported.
+                try:
+                    client.set_sandbox_mode(True)
+                except Exception as exc:
+                    logger.warning(
+                        "%s has no testnet/sandbox; using live endpoints: %s",
+                        exchange_id,
+                        exc,
+                    )
             self._client = client
         except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("Failed to initialise Binance client: %s", exc)
+            logger.warning("Failed to initialise exchange client: %s", exc)
             self._client = None
 
     @property
@@ -311,6 +342,7 @@ class BinanceConnector:
             "can_read_account": False,
             "can_trade": False,
             "testnet": self._settings.binance_testnet,
+            "exchange": self._exchange_id,
             "detail": "",
         }
         if not self._client:
@@ -327,9 +359,13 @@ class BinanceConnector:
             low = msg.lower()
             if "451" in msg or "restricted location" in low or "eligibility" in low:
                 result["detail"] = (
-                    "Binance is geo-blocking this server's region (HTTP 451). "
-                    "Neither live trading nor market data will work from here — "
-                    "deploy in a Binance-supported region or route through a proxy."
+                    f"{self._exchange_id} is geo-blocking this server's region "
+                    "(HTTP 451). This is Binance refusing the request based on "
+                    "where the server runs — not a bug, and no API key can undo "
+                    "it. Nothing here works (not even public prices) until you "
+                    "either deploy in a supported region, set EXCHANGE_HTTP_PROXY "
+                    "to route through an allowed region, or (US only) set "
+                    "EXCHANGE_ID=binanceus."
                 )
             else:
                 result["detail"] = f"public data unreachable: {exc}"

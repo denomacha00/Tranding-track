@@ -3,8 +3,11 @@ import type {
   BacktestResult,
   BotStatus,
   Candle,
+  AiHealth,
   ExchangeAccess,
   ExecutionResult,
+  LicenseKeyCreated,
+  LicenseKeyRow,
   MarketAnalysis,
   Me,
   NewsItem,
@@ -100,6 +103,19 @@ export const api = {
     }),
   adminDeleteUser: (id: number) =>
     req<{ deleted: number }>(`/api/admin/users/${id}`, { method: 'DELETE' }),
+  // Licence keys: admin mints them, pending users self-redeem to activate.
+  adminLicenseKeys: () => req<LicenseKeyRow[]>('/api/admin/license-keys'),
+  adminCreateLicenseKey: (label?: string) =>
+    req<LicenseKeyCreated>('/api/admin/license-keys', {
+      method: 'POST',
+      body: JSON.stringify({ label: label ?? null }),
+    }),
+  adminRevokeLicenseKey: (id: number) =>
+    req<LicenseKeyRow>(`/api/admin/license-keys/${id}/revoke`, { method: 'POST' }),
+  // A logged-in pending user activates themselves with a key; returns the fresh
+  // Me so the app can flip straight into the dashboard.
+  redeemLicenseKey: (key: string) =>
+    req<Me>('/api/license/redeem', { method: 'POST', body: JSON.stringify({ key }) }),
 
   // ---- trading ----
   status: () => req<BotStatus>('/api/status'),
@@ -171,4 +187,7 @@ export const api = {
   news: (limit = 8) =>
     req<{ items: NewsItem[]; errors: string[] }>(`/api/news?limit=${limit}`),
   exchangeAccess: () => req<ExchangeAccess>('/api/exchange/access'),
+  // Real reachability of the app-wide AI provider (no secrets). Lets the
+  // assistant show "connected" or the concrete reason it can't answer.
+  aiHealth: () => req<AiHealth>('/api/ai/health'),
 }

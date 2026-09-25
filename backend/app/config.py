@@ -20,6 +20,19 @@ class Settings(BaseSettings):
     binance_api_secret: str = Field(default="")
     binance_testnet: bool = Field(default=True)
 
+    # Exchange selection & networking. Default is Binance global — nothing
+    # changes unless you set these. Binance legally geo-blocks some server
+    # regions (HTTP 451): from a blocked region NO Binance call works (not even
+    # public market data), which looks like "everything fails". Two real levers:
+    #   * exchange_id="binanceus" if your server is in the US (ccxt `binanceus`;
+    #     note: US spot markets, no testnet), or another ccxt exchange id.
+    #   * exchange_http_proxy=<url> to route requests through an HTTP/HTTPS proxy
+    #     that sits in a Binance-supported region.
+    # Empty proxy = direct connection. This is honest infra config: it does not
+    # fake data, it changes where/what the app actually talks to.
+    exchange_id: str = Field(default="binance")
+    exchange_http_proxy: str = Field(default="")
+
     # TradingView webhook
     tradingview_webhook_secret: str = Field(default="change-me")
 

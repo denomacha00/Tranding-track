@@ -151,3 +151,19 @@ def decrypt_secret(secret_key: str, ciphertext: str) -> Optional[str]:
 def new_webhook_token() -> str:
     """Unguessable per-user TradingView webhook token."""
     return _secrets.token_urlsafe(24)
+
+
+def new_license_key() -> str:
+    """A fresh, unguessable licence key, shown to the admin exactly once.
+
+    Only its :func:`hash_license_key` digest is persisted — never the plaintext.
+    """
+    return "TT-" + _secrets.token_urlsafe(24)
+
+
+def hash_license_key(key: str) -> str:
+    """Stable SHA-256 of a licence key for at-rest storage and lookup.
+
+    We store/compare the hash so a database leak can't expose usable keys.
+    """
+    return hashlib.sha256(key.strip().encode()).hexdigest()

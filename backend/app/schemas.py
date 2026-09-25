@@ -203,3 +203,38 @@ class CredentialsUpdate(BaseModel):
 
 class LicenseUpdate(BaseModel):
     status: Literal["pending", "active", "revoked"]
+
+
+# ---- Licence keys (admin generates, users self-redeem) --------------
+
+
+class LicenseKeyCreate(BaseModel):
+    """Admin request to mint a new licence key. Label is a free-text reminder."""
+
+    label: Optional[str] = Field(default=None, max_length=120)
+
+
+class LicenseKeyOut(BaseModel):
+    """Admin-facing view of a licence key. NEVER carries the plaintext key —
+    that is returned only once, at creation, via :class:`LicenseKeyCreated`."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: int
+    key_prefix: str
+    label: Optional[str] = None
+    status: str
+    created_at: dt.datetime
+    redeemed_by: Optional[int] = None
+    redeemed_at: Optional[dt.datetime] = None
+
+
+class LicenseKeyCreated(LicenseKeyOut):
+    """Returned exactly once when a key is generated — includes the plaintext
+    ``key`` so the admin can copy it. It is never stored or returned again."""
+
+    key: str
+
+
+class RedeemLicenseKey(BaseModel):
+    key: str = Field(min_length=8, max_length=200)

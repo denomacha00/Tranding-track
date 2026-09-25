@@ -6,7 +6,7 @@ import { Admin } from './Admin'
 import { useSocket } from './useSocket'
 import { useTheme, type Theme } from './theme'
 import { ThemeToggle } from './ThemeToggle'
-import type { BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, MarketAnalysis, Me, NewsItem, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
+import type { AiHealth, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, MarketAnalysis, Me, NewsItem, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
 
 const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
@@ -83,6 +83,7 @@ export default function App() {
         status={me.license_status as 'pending' | 'revoked'}
         email={me.email}
         onLogout={logout}
+        onRedeemed={setMe}
         theme={theme}
         onToggleTheme={toggleTheme}
       />
@@ -105,6 +106,41 @@ const NAV: { key: TabKey; label: string; icon: string; admin?: boolean }[] = [
   { key: 'settings', label: 'Settings', icon: '⚙' },
   { key: 'admin', label: 'Admin', icon: '🛡', admin: true },
 ]
+
+// Human labels for a nav destination, used when the AI asks to "take me to X".
+const NAV_LABEL: Record<TabKey, string> = {
+  trades: 'Trades',
+  signals: 'Signals',
+  assistant: 'AI Assistant',
+  analyze: 'Analyze',
+  train: 'Train',
+  backtest: 'Backtest',
+  settings: 'Settings',
+  admin: 'Admin',
+}
+
+// Map the words the assistant might emit in [[goto:<dest>]] to a real tab. We
+// accept synonyms so "keys", "connect", "credentials" etc. all land on Settings.
+const NAV_ALIAS: Record<string, TabKey> = {
+  trades: 'trades', trade: 'trades', positions: 'trades', dashboard: 'trades', home: 'trades',
+  signals: 'signals', signal: 'signals',
+  assistant: 'assistant', ai: 'assistant', chat: 'assistant',
+  analyze: 'analyze', analysis: 'analyze', analyse: 'analyze',
+  train: 'train', training: 'train',
+  backtest: 'backtest', backtesting: 'backtest',
+  settings: 'settings', setting: 'settings', credentials: 'settings', keys: 'settings',
+  connect: 'settings', connection: 'settings', binance: 'settings', account: 'settings', risk: 'settings',
+  admin: 'admin', users: 'admin',
+}
+
+// Pull a trailing [[goto:<dest>]] action out of an AI reply: returns the reply
+// with the tag stripped (it's machine-only, never shown) plus the resolved tab.
+function parseNavAction(text: string): { text: string; dest: TabKey | null } {
+  const m = text.match(/\[\[\s*goto\s*:\s*([a-zA-Z]+)\s*\]\]/i)
+  if (!m) return { text, dest: null }
+  const dest = NAV_ALIAS[m[1].toLowerCase()] ?? null
+  return { text: text.replace(m[0], '').trim(), dest }
+}
 
 function Dashboard({
   me,
@@ -205,14 +241,27 @@ function Dashboard({
     },
   })
 
+  // Re-run the real exchange connection probe (used on mount, after saving
+  // API keys, and by the "Test connection" button) so the connection status
+  // shown is always the true, current result — never a stale/blank guess.
+  const refreshAccess = useCallback(async (): Promise<ExchangeAccess | null> => {
+    try {
+      const a = await api.exchangeAccess()
+      setAccess(a)
+      return a
+    } catch {
+      return null
+    }
+  }, [])
+
   // Initial load.
   useEffect(() => {
     api.status().then(setStatus).catch(() => {})
     loadSettings()
-    api.exchangeAccess().then(setAccess).catch(() => {})
+    refreshAccess()
     refreshTrades()
     refreshSignals()
-  }, [loadSettings, refreshTrades, refreshSignals])
+  }, [loadSettings, refreshAccess, refreshTrades, refreshSignals])
 
   // Poll the trades table on a slow cadence as a safety net. Trade changes are
   // normally pushed over the WebSocket (see onEvent), but if the socket drops
@@ -684,6 +733,9 @@ function Dashboard({
                   symbol={symbol}
                   timeframe={timeframe}
                   aiKeySet={me.ai_key_set}
+                  access={access}
+                  onRefreshAccess={refreshAccess}
+                  onNavigate={setTab}
                   onError={(m) => showToast('error', m)}
                 />
               )}
@@ -706,6 +758,7 @@ function Dashboard({
                   loadError={settingsError}
                   onReload={loadSettings}
                   access={access}
+                  onRefreshAccess={refreshAccess}
                   me={me}
                   onSaved={(s) => {
                     setSettings(s)
@@ -1109,14 +1162,23 @@ function AssistantPanel({
   symbol,
   timeframe,
   aiKeySet,
+  access,
+  onRefreshAccess,
+  onNavigate,
   onError,
 }: {
   symbol: string
   timeframe: string
   aiKeySet: boolean
+  access: ExchangeAccess | null
+  onRefreshAccess: () => Promise<ExchangeAccess | null>
+  onNavigate: (dest: TabKey) => void
   onError: (msg: string) => void
 }) {
-  const [turns, setTurns] = useState<ChatTurn[]>([])
+  // AI replies may carry a hidden [[goto:…]] action; we keep the resolved tab on
+  // the turn so the bubble can render a "take me there" button.
+  type ChatMsg = ChatTurn & { nav?: { dest: TabKey; label: string } }
+  const [turns, setTurns] = useState<ChatMsg[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
   const [useSymbol, setUseSymbol] = useState(true)
@@ -1126,6 +1188,11 @@ function AssistantPanel({
   const [news, setNews] = useState<NewsItem[]>([])
   const [newsErrors, setNewsErrors] = useState<string[]>([])
   const [newsLoading, setNewsLoading] = useState(false)
+  // Live connection dashboard: real AI-provider reachability + exchange access,
+  // so "the AI isn't working" / "am I connected?" show a concrete answer.
+  const [aiHealth, setAiHealth] = useState<AiHealth | null>(null)
+  const [aiHealthLoading, setAiHealthLoading] = useState(false)
+  const [testing, setTesting] = useState(false)
   const recRef = useRef<SpeechRec | null>(null)
   const listRef = useRef<HTMLDivElement | null>(null)
 
@@ -1160,6 +1227,34 @@ function AssistantPanel({
     }
   }, [onError])
 
+  // Probe the built-in AI provider once on mount (real ping, no secrets) so the
+  // dashboard can say "connected" or the concrete reason it can't answer.
+  const loadAiHealth = useCallback(async () => {
+    setAiHealthLoading(true)
+    try {
+      setAiHealth(await api.aiHealth())
+    } catch {
+      setAiHealth(null)
+    } finally {
+      setAiHealthLoading(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    loadAiHealth()
+  }, [loadAiHealth])
+
+  // Re-probe the exchange on demand from the assistant's dashboard.
+  const testConnection = useCallback(async () => {
+    setTesting(true)
+    try {
+      const a = await onRefreshAccess()
+      if (!a) onError('Could not reach the connection check.')
+    } finally {
+      setTesting(false)
+    }
+  }, [onRefreshAccess, onError])
+
   useEffect(() => {
     loadNews()
   }, [loadNews])
@@ -1187,8 +1282,19 @@ function AssistantPanel({
         timeframe: useSymbol ? timeframe : undefined,
         include_news: useNews,
       })
-      setTurns((t) => [...t, { role: 'ai', text: res.reply, usedNews: res.used_news }])
-      speak(res.reply)
+      // Extract any hidden navigation action; the spoken/shown text is the reply
+      // with the tag removed, and a button lets the user actually go there.
+      const { text, dest } = parseNavAction(res.reply)
+      setTurns((t) => [
+        ...t,
+        {
+          role: 'ai',
+          text,
+          usedNews: res.used_news,
+          nav: dest ? { dest, label: NAV_LABEL[dest] } : undefined,
+        },
+      ])
+      speak(text)
     } catch (e) {
       const msg = (e as Error).message
       onError(msg)
@@ -1231,24 +1337,87 @@ function AssistantPanel({
   }
 
   const suggestions = [
-    'How is my bot doing right now?',
+    'How does this app work?',
+    'Am I connected to my exchange?',
+    'How do I connect Binance and go live?',
     `What's your read on ${symbol} ${timeframe}?`,
-    'Given the latest news, what are the main risks today?',
-    'Should I be in cash or exposed right now, and why?',
+    'How is my bot doing right now?',
+    'Take me to settings',
   ]
 
   return (
     <div className="assistant">
-      {!aiKeySet && (
-        <div className="alert-banner soft">
-          <span className="alert-icon">🔑</span>
-          <div>
-            <b>No AI key configured.</b> Add your own AI provider key in Settings to
-            chat with the assistant. It uses <b>your</b> key and receives only your
-            non-secret bot state and public headlines — never your exchange keys.
-          </div>
+      {/* Honest connection dashboard: the built-in AI's real reachability and the
+          user's real exchange access, each with a concrete reason + a way to act.
+          Replaces the old "add your AI key" banner — the AI is operator-wide, so
+          users never enter a key. */}
+      <div className="conn-dash">
+        <div
+          className={`conn-pill ${aiHealth ? (aiHealth.ok ? 'ok' : 'bad') : 'muted'}`}
+          title={aiHealth?.detail || ''}
+        >
+          <span className="conn-dot" />
+          <span className="conn-label">Assistant AI</span>
+          <span className="conn-state">
+            {aiHealthLoading
+              ? 'checking…'
+              : aiHealth
+                ? aiHealth.ok
+                  ? `connected (${aiHealth.model || 'model'})`
+                  : `not working — ${aiHealth.detail}`
+                : aiKeySet
+                  ? 'status unknown'
+                  : 'not set up by the operator yet'}
+          </span>
+          <button
+            type="button"
+            className="btn ghost sm"
+            onClick={loadAiHealth}
+            disabled={aiHealthLoading}
+            title="Re-check the AI provider"
+          >
+            {aiHealthLoading ? '…' : '↻'}
+          </button>
         </div>
-      )}
+
+        <div
+          className={`conn-pill ${access ? (access.ok ? 'ok' : 'bad') : 'muted'}`}
+          title={access?.detail || ''}
+        >
+          <span className="conn-dot" />
+          <span className="conn-label">Exchange</span>
+          <span className="conn-state">
+            {access
+              ? access.can_trade
+                ? `trade-ready on ${access.exchange ?? 'exchange'} (${access.testnet ? 'testnet' : 'live'})`
+                : access.can_read_account
+                  ? 'connected, read-only (can’t trade yet)'
+                  : access.can_read_public
+                    ? 'public data only — not signed in'
+                    : 'not connected'
+              : 'not tested'}
+          </span>
+          <button
+            type="button"
+            className="btn ghost sm"
+            onClick={testConnection}
+            disabled={testing}
+            title="Test the exchange connection now"
+          >
+            {testing ? '…' : 'Test'}
+          </button>
+          {access && !access.can_trade && (
+            <button
+              type="button"
+              className="btn sm"
+              onClick={() => onNavigate('settings')}
+              title="Open Settings to add keys / fix the connection"
+            >
+              Fix in Settings →
+            </button>
+          )}
+        </div>
+      </div>
 
       <div className="assistant-grid">
         <div className="chat-col">
@@ -1256,9 +1425,11 @@ function AssistantPanel({
             {turns.length === 0 ? (
               <div className="chat-empty">
                 <p>
-                  Ask about your bot, a market, or your risk. The assistant sees your
-                  live (non-secret) bot state and — if you enable it — real headlines.
-                  It advises only: it can’t place orders or change settings.
+                  Ask about your bot, a market, or your risk — or how the app
+                  works and how to do things (“how do I connect Binance?”). It sees
+                  your live, non-secret account state, can pull real headlines, and
+                  can take you to the right screen (“take me to settings”). It
+                  advises only: it can’t place orders or change settings for you.
                 </p>
                 <div className="chip-row">
                   {suggestions.map((s) => (
@@ -1279,6 +1450,15 @@ function AssistantPanel({
                 <div key={i} className={`bubble ${t.role}`}>
                   <div className="bubble-role">{t.role === 'you' ? 'You' : '🤖 AI'}</div>
                   <div className="bubble-text">{t.text}</div>
+                  {t.nav && (
+                    <button
+                      type="button"
+                      className="btn primary sm nav-cta"
+                      onClick={() => onNavigate(t.nav!.dest)}
+                    >
+                      Take me to {t.nav.label} →
+                    </button>
+                  )}
                   {t.usedNews && <div className="bubble-note">grounded in live news</div>}
                 </div>
               ))
@@ -1863,6 +2043,7 @@ function SettingsPanel({
   loadError,
   onReload,
   access,
+  onRefreshAccess,
   me,
   onSaved,
   onMeChanged,
@@ -1872,6 +2053,7 @@ function SettingsPanel({
   loadError: boolean
   onReload: () => void
   access: ExchangeAccess | null
+  onRefreshAccess: () => Promise<ExchangeAccess | null>
   me: Me
   onSaved: (s: Settings) => void
   onMeChanged: (m: Me) => void
@@ -1879,6 +2061,7 @@ function SettingsPanel({
 }) {
   const [form, setForm] = useState<Settings | null>(settings)
   const [copied, setCopied] = useState(false)
+  const [testing, setTesting] = useState(false)
   useEffect(() => setForm(settings), [settings])
   if (!form) {
     // Distinguish a failed fetch from one still in flight so the panel never
@@ -1960,20 +2143,48 @@ function SettingsPanel({
         </p>
       )}
 
-      {access && (
-        <div className={`access-card ${access.ok ? 'ok' : 'bad'}`}>
-          <div className="access-head">
-            {access.ok ? '✅ Exchange ready to trade' : '⚠️ Exchange cannot trade yet'}
-            {access.testnet ? ' (testnet)' : ' (live account)'}
-          </div>
-          <div className="access-rows">
-            <span>Public data: {access.can_read_public ? '✅' : '❌'}</span>
-            <span>Account read: {access.can_read_account ? '✅' : '❌'}</span>
-            <span>Trading: {access.can_trade ? '✅' : '❌'}</span>
-          </div>
-          <p className="hint" style={{ marginTop: 6 }}>{access.detail}</p>
+      <div className={`access-card ${access ? (access.ok ? 'ok' : 'bad') : ''}`}>
+        <div className="access-head">
+          {access
+            ? `${access.ok ? '✅ Exchange ready to trade' : '⚠️ Exchange cannot trade yet'}${
+                access.testnet ? ' (testnet)' : ' (live account)'
+              }`
+            : 'Exchange connection — not tested yet'}
+          <button
+            className="btn"
+            style={{ marginLeft: 'auto' }}
+            onClick={async () => {
+              setTesting(true)
+              try {
+                const a = await onRefreshAccess()
+                if (!a) onError('Could not reach the connection check.')
+              } finally {
+                setTesting(false)
+              }
+            }}
+            disabled={testing}
+          >
+            {testing ? 'Testing…' : 'Test connection'}
+          </button>
         </div>
-      )}
+        {access && (
+          <>
+            <div className="access-rows">
+              <span>Public data: {access.can_read_public ? '✅' : '❌'}</span>
+              <span>Account read: {access.can_read_account ? '✅' : '❌'}</span>
+              <span>Trading: {access.can_trade ? '✅' : '❌'}</span>
+            </div>
+            <p className="hint" style={{ marginTop: 6 }}>{access.detail}</p>
+          </>
+        )}
+        {!access && (
+          <p className="hint" style={{ marginTop: 6 }}>
+            Click <b>Test connection</b> to check — live — whether this app can
+            reach your exchange, read your account, and place orders. Saving your
+            API keys below also runs this test automatically.
+          </p>
+        )}
+      </div>
 
       <div className="row">
         <div className="field">
@@ -2130,7 +2341,12 @@ function SettingsPanel({
         Save settings
       </button>
 
-      <CredentialsCard me={me} onMeChanged={onMeChanged} onError={onError} />
+      <CredentialsCard
+        me={me}
+        onMeChanged={onMeChanged}
+        onError={onError}
+        onRefreshAccess={onRefreshAccess}
+      />
 
       <div className="panel" style={{ marginTop: 6 }}>
         <div className="panel-head">Your TradingView webhook</div>
@@ -2185,10 +2401,12 @@ function CredentialsCard({
   me,
   onMeChanged,
   onError,
+  onRefreshAccess,
 }: {
   me: Me
   onMeChanged: (m: Me) => void
   onError: (msg: string) => void
+  onRefreshAccess: () => Promise<ExchangeAccess | null>
 }) {
   const [binKey, setBinKey] = useState('')
   const [binSecret, setBinSecret] = useState('')
@@ -2209,7 +2427,20 @@ function CredentialsCard({
       onMeChanged(updated)
       setBinKey('')
       setBinSecret('')
-      setSaved('Credentials saved (encrypted at rest).')
+      // Don't just save-and-go quiet: immediately re-probe the exchange with the
+      // new keys and report the REAL result (connected / read-only / geo-blocked)
+      // so the user actually sees whether they're live, not an empty box.
+      setSaved('Credentials saved (encrypted at rest). Testing connection…')
+      const acc = await onRefreshAccess()
+      if (!acc) {
+        setSaved('Credentials saved (encrypted at rest). Could not run the connection test — hit “Test connection” above.')
+      } else if (acc.can_trade) {
+        setSaved(`✅ Saved & connected — ${acc.exchange ?? 'exchange'} keys work and trading is enabled (${acc.testnet ? 'testnet' : 'live'}).`)
+      } else if (acc.can_read_account) {
+        setSaved(`⚠️ Saved — keys authenticate and can read your account, but trading isn't available yet. ${acc.detail}`)
+      } else {
+        setSaved(`⚠️ Saved, but not connected: ${acc.detail}`)
+      }
     } catch (e) {
       onError((e as Error).message)
     } finally {

@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { api, setToken, AuthError } from './api'
 import { ThemeToggle } from './ThemeToggle'
 import type { Theme } from './theme'
+import type { Me } from './types'
 
 /**
  * Auth gate: email + password sign-in / sign-up. On success it stores the JWT
@@ -59,6 +60,7 @@ export function Login({
           </div>
           <ThemeToggle theme={theme} onToggle={onToggleTheme} />
         </div>
+        <p className="auth-tagline">Real-time crypto trading terminal</p>
         <p className="hint">
           {mode === 'login'
             ? 'Sign in to your trading account.'
@@ -117,15 +119,39 @@ export function LicenseGate({
   status,
   email,
   onLogout,
+  onRedeemed,
   theme,
   onToggleTheme,
 }: {
   status: 'pending' | 'revoked'
   email: string
   onLogout: () => void
+  onRedeemed: (me: Me) => void
   theme: Theme
   onToggleTheme: () => void
 }) {
+  const [key, setKey] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  const redeem = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setError('')
+    if (!key.trim()) {
+      setError('Paste the licence key your administrator gave you.')
+      return
+    }
+    setBusy(true)
+    try {
+      const me = await api.redeemLicenseKey(key.trim())
+      onRedeemed(me) // flips license_status → active; app shows the dashboard
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Could not redeem that key.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
   return (
     <div className="auth-wrap">
       <div className="auth-card">
@@ -136,15 +162,37 @@ export function LicenseGate({
           </div>
           <ThemeToggle theme={theme} onToggle={onToggleTheme} />
         </div>
+        <p className="auth-tagline">Real-time crypto trading terminal</p>
         <h3 style={{ margin: '8px 0' }}>
-          {status === 'pending' ? 'Awaiting licence approval' : 'Licence revoked'}
+          {status === 'pending' ? 'Activate your account' : 'Licence revoked'}
         </h3>
         <p className="hint">
           {status === 'pending'
-            ? `Your account (${email}) is registered but not yet licensed. The administrator must grant you a licence before you can configure keys or trade.`
-            : `Your licence has been revoked. Contact the administrator to restore access.`}
+            ? `Your account (${email}) is registered but not yet licensed. Enter a licence key to activate instantly, or wait for an administrator to grant access.`
+            : `Your licence has been revoked. Contact the administrator to restore access — a licence key can't reactivate a revoked account.`}
         </p>
-        <button className="btn" onClick={onLogout}>Sign out</button>
+        {status === 'pending' && (
+          <form onSubmit={redeem} style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
+            <div className="field">
+              <label>Licence key</label>
+              <input
+                className="input mono"
+                value={key}
+                onChange={(e) => setKey(e.target.value)}
+                placeholder="TT-…"
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </div>
+            {error && <p className="hint" style={{ color: 'var(--red)' }}>{error}</p>}
+            <button className="btn primary" type="submit" disabled={busy}>
+              {busy ? 'Activating…' : 'Activate with key'}
+            </button>
+          </form>
+        )}
+        <button className="btn" onClick={onLogout} style={{ marginTop: 10 }}>
+          Sign out
+        </button>
       </div>
     </div>
   )

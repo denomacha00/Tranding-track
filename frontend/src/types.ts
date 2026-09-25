@@ -104,6 +104,20 @@ export interface ExchangeAccess {
   can_read_account: boolean
   can_trade: boolean
   testnet: boolean
+  // Which ccxt exchange this account talks to (e.g. "binance", "binanceus").
+  exchange?: string
+  detail: string
+}
+
+// Live reachability of the app-wide AI provider (never carries the key).
+// Powers the assistant's connection dashboard so "AI not working" shows a
+// concrete reason instead of failing silently.
+export interface AiHealth {
+  enabled: boolean
+  ok: boolean
+  model: string
+  base_url: string
+  style: string
   detail: string
 }
 
@@ -235,4 +249,22 @@ export interface UserRow {
   license_status: 'pending' | 'active' | 'revoked'
   created_at: string
   licensed_at: string | null
+}
+
+// A licence key row as the admin sees it. NEVER carries the plaintext key —
+// that is shown only once, at creation, via LicenseKeyCreated.
+export interface LicenseKeyRow {
+  id: number
+  key_prefix: string
+  label: string | null
+  status: 'unused' | 'redeemed' | 'revoked'
+  created_at: string
+  redeemed_by: number | null
+  redeemed_at: string | null
+}
+
+// Returned exactly once when an admin generates a key: `key` is the full
+// plaintext to copy now (never stored server-side, never returned again).
+export interface LicenseKeyCreated extends LicenseKeyRow {
+  key: string
 }
