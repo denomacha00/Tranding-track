@@ -443,9 +443,292 @@ th.mono {
   font-size: 12px;
 }
 
-.chart {
+.chart-wrap {
+  position: relative;
   width: 100%;
   height: 380px;
+}
+
+.chart {
+  width: 100%;
+  height: 100%;
+}
+
+/* TradingView-style OHLC + volume legend, pinned top-left over the chart. */
+.chart-legend {
+  position: absolute;
+  top: 8px;
+  left: 10px;
+  z-index: 3;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  font-size: 12px;
+  line-height: 1.4;
+  pointer-events: none;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+}
+
+.chart-legend .cl-sym {
+  font-weight: 700;
+  color: var(--text);
+  margin-right: 4px;
+}
+
+.chart-legend .cl-ohlc {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 3px 6px;
+}
+
+.chart-legend .cl-k {
+  color: var(--muted);
+}
+
+.chart-legend .cl-v {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.chart-legend .cl-chg {
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
+}
+
+/* Countdown to the forming candle's close, pinned top-right over the chart. */
+.chart-countdown {
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  z-index: 3;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--muted);
+  background: color-mix(in srgb, var(--panel) 70%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1px 7px;
+  pointer-events: none;
+}
+
+/* Live bid/ask + 24h volume strip above the chart. */
+.market-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 22px;
+  padding: 0 2px 12px;
+  font-size: 13px;
+}
+
+.market-stats.stale {
+  opacity: 0.5;
+}
+
+.market-stats .ms-item {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.market-stats .ms-k {
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.market-stats .ms-v {
+  font-variant-numeric: tabular-nums;
+  color: var(--text);
+}
+
+.market-stats .ms-v.buy {
+  color: var(--green);
+}
+
+.market-stats .ms-v.sell {
+  color: var(--red);
+}
+
+.sym-input {
+  width: 130px;
+  text-transform: uppercase;
+}
+
+/* Live order-book depth ladder. */
+.orderbook .panel-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.ob {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ob-headrow {
+  display: flex;
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 0 2px 4px;
+}
+
+.ob-row {
+  position: relative;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 2px 4px;
+  overflow: hidden;
+}
+
+/* Depth bar: grows from the right, sitting behind the price/amount text. */
+.ob-depth {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 0;
+}
+
+.ob-row.ask .ob-depth {
+  background: rgba(239, 83, 80, 0.16);
+}
+
+.ob-row.bid .ob-depth {
+  background: rgba(38, 166, 154, 0.16);
+}
+
+.ob-price,
+.ob-amt {
+  position: relative;
+  z-index: 1;
+}
+
+.ob-price.sell {
+  color: var(--red);
+}
+
+.ob-price.buy {
+  color: var(--green);
+}
+
+.ob-amt {
+  color: var(--text);
+}
+
+.ob-spread {
+  text-align: center;
+  color: var(--muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  padding: 5px 0;
+  margin: 3px 0;
+  border-top: 1px dashed var(--border);
+  border-bottom: 1px dashed var(--border);
+}
+
+/* Bot activity heartbeat strip. */
+.bot-pulse {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.bp-main {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+}
+
+.bp-state {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.bp-meta {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.bp-sep {
+  width: 1px;
+  align-self: stretch;
+  background: var(--border);
+}
+
+.bp-signal {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.bp-k {
+  color: var(--muted);
+  text-transform: uppercase;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+}
+
+.bp-sig {
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.bp-explain {
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.5;
+}
+
+/* Pulsing "alive" dot; steady grey when the monitor is stopped. */
+.bp-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.bp-dot.live {
+  background: var(--green);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--green) 70%, transparent);
+  animation: bp-pulse 1.8s ease-out infinite;
+}
+
+.bp-dot.off {
+  background: var(--muted);
+}
+
+@keyframes bp-pulse {
+  0% {
+    box-shadow: 0 0 0 0 color-mix(in srgb, var(--green) 65%, transparent);
+  }
+  70% {
+    box-shadow: 0 0 0 8px transparent;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .bp-dot.live {
+    animation: none;
+  }
 }
 
 .toast {

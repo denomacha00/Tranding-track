@@ -453,3 +453,47 @@ def test_signup_weak_password_rejected(client):
         json={"username": "weakling", "email": "weak@example.com", "password": "short"},
     )
     assert r.status_code == 422
+
+
+# ---- Order book (real resting liquidity, never fabricated) -----------
+
+def test_orderbook_shape_and_filters_bad_levels(client, monkeypatch):
+    """The endpoint returns the venue's real depth and drops any non-positive
+    price/amount — it must never invent a ladder to fill gaps."""
+    import app.exchange as exch
+
+    def fake_ob(self, symbol, limit=20):
+        return {
+            "bids": [[100.0, 2.0], [99.5, 1.0], [0, 5.0], [98.0, 0]],
+            "asks": [[101.0, 1.5], [-1, 2.0], [102.0, 3.0], ["x", 1]],
+        }
+
+    monkeypatch.setattr(exch.BinanceConnector, "fetch_order_book", fake_ob)
+    r = client.get("/api/orderbook/btc%2Fusdt?limit=20")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["symbol"] == "BTC/USDT"
+    # Only levels with price > 0 AND amount > 0 survive.
+    assert body["bids"] == [
+        {"price": 100.0, "amount": 2.0},
+        {"price": 99.5, "amount": 1.0},
+    ]
+    assert body["asks"] == [
+        {"price": 101.0, "amount": 1.5},
+        {"price": 102.0, "amount": 3.0},
+    ]
+    assert "source" in body  # honest venue label (may be null)
+
+
+def test_orderbook_failure_is_502_not_faked(client, monkeypatch):
+    """When the venue can't be reached the endpoint 502s honestly rather than
+    returning an empty or invented book."""
+    import app.exchange as exch
+
+    def boom(self, symbol, limit=20):
+        raise RuntimeError("exchange down")
+
+    monkeypatch.setattr(exch.BinanceConnector, "fetch_order_book", boom)
+    r = client.get("/api/orderbook/BTC/USDT")
+    assert r.status_code == 502
+    assert "unavailable" in r.json()["detail"].lower()

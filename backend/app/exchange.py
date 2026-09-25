@@ -330,6 +330,18 @@ class BinanceConnector:
             lambda c: c.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
         )
 
+    def fetch_order_book(self, symbol: str, limit: int = 20) -> dict[str, Any]:
+        """Live order book: the market's real resting bids and asks.
+
+        Read-only public depth via the same geo-block-aware fallback path as the
+        other market reads, so it keeps working when the primary is geo-blocked.
+        This is the market's ACTUAL resting liquidity (buy side = bids, sell side
+        = asks) — NOT the user's own orders — and it is never fabricated: an
+        unreachable venue raises (surfaced as a 502) rather than returning an
+        invented book.
+        """
+        return self._fetch_public(lambda c: c.fetch_order_book(symbol, limit))
+
     # ---- Account -----------------------------------------------------
 
     def fetch_balance(self, quote: str = "USDT") -> Optional[float]:

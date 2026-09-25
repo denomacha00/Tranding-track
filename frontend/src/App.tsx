@@ -6,7 +6,7 @@ import { Admin } from './Admin'
 import { useSocket } from './useSocket'
 import { useTheme, type Theme } from './theme'
 import { ThemeToggle } from './ThemeToggle'
-import type { AiHealth, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, MarketAnalysis, Me, NewsItem, Performance, PerfBucket, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
+import type { AiHealth, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, MarketAnalysis, Me, NewsItem, OrderBook as OrderBookData, Performance, PerfBucket, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
 
 const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
@@ -183,6 +183,12 @@ function Dashboard({
   const [tickerStale, setTickerStale] = useState(false)
   const [symbol, setSymbol] = useState(SYMBOLS[0])
   const [timeframe, setTimeframe] = useState('1h')
+  // Free-text draft for the symbol box (committed on Enter/blur) so you can
+  // chart ANY pair, not just the presets, without reloading on every keystroke.
+  const [symbolDraft, setSymbolDraft] = useState(SYMBOLS[0])
+  // Wall-clock of the last status we received (WS push or poll), so the bot
+  // activity strip can show an honest "updated Ns ago" heartbeat.
+  const [statusTs, setStatusTs] = useState(0)
   const [amount, setAmount] = useState('')
   const [limitPrice, setLimitPrice] = useState('')
   const [stopLoss, setStopLoss] = useState('')
@@ -259,8 +265,15 @@ function Dashboard({
     }
   }, [])
 
+  // Apply a fresh status and stamp when it arrived, so the UI can show a
+  // truthful "last updated" heartbeat rather than implying constant liveness.
+  const applyStatus = useCallback((s: BotStatus) => {
+    setStatus(s)
+    setStatusTs(Date.now())
+  }, [])
+
   const { connected } = useSocket({
-    onStatus: setStatus,
+    onStatus: applyStatus,
     onEvent: (m) => {
       if (TRADE_EVENTS.has(m.event)) {
         refreshTrades()
@@ -320,13 +333,13 @@ function Dashboard({
 
   // Initial load.
   useEffect(() => {
-    api.status().then(setStatus).catch(() => {})
+    api.status().then(applyStatus).catch(() => {})
     loadSettings()
     refreshAccess()
     loadAiHealth()
     refreshTrades()
     refreshSignals()
-  }, [loadSettings, refreshAccess, loadAiHealth, refreshTrades, refreshSignals])
+  }, [loadSettings, refreshAccess, loadAiHealth, refreshTrades, refreshSignals, applyStatus])
 
   // Poll the trades table on a slow cadence as a safety net. Trade changes are
   // normally pushed over the WebSocket (see onEvent), but if the socket drops
@@ -399,6 +412,23 @@ function Dashboard({
       clearInterval(id)
     }
   }, [symbol])
+
+  // Keep the symbol box's draft in step when the pair changes elsewhere (e.g.
+  // picking a preset), then commit a typed pair: uppercased, and defaulted to a
+  // /USDT quote when none is given, so "doge" becomes "DOGE/USDT".
+  useEffect(() => {
+    setSymbolDraft(symbol)
+  }, [symbol])
+  const commitSymbol = () => {
+    let s = symbolDraft.trim().toUpperCase()
+    if (!s) {
+      setSymbolDraft(symbol)
+      return
+    }
+    if (!s.includes('/')) s = `${s}/USDT`
+    setSymbolDraft(s)
+    if (s !== symbol) setSymbol(s)
+  }
 
   const openTrades = useMemo(
     () => trades.filter((t) => t.status === 'open' || t.status === 'pending'),
@@ -704,6 +734,14 @@ function Dashboard({
         <div className="col">
           <StatsRow status={status} />
 
+          <BotPulse
+            status={status}
+            statusTs={statusTs}
+            signals={signals}
+            settings={settings}
+            connected={connected}
+          />
+
           <AutonomyToggle
             settings={settings}
             status={status}
@@ -752,11 +790,29 @@ function Dashboard({
                 )}
               </div>
               <div className="row" style={{ alignItems: 'center' }}>
-                <select className="select" value={symbol} onChange={(e) => setSymbol(e.target.value)}>
+                <input
+                  className="input sym-input"
+                  list="symbol-presets"
+                  value={symbolDraft}
+                  onChange={(e) => setSymbolDraft(e.target.value)}
+                  onBlur={commitSymbol}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault()
+                      commitSymbol()
+                      ;(e.target as HTMLInputElement).blur()
+                    }
+                  }}
+                  spellCheck={false}
+                  autoComplete="off"
+                  aria-label="Symbol (any Binance pair, e.g. BTC/USDT)"
+                  title="Type any Binance pair (e.g. DOGE/USDT) and press Enter"
+                />
+                <datalist id="symbol-presets">
                   {SYMBOLS.map((s) => (
-                    <option key={s}>{s}</option>
+                    <option key={s} value={s} />
                   ))}
-                </select>
+                </datalist>
                 <select
                   className="select"
                   value={timeframe}
@@ -769,8 +825,16 @@ function Dashboard({
               </div>
             </div>
             <div className="panel-body">
+              <MarketStats ticker={ticker} symbol={symbol} stale={tickerStale} />
               {candles.length ? (
-                <PriceChart candles={candles} theme={theme} last={livePrice} fitKey={`${symbol}:${timeframe}`} />
+                <PriceChart
+                  candles={candles}
+                  theme={theme}
+                  last={livePrice}
+                  fitKey={`${symbol}:${timeframe}`}
+                  symbol={symbol}
+                  timeframe={timeframe}
+                />
               ) : (
                 <div className="empty">
                   No candle data. Check the backend / Binance connection.
@@ -778,6 +842,8 @@ function Dashboard({
               )}
             </div>
           </section>
+
+          <OrderBook symbol={symbol} exchange={access?.exchange} />
 
           <section className="panel">
             <div className="panel-head">Manual order</div>
@@ -1225,6 +1291,255 @@ function NotificationsBell({
         </div>
       )}
     </div>
+  )
+}
+
+// Compact number (1.23K / 4.56M / 7.89B) for volumes and order sizes.
+function compact(n: number | null | undefined): string {
+  if (n == null || !Number.isFinite(n)) return '—'
+  const a = Math.abs(n)
+  if (a >= 1e9) return (n / 1e9).toFixed(2) + 'B'
+  if (a >= 1e6) return (n / 1e6).toFixed(2) + 'M'
+  if (a >= 1e3) return (n / 1e3).toFixed(2) + 'K'
+  return n.toFixed(a > 0 && a < 1 ? 4 : 2)
+}
+
+// Price with a sensible number of decimals for its magnitude.
+function fmtPx(v: number): string {
+  const dp = v < 1 ? 6 : v < 10 ? 4 : 2
+  return v.toLocaleString('en-US', { minimumFractionDigits: dp, maximumFractionDigits: dp })
+}
+
+// Short "time since" for the activity heartbeat. Truthful, not decorative.
+function ago(ts: number): string {
+  if (!ts) return 'never'
+  const s = Math.max(0, Math.floor((Date.now() - ts) / 1000))
+  if (s < 3) return 'just now'
+  if (s < 60) return `${s}s ago`
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`
+  return `${Math.floor(s / 3600)}h ago`
+}
+
+// Live bid/ask + 24h volume strip above the chart. Every figure is only shown
+// when the venue actually reported it — no fabricated depth or volume.
+function MarketStats({
+  ticker,
+  symbol,
+  stale,
+}: {
+  ticker: Ticker | null
+  symbol: string
+  stale: boolean
+}) {
+  const [base, quote] = symbol.split('/')
+  const bid = ticker?.bid ?? null
+  const ask = ticker?.ask ?? null
+  const spread = bid != null && ask != null && ask > 0 ? ask - bid : null
+  const spreadPct = spread != null && ask ? (spread / ask) * 100 : null
+  return (
+    <div className={`market-stats ${stale ? 'stale' : ''}`}>
+      <div className="ms-item">
+        <span className="ms-k">Bid</span>
+        <span className="ms-v buy" title="Highest resting buy order — you sell into this">
+          {bid != null ? fmtPx(bid) : '—'}
+        </span>
+      </div>
+      <div className="ms-item">
+        <span className="ms-k">Ask</span>
+        <span className="ms-v sell" title="Lowest resting sell order — you buy at this">
+          {ask != null ? fmtPx(ask) : '—'}
+        </span>
+      </div>
+      <div className="ms-item">
+        <span className="ms-k">Spread</span>
+        <span className="ms-v">
+          {spread != null ? `${fmtPx(spread)}${spreadPct != null ? ` (${spreadPct.toFixed(3)}%)` : ''}` : '—'}
+        </span>
+      </div>
+      <div className="ms-item">
+        <span className="ms-k">24h Vol</span>
+        <span className="ms-v" title="24h traded volume reported by the venue">
+          {ticker?.base_volume != null ? `${compact(ticker.base_volume)} ${base}` : '—'}
+          {ticker?.quote_volume != null ? ` · ${compact(ticker.quote_volume)} ${quote}` : ''}
+        </span>
+      </div>
+    </div>
+  )
+}
+// Live order-book depth: the market's REAL resting bids (buy side) and asks
+// (sell side), polled every few seconds. Depth bars are scaled to the largest
+// order shown. Empty sides mean the venue returned no depth — never invented.
+function OrderBook({ symbol, exchange }: { symbol: string; exchange?: string }) {
+  const [book, setBook] = useState<OrderBookData | null>(null)
+  const [err, setErr] = useState<string | null>(null)
+  useEffect(() => {
+    let alive = true
+    setBook(null)
+    setErr(null)
+    const load = () =>
+      api
+        .orderbook(symbol, 20)
+        .then((b) => {
+          if (alive) {
+            setBook(b)
+            setErr(null)
+          }
+        })
+        .catch((e) => {
+          if (alive) setErr(e?.message || 'unavailable')
+        })
+    load()
+    const id = setInterval(load, 2500)
+    return () => {
+      alive = false
+      clearInterval(id)
+    }
+  }, [symbol])
+
+  const LEVELS = 12
+  const asks = (book?.asks ?? []).slice(0, LEVELS)
+  const bids = (book?.bids ?? []).slice(0, LEVELS)
+  const maxAmt = Math.max(1e-9, ...asks.map((a) => a.amount), ...bids.map((b) => b.amount))
+  const bestAsk = book?.asks[0]?.price
+  const bestBid = book?.bids[0]?.price
+  const spread = bestAsk != null && bestBid != null ? bestAsk - bestBid : null
+  const spreadPct = spread != null && bestAsk ? (spread / bestAsk) * 100 : null
+  const viaFallback = Boolean(book?.source && exchange && book.source !== exchange)
+  return (
+    <section className="panel orderbook">
+      <div className="panel-head">
+        <span>Order book</span>
+        <div className="row" style={{ alignItems: 'center', gap: 8 }}>
+          {viaFallback && (
+            <span className="hint" title={`Depth served from the public fallback ${book?.source}, not ${exchange}.`}>
+              via {book?.source}
+            </span>
+          )}
+          {spread != null && (
+            <span className="hint">
+              Spread {fmtPx(spread)}
+              {spreadPct != null ? ` (${spreadPct.toFixed(3)}%)` : ''}
+            </span>
+          )}
+        </div>
+      </div>
+      <div className="panel-body">
+        {err ? (
+          <div className="empty">Order book unavailable: {err}</div>
+        ) : !book ? (
+          <div className="empty">Loading order book…</div>
+        ) : asks.length === 0 && bids.length === 0 ? (
+          <div className="empty">No resting orders returned{book.source ? ` by ${book.source}` : ''}.</div>
+        ) : (
+          <div className="ob">
+            <div className="ob-headrow">
+              <span>Price</span>
+              <span>Amount</span>
+            </div>
+            <div className="ob-side">
+              {[...asks].reverse().map((lvl, i) => (
+                <div className="ob-row ask" key={`a${i}`}>
+                  <div className="ob-depth" style={{ width: `${(lvl.amount / maxAmt) * 100}%` }} />
+                  <span className="ob-price sell">{fmtPx(lvl.price)}</span>
+                  <span className="ob-amt">{compact(lvl.amount)}</span>
+                </div>
+              ))}
+            </div>
+            <div className="ob-spread">
+              {bestBid != null && bestAsk != null ? `${fmtPx(bestBid)} — ${fmtPx(bestAsk)}` : '—'}
+            </div>
+            <div className="ob-side">
+              {bids.map((lvl, i) => (
+                <div className="ob-row bid" key={`b${i}`}>
+                  <div className="ob-depth" style={{ width: `${(lvl.amount / maxAmt) * 100}%` }} />
+                  <span className="ob-price buy">{fmtPx(lvl.price)}</span>
+                  <span className="ob-amt">{compact(lvl.amount)}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+    </section>
+  )
+}
+// Bot activity heartbeat: an honest, at-a-glance answer to "is the bot actually
+// doing anything?". Shows the live monitor pulse, mode, open positions, the
+// most recent logged signal, an "updated Ns ago" stamp, and a plain-English
+// line on what "running" means right now (watching vs. autonomously trading).
+function BotPulse({
+  status,
+  statusTs,
+  signals,
+  settings,
+  connected,
+}: {
+  status: BotStatus | null
+  statusTs: number
+  signals: SignalRow[]
+  settings: Settings | null
+  connected: boolean
+}) {
+  // Re-render every second so the "updated Ns ago" heartbeat stays honest.
+  const [, force] = useState(0)
+  useEffect(() => {
+    const id = setInterval(() => force((n) => n + 1), 1000)
+    return () => clearInterval(id)
+  }, [])
+
+  const running = Boolean(status?.running)
+  const auto = Boolean(settings?.auto_trade_enabled)
+  const latest = signals.length
+    ? [...signals].sort((a, b) => +new Date(b.created_at) - +new Date(a.created_at))[0]
+    : null
+  const autoSymbols = settings?.auto_symbols?.trim() || 'your auto symbols'
+
+  let explain: string
+  if (!running) {
+    explain =
+      'Monitor stopped — no new signals. Stop-loss / take-profit and resting-order checks still run to protect any open trades.'
+  } else if (auto) {
+    explain = `Autonomous trading is ON: a confident signal on ${autoSymbols} can place a REAL order. It never invents trades.`
+  } else {
+    explain = `Watching ${autoSymbols} and logging verdicts to Signals — it does NOT place orders unless you send a manual order or a TradingView alert fires.`
+  }
+  return (
+    <section className="bot-pulse">
+      <div className="bp-main">
+        <span className={`bp-dot ${running ? 'live' : 'off'}`} />
+        <span className="bp-state">{running ? 'Monitoring market' : 'Bot stopped'}</span>
+        <span className={`badge ${status?.trading_mode === 'live' ? 'live' : 'paper'}`}>
+          {status?.trading_mode ?? '—'}
+        </span>
+        {status?.testnet && <span className="badge">testnet</span>}
+        <span className={`badge ${auto ? 'on' : 'off'}`}>auto {auto ? 'on' : 'off'}</span>
+        <span className="bp-sep" />
+        <span className="bp-meta">Open positions: {status?.open_positions ?? 0}</span>
+        <span className="bp-sep" />
+        <span className="bp-meta" title="Time since the last status update from the backend">
+          {connected ? 'updated ' : 'stale — reconnecting, last '}
+          {ago(statusTs)}
+        </span>
+      </div>
+      <div className="bp-signal">
+        {latest ? (
+          <>
+            <span className="bp-k">Latest signal</span>
+            <span className={`badge ${latest.accepted ? 'on' : 'off'}`}>
+              {latest.accepted ? 'acted' : 'logged'}
+            </span>
+            <span className="bp-sig">
+              {latest.source}: {latest.action ?? 'hold'} {latest.symbol ?? ''}
+              {latest.confidence != null ? ` · ${(latest.confidence * 100).toFixed(0)}%` : ''}
+            </span>
+            <span className="hint">{ago(+new Date(latest.created_at))}</span>
+          </>
+        ) : (
+          <span className="hint">No signals logged yet — none will appear until the bot is running.</span>
+        )}
+      </div>
+      <div className="bp-explain">{explain}</div>
+    </section>
   )
 }
 
@@ -1854,6 +2169,18 @@ function AssistantPanel({
   const send = async (q: string) => {
     const question = q.trim()
     if (!question || busy) return
+    // Prior turns become the conversation history the assistant reads, so it can
+    // follow a multi-step task instead of answering each question cold. Captured
+    // BEFORE we append this question (setTurns is async), so it's exactly the
+    // context that preceded it. Drop the synthetic "(request failed…)" bubbles —
+    // those are our own error notices, not real assistant replies.
+    const history = turns
+      .filter((m) => m.text && !(m.role === 'ai' && m.text.startsWith('(request failed:')))
+      .slice(-20)
+      .map((m) => ({
+        role: m.role === 'ai' ? ('assistant' as const) : ('user' as const),
+        content: m.text,
+      }))
     setTurns((t) => [...t, { role: 'you', text: question }])
     setInput('')
     setBusy(true)
@@ -1863,6 +2190,7 @@ function AssistantPanel({
         symbol: useSymbol ? symbol : undefined,
         timeframe: useSymbol ? timeframe : undefined,
         include_news: useNews,
+        history,
       })
       // Extract any hidden navigation action; the spoken/shown text is the reply
       // with the tag removed, and a button lets the user actually go there.

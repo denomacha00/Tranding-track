@@ -116,9 +116,33 @@ class TickerOut(BaseModel):
     bid: Optional[float] = None
     ask: Optional[float] = None
     percentage: Optional[float] = None
+    # 24h traded volume as the exchange reports it: base_volume in the base asset
+    # (e.g. BTC), quote_volume in the quote asset (e.g. USDT). None when the venue
+    # omits it — never fabricated.
+    base_volume: Optional[float] = None
+    quote_volume: Optional[float] = None
     # Which venue actually served this price: the primary exchange, or the
     # public-data fallback when the primary is geo-blocked. Honest source label
     # so the UI never implies a price came from somewhere it didn't.
+    source: Optional[str] = None
+
+
+class OrderBookLevel(BaseModel):
+    price: float
+    amount: float
+
+
+class OrderBookOut(BaseModel):
+    """A snapshot of the market's real resting orders (depth).
+
+    `bids` are the buy side (highest price first), `asks` the sell side (lowest
+    price first). Straight from the exchange (or the public fallback); an empty
+    side means the venue returned no depth, never an invented ladder.
+    """
+
+    symbol: str
+    bids: list[OrderBookLevel]
+    asks: list[OrderBookLevel]
     source: Optional[str] = None
 
 

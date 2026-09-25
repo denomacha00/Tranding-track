@@ -128,6 +128,50 @@ def _looks_anthropic(model: str, base_url: str) -> bool:
     return "claude" in m or "anthropic" in b
 
 
+def _sanitize_history(
+    history: Any, *, max_turns: int = 12, max_chars: int = 4000
+) -> list[dict[str, str]]:
+    """Normalise PRIOR conversation turns into clean provider messages.
+
+    This is what lets the assistant actually follow a multi-turn task instead of
+    treating every question as brand new. Defensive on purpose — the turns come
+    from the browser, so we:
+      * accept either {role, content} or the UI's {role:'you'/'ai', text} shape,
+      * map roles to the strict {user, assistant} the APIs expect,
+      * coerce to strings, drop empties, and clip any oversized turn,
+      * keep only the most recent ``max_turns`` (bounds tokens + the shared bill),
+      * drop leading assistant turns so the first message is a user turn
+        (required by the Anthropic messages API).
+    Adjacent same-role turns are coalesced later, once the live question is
+    appended, in ``_post``. Never raises — a bad history just yields no memory.
+    """
+    if not isinstance(history, (list, tuple)):
+        return []
+    out: list[dict[str, str]] = []
+    for item in history:
+        if not isinstance(item, dict):
+            continue
+        raw_role = str(item.get("role", "")).strip().lower()
+        if raw_role in ("assistant", "ai", "bot"):
+            role = "assistant"
+        elif raw_role in ("user", "you", "human"):
+            role = "user"
+        else:
+            continue
+        content = item.get("content")
+        if content is None:
+            content = item.get("text")
+        content = str(content or "").strip()
+        if not content:
+            continue
+        out.append({"role": role, "content": content[:max_chars]})
+    if len(out) > max_turns:
+        out = out[-max_turns:]
+    while out and out[0]["role"] != "user":
+        out.pop(0)
+    return out
+
+
 def _key_family(key: str) -> str:
     """Best-effort provider guess from a key's PUBLIC prefix (never the secret).
 
@@ -179,8 +223,17 @@ class AICommentator:
         system: str,
         user: str,
         max_tokens: int | None = None,
+        history: list[dict[str, str]] | None = None,
     ) -> Optional[str]:
-        """Send one system+user turn and return the text reply, or None on failure."""
+        """Send a conversation and return the text reply, or None on failure.
+
+        ``history`` (already sanitised prior turns) is prepended before the live
+        ``user`` turn so the assistant has real conversational memory. Adjacent
+        same-role turns are coalesced here so the message list strictly
+        alternates — the Anthropic messages API rejects two same-role turns in a
+        row, and the boundary between a trailing user turn in history and the
+        live question is exactly where that would happen.
+        """
         if not self.available:
             self._last_error = "no AI key configured"
             return None
@@ -188,6 +241,13 @@ class AICommentator:
         max_tokens = max_tokens or self._settings.ai_max_tokens
         base = self._settings.ai_base_url.rstrip("/")
         timeout = self._settings.ai_timeout_seconds
+        # Build the alternating message list: prior turns + the live question.
+        messages: list[dict[str, str]] = []
+        for turn in (history or []) + [{"role": "user", "content": user}]:
+            if messages and messages[-1]["role"] == turn["role"]:
+                messages[-1]["content"] += "\n\n" + turn["content"]
+            else:
+                messages.append({"role": turn["role"], "content": turn["content"]})
         try:
             with httpx.Client(timeout=timeout) as client:
                 if self._style() == "anthropic":
@@ -202,7 +262,7 @@ class AICommentator:
                             "model": self._settings.ai_model,
                             "max_tokens": max_tokens,
                             "system": system,
-                            "messages": [{"role": "user", "content": user}],
+                            "messages": messages,
                         },
                     )
                     resp.raise_for_status()
@@ -219,7 +279,7 @@ class AICommentator:
                         "model": self._settings.ai_model,
                         "messages": [
                             {"role": "system", "content": system},
-                            {"role": "user", "content": user},
+                            *messages,
                         ],
                         "temperature": 0.2,
                         "max_tokens": max_tokens,
@@ -293,6 +353,7 @@ class AICommentator:
         analysis: "MarketAnalysis | None" = None,
         bot_context: str | None = None,
         news: list[dict] | None = None,
+        history: Any = None,
     ) -> str:
         """Assistant answer grounded in the user's OWN bot state + optional news.
 
@@ -300,6 +361,11 @@ class AICommentator:
         (never exchange keys/passwords). Headlines are public. Everything is sent
         to the USER'S OWN configured AI provider. If AI isn't configured we say so
         plainly rather than pretending to answer.
+
+        ``history`` is the PRIOR conversation (browser-local turns) so the
+        assistant can follow a multi-turn task. Only the live question carries the
+        fresh grounding blocks below — prior turns are sent as plain Q&A so we
+        don't re-send (or leak) stale account context on every turn.
         """
         if not self.available:
             return (
@@ -336,7 +402,7 @@ class AICommentator:
         # System prompt = who you are + how the app works + how to navigate it, so
         # the assistant can both explain the product and drive the UI on request.
         system = _SYSTEM_ASSISTANT + "\n\n" + _APP_GUIDE + "\n\n" + _NAV_ACTIONS
-        reply = self._post(system, prompt)
+        reply = self._post(system, prompt, history=_sanitize_history(history))
         if reply is not None:
             return reply
         return (

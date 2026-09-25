@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from app.ai import AICommentator, _extract_anthropic_text, _looks_anthropic
+from app.ai import AICommentator, _extract_anthropic_text, _looks_anthropic, _sanitize_history
 from app.analysis import Factor, MarketAnalysis
 
 
@@ -181,3 +181,92 @@ def test_assess_uses_full_token_budget(monkeypatch):
     out = ai.assess(_analysis())
     assert out == "assessment text"
     assert _FakeClient.captured["body"]["max_tokens"] == 999
+
+
+# ---- conversation memory (history threading) -------------------------
+
+def test_sanitize_history_maps_roles_and_drops_junk():
+    out = _sanitize_history([
+        {"role": "you", "text": "hi"},          # UI shape -> user
+        {"role": "ai", "content": "hello"},      # UI shape -> assistant
+        {"role": "user", "content": "  "},       # empty -> dropped
+        {"role": "system", "content": "nope"},   # unknown role -> dropped
+        "garbage",                                # non-dict -> dropped
+        {"role": "assistant", "content": "sure"},
+    ])
+    assert out == [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "hello"},
+        {"role": "assistant", "content": "sure"},
+    ]
+
+
+def test_sanitize_history_bounds_turns_and_length():
+    many = [{"role": "user" if i % 2 == 0 else "ai", "content": f"m{i}"} for i in range(40)]
+    out = _sanitize_history(many, max_turns=6)
+    assert len(out) == 6
+    assert out[-1]["content"] == "m39"  # keeps the most recent turns
+    long = _sanitize_history([{"role": "user", "content": "x" * 9000}], max_chars=100)
+    assert len(long[0]["content"]) == 100
+
+
+def test_sanitize_history_drops_leading_assistant_and_bad_input():
+    # First turn must be a user turn for the Anthropic messages API.
+    out = _sanitize_history([
+        {"role": "ai", "content": "orphan reply"},
+        {"role": "you", "content": "real question"},
+    ])
+    assert out[0]["role"] == "user"
+    assert _sanitize_history(None) == []
+    assert _sanitize_history("nope") == []
+
+
+def test_chat_threads_history_openai(monkeypatch):
+    _patch_httpx(monkeypatch, {"choices": [{"message": {"content": "answer"}}]})
+    ai = AICommentator(_settings(ai_model="gpt-4o-mini"))
+    out = ai.chat("and now?", history=[
+        {"role": "you", "text": "what is my balance?"},
+        {"role": "ai", "text": "you have 100 USDT"},
+    ])
+    assert out == "answer"
+    msgs = _FakeClient.captured["body"]["messages"]
+    assert [m["role"] for m in msgs] == ["system", "user", "assistant", "user"]
+    assert msgs[1]["content"] == "what is my balance?"
+    assert msgs[2]["content"] == "you have 100 USDT"
+    assert "and now?" in msgs[-1]["content"]  # live question carries the grounding
+
+
+def test_chat_threads_history_anthropic_alternates(monkeypatch):
+    _patch_httpx(monkeypatch, {"content": [{"type": "text", "text": "ok"}]})
+    ai = AICommentator(_settings(ai_model="claude-opus-4-8"))
+    ai.chat("continue", history=[
+        {"role": "you", "text": "first"},
+        {"role": "ai", "text": "second"},
+    ])
+    body = _FakeClient.captured["body"]
+    assert body["system"]  # system stays in its own field, not in messages
+    roles = [m["role"] for m in body["messages"]]
+    assert roles == ["user", "assistant", "user"]  # strictly alternating
+
+
+def test_chat_coalesces_adjacent_same_role(monkeypatch):
+    # Two trailing user turns (or a user turn right before the live question)
+    # must be merged, or the Anthropic API 400s on non-alternating roles.
+    _patch_httpx(monkeypatch, {"content": [{"type": "text", "text": "ok"}]})
+    ai = AICommentator(_settings(ai_model="claude-opus-4-8"))
+    ai.chat("live question", history=[
+        {"role": "you", "text": "a"},
+        {"role": "you", "text": "b"},
+    ])
+    msgs = _FakeClient.captured["body"]["messages"]
+    assert [m["role"] for m in msgs] == ["user"]
+    assert "a" in msgs[0]["content"] and "b" in msgs[0]["content"]
+    assert "live question" in msgs[0]["content"]
+
+
+def test_chat_no_history_is_single_user_turn(monkeypatch):
+    _patch_httpx(monkeypatch, {"choices": [{"message": {"content": "hey"}}]})
+    ai = AICommentator(_settings(ai_model="gpt-4o-mini"))
+    ai.chat("hello")
+    roles = [m["role"] for m in _FakeClient.captured["body"]["messages"]]
+    assert roles == ["system", "user"]

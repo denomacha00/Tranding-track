@@ -62,6 +62,7 @@ from app.schemas import (
     LoginRequest,
     ManualOrder,
     MeOut,
+    OrderBookOut,
     PerformanceOut,
     RedeemLicenseKey,
     ScaledOrder,
@@ -837,6 +838,8 @@ def ticker(
         bid=t.get("bid"),
         ask=t.get("ask"),
         percentage=t.get("percentage"),
+        base_volume=t.get("baseVolume"),
+        quote_volume=t.get("quoteVolume"),
         source=getattr(engine.connector, "last_data_source", None),
     )
 
@@ -859,6 +862,48 @@ def ohlcv(
          "low": c[3], "close": c[4], "volume": c[5]}
         for c in raw
     ]
+
+
+@app.get("/api/orderbook/{symbol:path}", response_model=OrderBookOut)
+def orderbook(
+    symbol: str,
+    limit: int = 20,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    """Live order book (real resting buy-side bids and sell-side asks).
+
+    The market's ACTUAL resting liquidity, straight from the exchange (or the
+    public fallback when the primary is geo-blocked) — not the user's own
+    orders, and never fabricated: if the venue returns no depth the side comes
+    back empty rather than invented. Note: on the Binance TESTNET the book is the
+    sandbox's own thin liquidity, not the live market — flip BINANCE_TESTNET off
+    to see the real book.
+    """
+    engine = _engine_for(db, user)
+    try:
+        ob = engine.connector.fetch_order_book(symbol.upper(), min(max(limit, 1), 100))
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Order book unavailable: {exc}")
+
+    def _levels(rows: object) -> list[dict[str, float]]:
+        out: list[dict[str, float]] = []
+        for r in rows or []:  # type: ignore[union-attr]
+            try:
+                price = float(r[0])
+                amount = float(r[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if price > 0 and amount > 0:
+                out.append({"price": price, "amount": amount})
+        return out
+
+    return OrderBookOut(
+        symbol=symbol.upper(),
+        bids=_levels(ob.get("bids")),
+        asks=_levels(ob.get("asks")),
+        source=getattr(engine.connector, "last_data_source", None),
+    )
 
 
 # ---- Backtesting ----------------------------------------------------
@@ -1148,8 +1193,19 @@ def ai_chat(
             news = []
         used_news = bool(news)
 
+    # Prior conversation turns from the browser so the assistant can follow a
+    # multi-turn task instead of answering each question cold. Untrusted input:
+    # slice to a sane bound here (ai.chat sanitises roles/content and keeps only
+    # the most recent turns); a bad shape simply yields no memory, never a 500.
+    raw_history = payload.get("history")
+    history = raw_history[-40:] if isinstance(raw_history, list) else None
+
     reply = engine.ai.chat(
-        question, analysis=analysis, bot_context=bot_context, news=news or None
+        question,
+        analysis=analysis,
+        bot_context=bot_context,
+        news=news or None,
+        history=history,
     )
     return {"reply": reply, "ai_enabled": engine.ai.available, "used_news": used_news}
 

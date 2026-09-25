@@ -12,6 +12,7 @@ import type {
   MarketAnalysis,
   Me,
   NewsItem,
+  OrderBook,
   Performance,
   ScaledResult,
   Settings,
@@ -183,6 +184,11 @@ export const api = {
     req<Candle[]>(`/api/ohlcv/${encodeURIComponent(symbol)}?timeframe=${timeframe}&limit=${limit}`),
   ticker: (symbol: string) =>
     req<Ticker>(`/api/ticker/${encodeURIComponent(symbol)}`),
+  // Live order book: the market's real resting bids (buy side) and asks (sell
+  // side). Read-only public depth; on the Binance testnet it's the sandbox's own
+  // thin book, not the live market.
+  orderbook: (symbol: string, limit = 20) =>
+    req<OrderBook>(`/api/orderbook/${encodeURIComponent(symbol)}?limit=${limit}`),
   backtest: (
     symbol: string,
     strategy: string,
@@ -212,12 +218,14 @@ export const api = {
     }),
   // Assistant chat: grounded in the user's OWN non-secret bot state, an optional
   // per-symbol analysis, and (opt-in) live public news. The AI advises only — it
-  // cannot place orders or change settings.
+  // cannot place orders or change settings. `history` carries prior turns so the
+  // assistant keeps the thread across a multi-step conversation.
   aiChat: (body: {
     question: string
     symbol?: string
     timeframe?: string
     include_news?: boolean
+    history?: { role: 'user' | 'assistant'; content: string }[]
   }) =>
     req<{ reply: string; ai_enabled: boolean; used_news: boolean }>('/api/ai/chat', {
       method: 'POST',

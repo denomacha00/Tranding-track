@@ -154,9 +154,30 @@ export interface Ticker {
   ask: number | null
   // 24h price change percent (may be null if the exchange omits it).
   percentage: number | null
+  // 24h traded volume: base_volume in the base asset (e.g. BTC), quote_volume in
+  // the quote asset (e.g. USDT). null when the venue omits it — never faked.
+  base_volume?: number | null
+  quote_volume?: number | null
   // Which venue actually served this price: the primary exchange, or the
   // public-data fallback when the primary is geo-blocked. Honest source label
   // so the UI never implies a price came from somewhere it didn't.
+  source?: string | null
+}
+
+// One price level of the live order book (a real resting order aggregate).
+export interface OrderBookLevel {
+  price: number
+  amount: number
+}
+
+// A live order-book snapshot: the market's real resting liquidity. `bids` are
+// the buy side (highest first), `asks` the sell side (lowest first). An empty
+// side means the venue returned no depth — never an invented ladder. On the
+// Binance testnet this is the sandbox's own thin book, not the live market.
+export interface OrderBook {
+  symbol: string
+  bids: OrderBookLevel[]
+  asks: OrderBookLevel[]
   source?: string | null
 }
 
