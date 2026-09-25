@@ -196,6 +196,20 @@ class Settings(BaseSettings):
             v = v.strip()
             if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
                 v = v[1:-1].strip()
+            # Railway paste error: the whole "NAME=value" line pasted into the
+            # value box (e.g. AI_BASE_URL=https://…), so the value carries its own
+            # variable name. Drop a leading ENV-NAME= echo so we don't send it to
+            # the provider (which turns a URL into an unparseable protocol error).
+            head = v.split("=", 1)[0] if "=" in v else ""
+            if (
+                head
+                and head == head.upper()
+                and not head[0].isdigit()
+                and all(c.isalnum() or c == "_" for c in head)
+            ):
+                v = v.split("=", 1)[1].strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                    v = v[1:-1].strip()
         return v
 
     @property

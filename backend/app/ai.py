@@ -383,13 +383,22 @@ class AICommentator:
             # openai-style to api.openai.com — returns 401 with a real key.
             style = self._style()
             family = _key_family(self._settings.ai_api_key)
+            looks_anth = _looks_anthropic(
+                self._settings.ai_model, self._settings.ai_base_url
+            )
             hint = ""
-            if (family.startswith("anthropic") and style != "anthropic") or (
-                family.startswith("openai") and style != "openai"
-            ):
+            if family.startswith("anthropic") and style != "anthropic":
                 hint = (
-                    f" — your key looks like {family} but it's being sent "
-                    f"{style}-style; set AI_API_STYLE + AI_BASE_URL to match the key"
+                    " — your key is an Anthropic key (sk-ant-…) but it's being "
+                    f"sent {style}-style; set AI_API_STYLE=anthropic"
+                )
+            elif style == "openai" and looks_anth:
+                # A Claude model over openai-style is the usual misconfig; note
+                # that an sk-… key sent anthropic-style is NOT flagged, because
+                # Claude-serving gateways legitimately use sk-… keys that way.
+                hint = (
+                    " — a Claude model is being sent openai-style; gateways that "
+                    "serve Claude usually need AI_API_STYLE=anthropic"
                 )
             elif family == "unrecognized prefix":
                 hint = " — the key's format isn't a known OpenAI/Anthropic prefix"
@@ -518,6 +527,11 @@ def _describe_ai_error(exc: Exception) -> str:
         if 500 <= code < 600:
             return f"the AI provider had a server error (HTTP {code}) — retry shortly"
         return f"the AI provider returned HTTP {code}"
+    if isinstance(exc, (httpx.UnsupportedProtocol, httpx.InvalidURL)):
+        return (
+            "AI_BASE_URL is malformed — it must be just the URL starting with "
+            "https:// (no 'AI_BASE_URL=' prefix, quotes, or spaces around it)"
+        )
     if isinstance(exc, httpx.TimeoutException):
         return "the AI provider timed out — it may be slow or unreachable"
     if isinstance(exc, httpx.ConnectError):
