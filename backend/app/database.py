@@ -77,7 +77,21 @@ _ADDED_COLUMNS: dict[str, dict[str, str]] = {
         "user_id": "INTEGER",
     },
     "signal_logs": {"user_id": "INTEGER"},
+    # Multi-tenant licensing v2: username login + time-limited licences.
+    "users": {
+        "username": "VARCHAR(64)",
+        "license_expires_at": "DATETIME",
+    },
+    "license_keys": {"duration_days": "INTEGER"},
 }
+
+# Indexes added after initial release. Idempotent (IF NOT EXISTS): a no-op on a
+# fresh DB (create_all already made them) and additive on an existing one. A
+# UNIQUE index on the freshly-added, all-NULL username column is safe — SQLite
+# treats NULLs as distinct, so legacy rows without a username never collide.
+_ADDED_INDEXES: list[str] = [
+    "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_username ON users(username)",
+]
 
 
 def _apply_additive_migrations() -> None:
@@ -93,3 +107,7 @@ def _apply_additive_migrations() -> None:
                     conn.execute(
                         text(f'ALTER TABLE {table} ADD COLUMN {column} {ddl}')
                     )
+    if "users" in existing_tables:
+        for ddl in _ADDED_INDEXES:
+            with engine.begin() as conn:
+                conn.execute(text(ddl))

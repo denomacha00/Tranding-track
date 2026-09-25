@@ -8,9 +8,11 @@ their own in-memory :class:`TradingEngine` and a unique TradingView webhook URL.
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
 import logging
 import os
+import re
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -26,7 +28,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app import __version__
@@ -44,8 +46,11 @@ from app.models import (
     TradeStatus,
     User,
     UserRole,
+    _as_utc,
+    _utcnow,
 )
 from app.schemas import (
+    AddLicenseDays,
     BotStatus,
     CredentialsUpdate,
     ExecutionResult,
@@ -248,6 +253,36 @@ def _issue_token(user: User) -> str:
     )
 
 
+def _me_out(user: User) -> MeOut:
+    """Build the authenticated-user payload (own state + capability flags).
+
+    AI is app-wide/inbuilt: report the OPERATOR's global config, not per-user,
+    so every licensed user sees the same built-in AI availability.
+    """
+    gs = get_settings()
+    return MeOut(
+        id=user.id,
+        username=user.username,
+        email=user.email,
+        role=user.role,
+        license_status=user.license_status,
+        license_active=user.license_active,
+        license_expires_at=user.license_expires_at,
+        license_days_left=user.license_days_left,
+        webhook_path=_webhook_path(user.webhook_token),
+        binance_keys_set=bool(user.binance_api_key_enc and user.binance_api_secret_enc),
+        binance_testnet=bool(user.binance_testnet),
+        ai_key_set=bool(gs.ai_api_key),
+        ai_model=gs.ai_model or "",
+        secrets_storage_enabled=secrets_enabled(gs.secret_key),
+    )
+
+
+# Usernames: letters, digits, dot, dash, underscore; 3–64 chars. Keeps them
+# URL/display-safe and unambiguous against emails (which always contain "@").
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9._-]{3,64}$")
+
+
 def _enforce_rate_limit(
     request: Request, bucket: str, *, limit: int, window_seconds: float
 ) -> None:
@@ -274,8 +309,21 @@ def signup(req: SignupRequest, request: Request, db: Session = Depends(get_db)):
     email = req.email.strip().lower()
     if "@" not in email:
         raise HTTPException(status_code=400, detail="A valid email is required")
-    if db.scalars(select(User).where(User.email == email)).first():
+    username = req.username.strip()
+    if not _USERNAME_RE.match(username):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Username must be 3–64 characters: letters, numbers, dot, dash "
+                "or underscore only."
+            ),
+        )
+    if db.scalars(select(User).where(func.lower(User.email) == email)).first():
         raise HTTPException(status_code=409, detail="Email already registered")
+    if db.scalars(
+        select(User).where(func.lower(User.username) == username.lower())
+    ).first():
+        raise HTTPException(status_code=409, detail="That username is taken")
     try:
         pw_hash = hash_password(req.password)
     except ValueError as exc:
@@ -284,23 +332,67 @@ def signup(req: SignupRequest, request: Request, db: Session = Depends(get_db)):
     is_admin = bool(s.admin_email) and email == s.admin_email.strip().lower()
     first_user = db.scalars(select(User)).first() is None
     make_admin = is_admin or (not s.admin_email and first_user)
-    licensed = make_admin or s.auto_license_new_users
+    # The operator (admin) and auto-license mode don't need a key; everyone else
+    # activates by redeeming the licence key you sold them — right here at signup.
+    key_exempt = make_admin or s.auto_license_new_users
+
+    now = _utcnow()
+    expires_at: dt.datetime | None = None
+    lk: LicenseKey | None = None
+    if not key_exempt:
+        key = (req.license_key or "").strip()
+        if not key:
+            raise HTTPException(
+                status_code=400,
+                detail="A licence key is required to sign up. Ask your provider for one.",
+            )
+        lk = db.scalars(
+            select(LicenseKey).where(LicenseKey.key_hash == hash_license_key(key))
+        ).first()
+        if lk is None or lk.status != LicenseKeyStatus.unused.value:
+            raise HTTPException(
+                status_code=400,
+                detail="That licence key is invalid or has already been used.",
+            )
+        if lk.duration_days:
+            expires_at = now + dt.timedelta(days=int(lk.duration_days))
 
     user = User(
         email=email,
+        username=username,
         password_hash=pw_hash,
         role=UserRole.admin.value if make_admin else UserRole.user.value,
-        license_status=(
-            LicenseStatus.active.value if licensed else LicenseStatus.pending.value
-        ),
+        license_status=LicenseStatus.active.value,  # key/admin/auto → live now
+        license_expires_at=expires_at,
         webhook_token=new_webhook_token(),
         binance_testnet=1,
+        licensed_at=now,
     )
-    from app.models import _utcnow  # local import to avoid cycle at top
-
-    if licensed:
-        user.licensed_at = _utcnow()
     db.add(user)
+    db.flush()  # assign user.id so we can bind the redeemed key to this account
+
+    if lk is not None:
+        # Atomically claim the key (only if still unused) and bind it to this
+        # user — a per-client, single-use key prevents any data mix-up.
+        claimed = db.execute(
+            update(LicenseKey)
+            .where(
+                LicenseKey.key_hash == lk.key_hash,
+                LicenseKey.status == LicenseKeyStatus.unused.value,
+            )
+            .values(
+                status=LicenseKeyStatus.redeemed.value,
+                redeemed_by=user.id,
+                redeemed_at=now,
+            )
+        ).rowcount
+        if claimed != 1:
+            db.rollback()
+            raise HTTPException(
+                status_code=400,
+                detail="That licence key is invalid or has already been used.",
+            )
+
     db.commit()
     db.refresh(user)
     return TokenResponse(access_token=_issue_token(user))
@@ -314,30 +406,23 @@ def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
         raise HTTPException(
             status_code=503, detail="Login is disabled (SECRET_KEY unset)."
         )
-    email = req.email.strip().lower()
-    user = db.scalars(select(User).where(User.email == email)).first()
+    ident = req.identifier.strip().lower()
+    # Match on username OR email (both stored/compared lower-case).
+    user = db.scalars(
+        select(User).where(
+            or_(func.lower(User.email) == ident, func.lower(User.username) == ident)
+        )
+    ).first()
     if not user or not verify_password(req.password, user.password_hash):
-        raise HTTPException(status_code=401, detail="Invalid email or password")
+        raise HTTPException(
+            status_code=401, detail="Invalid username/email or password"
+        )
     return TokenResponse(access_token=_issue_token(user))
 
 
 @app.get("/api/auth/me", response_model=MeOut)
 def me(user: User = Depends(get_current_user)):
-    # AI is app-wide/inbuilt: report the OPERATOR's global config, not per-user,
-    # so every licensed user sees the same built-in AI availability.
-    gs = get_settings()
-    return MeOut(
-        id=user.id,
-        email=user.email,
-        role=user.role,
-        license_status=user.license_status,
-        webhook_path=_webhook_path(user.webhook_token),
-        binance_keys_set=bool(user.binance_api_key_enc and user.binance_api_secret_enc),
-        binance_testnet=bool(user.binance_testnet),
-        ai_key_set=bool(gs.ai_api_key),
-        ai_model=gs.ai_model or "",
-        secrets_storage_enabled=secrets_enabled(gs.secret_key),
-    )
+    return _me_out(user)
 
 
 # ---- Per-user credentials (own trade-only keys) --------------------
@@ -374,7 +459,7 @@ def update_credentials(
     db.refresh(user)
     # Rebuild the user's engine so new keys take effect immediately.
     get_manager().refresh(db, user)
-    return me(user)
+    return _me_out(user)
 
 
 # ---- TradingView webhook (per-user token in the URL) ----------------
@@ -411,10 +496,10 @@ async def tradingview_webhook(
         _log_signal(db, user.id, "tradingview", None, None, safe_raw, False, f"parse error: {exc}")
         raise HTTPException(status_code=400, detail=f"Invalid signal payload: {exc}")
 
-    if user.license_status != LicenseStatus.active.value:
+    if not user.license_active:
         _log_signal(db, user.id, "tradingview", signal.symbol, signal.action, safe_raw, False,
                     "account not licensed")
-        raise HTTPException(status_code=403, detail="Account is not licensed")
+        raise HTTPException(status_code=403, detail="Account is not licensed or licence expired")
 
     engine = _engine_for(db, user)
     accepted, message, trade = await asyncio.to_thread(
@@ -1101,16 +1186,45 @@ def admin_set_license(
         raise HTTPException(status_code=404, detail="User not found")
     if target.id == admin.id and body.status != LicenseStatus.active.value:
         raise HTTPException(status_code=400, detail="Refusing to de-license yourself")
-    from app.models import _utcnow
 
     target.license_status = body.status
-    if body.status == LicenseStatus.active.value and target.licensed_at is None:
-        target.licensed_at = _utcnow()
+    if body.status == LicenseStatus.active.value:
+        # A manual admin "Grant" is a lifetime licence: clear any expiry so the
+        # user stays live until explicitly revoked. Use "add days" for a
+        # time-limited grant instead.
+        target.license_expires_at = None
+        if target.licensed_at is None:
+            target.licensed_at = _utcnow()
     db.commit()
     db.refresh(target)
     # Revoked/pending users must stop trading immediately: drop their engine.
     if body.status != LicenseStatus.active.value:
         get_manager().drop(target.id)
+    return target
+
+
+@app.post("/api/admin/users/{user_id}/add-days", response_model=UserOut)
+def admin_add_license_days(
+    user_id: int,
+    body: AddLicenseDays,
+    db: Session = Depends(get_db),
+    _admin: User = Depends(require_admin),
+):
+    """Extend (or start) a user's time-limited licence by N days and make them
+    live. Days stack on whatever is left: from now if lapsed/lifetime-less, or
+    from the current future expiry so unused time is never lost."""
+    target = db.get(User, user_id)
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+    now = _utcnow()
+    current = _as_utc(target.license_expires_at)
+    base = current if (current is not None and current > now) else now
+    target.license_expires_at = base + dt.timedelta(days=int(body.days))
+    target.license_status = LicenseStatus.active.value
+    if target.licensed_at is None:
+        target.licensed_at = now
+    db.commit()
+    db.refresh(target)
     return target
 
 
@@ -1155,6 +1269,7 @@ def admin_create_license_key(
         key_hash=hash_license_key(plaintext),
         key_prefix=plaintext[:7],  # "TT-Ab3" — recognisable, not guessable
         label=(body.label or "").strip() or None,
+        duration_days=body.duration_days,  # None = lifetime key
         status=LicenseKeyStatus.unused.value,
         created_by=admin.id,
     )
@@ -1165,6 +1280,7 @@ def admin_create_license_key(
         id=key.id,
         key_prefix=key.key_prefix,
         label=key.label,
+        duration_days=key.duration_days,
         status=key.status,
         created_at=key.created_at,
         redeemed_by=key.redeemed_by,
@@ -1202,30 +1318,31 @@ def redeem_license_key(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """A logged-in *pending* user activates their own account with a valid key.
+    """A logged-in user activates (or RENEWS) their account with a valid key.
 
-    A revoked licence cannot be self-restored with a key — that was an admin
-    action. Keys are single-use and claimed atomically to avoid double-redeem.
+    Works for a *pending* account and for one whose time-limited licence has
+    *expired* (redeeming renews it from now). A currently-live licence needs no
+    key, and a *revoked* one cannot be self-restored — that is an admin action.
+    Keys are single-use and claimed atomically to avoid double-redeem.
     """
     # Blunt brute-forcing of keys: cap redeem attempts per source IP.
     _enforce_rate_limit(request, "redeem", limit=10, window_seconds=600)
-    if user.license_status == LicenseStatus.active.value:
+    if user.license_active:  # truly live (active AND not expired)
         raise HTTPException(status_code=400, detail="Your licence is already active.")
     if user.license_status == LicenseStatus.revoked.value:
         raise HTTPException(
             status_code=403,
             detail="Your licence was revoked by the administrator; a key can't restore it.",
         )
-    from app.models import _utcnow
-
     now = _utcnow()
+    key_hash = hash_license_key(body.key)
     # Atomically claim the key: only an *unused* key with this hash flips to
     # redeemed. rowcount != 1 means no such unused key (bad / used / revoked /
     # a racing redeemer won) — reject without leaking which case it was.
     claimed = db.execute(
         update(LicenseKey)
         .where(
-            LicenseKey.key_hash == hash_license_key(body.key),
+            LicenseKey.key_hash == key_hash,
             LicenseKey.status == LicenseKeyStatus.unused.value,
         )
         .values(
@@ -1237,24 +1354,22 @@ def redeem_license_key(
     if claimed != 1:
         db.rollback()
         raise HTTPException(status_code=400, detail="Invalid or already-used licence key.")
+    # Read the (now-claimed) key to honour its day-count: time-limited keys set
+    # an expiry; a null duration means a lifetime licence.
+    lk = db.scalars(
+        select(LicenseKey).where(LicenseKey.key_hash == key_hash)
+    ).first()
     user.license_status = LicenseStatus.active.value
+    user.license_expires_at = (
+        now + dt.timedelta(days=int(lk.duration_days))
+        if lk and lk.duration_days
+        else None
+    )
     if user.licensed_at is None:
         user.licensed_at = now
     db.commit()
     db.refresh(user)
-    gs = get_settings()
-    return MeOut(
-        id=user.id,
-        email=user.email,
-        role=user.role,
-        license_status=user.license_status,
-        webhook_path=_webhook_path(user.webhook_token),
-        binance_keys_set=bool(user.binance_api_key_enc and user.binance_api_secret_enc),
-        binance_testnet=bool(user.binance_testnet),
-        ai_key_set=bool(gs.ai_api_key),
-        ai_model=gs.ai_model or "",
-        secrets_storage_enabled=secrets_enabled(gs.secret_key),
-    )
+    return _me_out(user)
 
 
 # ---- WebSocket ------------------------------------------------------

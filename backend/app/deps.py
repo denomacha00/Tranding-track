@@ -43,8 +43,19 @@ def get_current_user(
 
 
 def require_licensed_user(user: User = Depends(get_current_user)) -> User:
-    """Only users the admin has licensed may trade / configure keys."""
-    if user.license_status != LicenseStatus.active.value:
+    """Only users with a currently-active (non-expired) licence may trade."""
+    if (
+        user.license_status == LicenseStatus.active.value
+        and user.license_expired
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "Your licence has expired. Ask the administrator to add more "
+                "days before trading again."
+            ),
+        )
+    if not user.license_active:
         raise HTTPException(
             status_code=403,
             detail=(

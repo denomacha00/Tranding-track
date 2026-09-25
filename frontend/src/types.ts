@@ -231,9 +231,15 @@ export type WsMessage =
 
 export interface Me {
   id: number
+  username: string | null
   email: string
   role: 'admin' | 'user'
   license_status: 'pending' | 'active' | 'revoked'
+  // Effective access: licensed AND not past expiry. This — not license_status
+  // alone — is what the UI should gate trading on.
+  license_active: boolean
+  license_expires_at: string | null
+  license_days_left: number | null
   webhook_path: string
   binance_keys_set: boolean
   binance_testnet: boolean
@@ -244,9 +250,13 @@ export interface Me {
 
 export interface UserRow {
   id: number
+  username: string | null
   email: string
   role: 'admin' | 'user'
   license_status: 'pending' | 'active' | 'revoked'
+  license_active: boolean
+  license_expires_at: string | null
+  license_days_left: number | null
   created_at: string
   licensed_at: string | null
 }
@@ -257,6 +267,8 @@ export interface LicenseKeyRow {
   id: number
   key_prefix: string
   label: string | null
+  // Days of access this key grants when redeemed; null = lifetime.
+  duration_days: number | null
   status: 'unused' | 'redeemed' | 'revoked'
   created_at: string
   redeemed_by: number | null

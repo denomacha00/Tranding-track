@@ -77,15 +77,23 @@ async function req<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   // ---- auth ----
-  signup: (email: string, password: string) =>
+  // Sign up with the licence key you bought (unless the operator runs in
+  // auto-license mode), plus the username + email + password you'll log in with.
+  signup: (body: {
+    username: string
+    email: string
+    password: string
+    license_key?: string
+  }) =>
     req<{ access_token: string }>('/api/auth/signup', {
       method: 'POST',
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify(body),
     }),
-  login: (email: string, password: string) =>
+  // Log in with EITHER your username or your email in the single identifier field.
+  login: (identifier: string, password: string) =>
     req<{ access_token: string }>('/api/auth/login', {
       method: 'POST',
-      body: JSON.stringify({ email, password }),
+      body: JSON.stringify({ identifier, password }),
     }),
   me: () => req<Me>('/api/auth/me'),
   updateCredentials: (body: {
@@ -101,14 +109,24 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ status }),
     }),
+  // Extend (or start) a user's time-limited licence by N days and make them live.
+  adminAddDays: (id: number, days: number) =>
+    req<UserRow>(`/api/admin/users/${id}/add-days`, {
+      method: 'POST',
+      body: JSON.stringify({ days }),
+    }),
   adminDeleteUser: (id: number) =>
     req<{ deleted: number }>(`/api/admin/users/${id}`, { method: 'DELETE' }),
-  // Licence keys: admin mints them, pending users self-redeem to activate.
+  // Licence keys: admin mints them (optionally with a label + day count), clients
+  // redeem them at signup to go live instantly.
   adminLicenseKeys: () => req<LicenseKeyRow[]>('/api/admin/license-keys'),
-  adminCreateLicenseKey: (label?: string) =>
+  adminCreateLicenseKey: (label?: string, durationDays?: number | null) =>
     req<LicenseKeyCreated>('/api/admin/license-keys', {
       method: 'POST',
-      body: JSON.stringify({ label: label ?? null }),
+      body: JSON.stringify({
+        label: label ?? null,
+        duration_days: durationDays ?? null,
+      }),
     }),
   adminRevokeLicenseKey: (id: number) =>
     req<LicenseKeyRow>(`/api/admin/license-keys/${id}/revoke`, { method: 'POST' }),

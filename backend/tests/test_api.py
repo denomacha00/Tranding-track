@@ -8,9 +8,33 @@ on the underlying modules.
 """
 from __future__ import annotations
 
+import atexit
 import os
+import tempfile
 
 os.environ.setdefault("TRADING_MODE", "paper")
+
+# Run the suite against a private, throwaway SQLite file — never the developer's
+# persistent tranding_track.db. A stale dev DB (e.g. a legacy admin row created
+# before the `username` column existed) otherwise poisons fixtures. This MUST be
+# set before importing app.database, which binds its engine at import time.
+_TEST_DB = os.path.join(tempfile.gettempdir(), f"tt_test_{os.getpid()}.db")
+for _p in (_TEST_DB, _TEST_DB + "-wal", _TEST_DB + "-shm"):
+    try:
+        os.remove(_p)
+    except OSError:
+        pass
+os.environ["DATABASE_URL"] = "sqlite:///" + _TEST_DB.replace("\\", "/")
+
+
+@atexit.register
+def _cleanup_test_db() -> None:
+    for _p in (_TEST_DB, _TEST_DB + "-wal", _TEST_DB + "-shm"):
+        try:
+            os.remove(_p)
+        except OSError:
+            pass
+
 
 import pytest
 from fastapi.testclient import TestClient
@@ -39,12 +63,16 @@ def client():
         # First user matching admin_email becomes the licensed admin.
         r = c.post(
             "/api/auth/signup",
-            json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+            json={
+                "username": "admin",
+                "email": ADMIN_EMAIL,
+                "password": ADMIN_PASSWORD,
+            },
         )
         if r.status_code == 409:
             r = c.post(
                 "/api/auth/login",
-                json={"email": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
+                json={"identifier": ADMIN_EMAIL, "password": ADMIN_PASSWORD},
             )
         token = r.json()["access_token"]
         c.headers.update({"Authorization": f"Bearer {token}"})
@@ -70,14 +98,16 @@ def test_requires_auth(client):
 def test_me_shape(client):
     body = client.get("/api/auth/me").json()
     assert body["email"] == ADMIN_EMAIL
+    assert body["username"] == "admin"
     assert body["role"] == "admin"
     assert body["license_status"] == "active"
+    assert body["license_active"] is True
     assert body["webhook_path"].startswith("/api/webhook/tradingview/")
 
 
 def test_login_bad_password(client):
     r = client.post(
-        "/api/auth/login", json={"email": ADMIN_EMAIL, "password": "wrong"}
+        "/api/auth/login", json={"identifier": ADMIN_EMAIL, "password": "wrong"}
     )
     assert r.status_code == 401
 
@@ -210,10 +240,14 @@ def test_trades_empty_initially(client):
 # ---- multi-user, licensing & admin ---------------------------------
 
 
-def _signup(client, email, password="password123"):
-    return client.post(
-        "/api/auth/signup", json={"email": email, "password": password}
-    )
+def _signup(client, email, password="password123", username=None, license_key=None):
+    # Derive a valid, unique username from the email local-part unless one is
+    # given (e.g. "trader1@example.com" -> "trader1").
+    username = username or email.split("@", 1)[0]
+    payload = {"username": username, "email": email, "password": password}
+    if license_key is not None:
+        payload["license_key"] = license_key
+    return client.post("/api/auth/signup", json=payload)
 
 
 def test_admin_can_list_and_license_users(client):
@@ -236,13 +270,16 @@ def test_admin_can_list_and_license_users(client):
     assert grant.status_code == 200
     assert grant.json()["license_status"] == "active"
     assert grant.json()["licensed_at"] is not None
+    # A manual admin grant is a lifetime licence (no expiry).
+    assert grant.json()["license_expires_at"] is None
+    assert grant.json()["license_active"] is True
 
 
 def test_non_admin_forbidden_from_admin_routes(client):
     _signup(client, "trader2@example.com", "password123")
     login = client.post(
         "/api/auth/login",
-        json={"email": "trader2@example.com", "password": "password123"},
+        json={"identifier": "trader2@example.com", "password": "password123"},
     )
     token = login.json()["access_token"]
     r = TestClient(app).get(
@@ -251,23 +288,111 @@ def test_non_admin_forbidden_from_admin_routes(client):
     assert r.status_code == 403
 
 
-def test_pending_user_cannot_trade(client):
-    # Temporarily require admin approval so this signup is PENDING.
+def test_login_by_username_or_email(client):
+    # Sign up a user, then confirm login works with BOTH the username and email.
+    _signup(client, "byname@example.com", "password123", username="by_name")
+    for ident in ("by_name", "BYNAME@EXAMPLE.COM"):  # username + case-insensitive email
+        r = client.post(
+            "/api/auth/login", json={"identifier": ident, "password": "password123"}
+        )
+        assert r.status_code == 200, ident
+        assert r.json()["access_token"]
+
+
+def test_signup_requires_license_key_when_not_auto(client):
+    # With auto-licensing OFF and no key, a normal signup is rejected — a client
+    # must redeem the key they bought to create a live account.
     s = get_settings()
     s.auto_license_new_users = False
     try:
-        _signup(client, "pending@example.com", "password123")
+        r = _signup(client, "nokey@example.com", "password123")
     finally:
         s.auto_license_new_users = True
+    assert r.status_code == 400
+    assert "licence key" in r.json()["detail"].lower()
+
+
+def test_signup_with_license_key_activates_and_sets_days(client):
+    # Admin mints a 30-day key; a client redeems it at signup and is live at once.
+    import uuid
+
+    tag = uuid.uuid4().hex[:8]  # unique labels so the row is easy to find
+    key = client.post(
+        "/api/admin/license-keys", json={"label": "Client A", "duration_days": 30}
+    ).json()["key"]
+    s = get_settings()
+    s.auto_license_new_users = False
+    try:
+        r = _signup(
+            client,
+            f"keyed-{tag}@example.com",
+            "password123",
+            username=f"keyed_{tag}",
+            license_key=key,
+        )
+        assert r.status_code == 200
+        token = r.json()["access_token"]
+        me = TestClient(app).get(
+            "/api/auth/me", headers={"Authorization": f"Bearer {token}"}
+        ).json()
+        assert me["license_status"] == "active"
+        assert me["license_active"] is True
+        assert me["license_days_left"] in (29, 30)  # ceil of ~30 days
+        # The same key cannot be reused by another client. This MUST run while
+        # auto_license is still off, otherwise the key would be bypassed, not
+        # consumed — hence it lives inside the try, before finally restores it.
+        again = _signup(
+            client,
+            f"keyed2-{tag}@example.com",
+            "password123",
+            username=f"keyed2_{tag}",
+            license_key=key,
+        )
+        assert again.status_code == 400
+    finally:
+        s.auto_license_new_users = True
+
+
+def test_admin_add_days_extends_licence(client):
+    r = _signup(client, "adddays@example.com", "password123")
+    assert r.status_code in (200, 409)
+    users = client.get("/api/admin/users").json()
+    target = next(u for u in users if u["email"] == "adddays@example.com")
+    add = client.post(
+        f"/api/admin/users/{target['id']}/add-days", json={"days": 7}
+    )
+    assert add.status_code == 200
+    body = add.json()
+    assert body["license_status"] == "active"
+    assert body["license_active"] is True
+    assert body["license_days_left"] in (6, 7)
+
+
+def test_pending_user_cannot_trade(client):
+    # A user whose licence has EXPIRED must not be able to place orders.
+    from app.models import User, _utcnow
+    import datetime as _dt
+    from app.database import SessionLocal
+
+    _signup(client, "expired@example.com", "password123")
+    # Force their licence to be active-but-expired directly in the DB.
+    db = SessionLocal()
+    try:
+        u = db.query(User).filter(User.email == "expired@example.com").first()
+        u.license_status = "active"
+        u.license_expires_at = _utcnow() - _dt.timedelta(days=1)
+        db.commit()
+    finally:
+        db.close()
     login = client.post(
         "/api/auth/login",
-        json={"email": "pending@example.com", "password": "password123"},
+        json={"identifier": "expired@example.com", "password": "password123"},
     )
     token = login.json()["access_token"]
     hdr = {"Authorization": f"Bearer {token}"}
     tc = TestClient(app)
-    # Pending users can see their own status but not place orders.
-    assert tc.get("/api/auth/me", headers=hdr).json()["license_status"] == "pending"
+    me = tc.get("/api/auth/me", headers=hdr).json()
+    assert me["license_status"] == "active" and me["license_active"] is False
     r = tc.post(
         "/api/order",
         headers=hdr,
@@ -286,7 +411,7 @@ def test_trades_isolated_per_user(client):
     _signup(client, "trader3@example.com", "password123")
     login = client.post(
         "/api/auth/login",
-        json={"email": "trader3@example.com", "password": "password123"},
+        json={"identifier": "trader3@example.com", "password": "password123"},
     )
     token = login.json()["access_token"]
     other = TestClient(app).get(
@@ -301,8 +426,16 @@ def test_duplicate_signup_rejected(client):
     assert _signup(client, "dup-check@example.com").status_code == 409
 
 
+def test_duplicate_username_rejected(client):
+    r1 = _signup(client, "sameuser1@example.com", username="taken_name")
+    assert r1.status_code in (200, 409)
+    r2 = _signup(client, "sameuser2@example.com", username="taken_name")
+    assert r2.status_code == 409
+
+
 def test_signup_weak_password_rejected(client):
     r = client.post(
-        "/api/auth/signup", json={"email": "weak@example.com", "password": "short"}
+        "/api/auth/signup",
+        json={"username": "weakling", "email": "weak@example.com", "password": "short"},
     )
     assert r.status_code == 422

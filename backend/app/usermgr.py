@@ -102,7 +102,10 @@ class EngineManager:
 
     def active_users(self, db: Session) -> list[User]:
         stmt = select(User).where(User.license_status == LicenseStatus.active.value)
-        return list(db.scalars(stmt).all())
+        # Exclude time-limited licences that have passed their expiry so an
+        # unpaid/expired client's bot stops auto-trading (its open positions are
+        # still managed elsewhere via check_open_positions on the stored engine).
+        return [u for u in db.scalars(stmt).all() if not u.license_expired]
 
     def engines_for_active_users(self, db: Session) -> list[tuple[User, TradingEngine]]:
         """Return (user, engine) for every currently-licensed user."""

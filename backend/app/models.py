@@ -15,6 +15,19 @@ def _utcnow() -> dt.datetime:
     return dt.datetime.now(dt.timezone.utc)
 
 
+def _as_utc(value: "dt.datetime | None") -> "dt.datetime | None":
+    """Coerce a possibly-naive datetime (SQLite hands back naive) to aware UTC.
+
+    Licence expiry is compared against :func:`_utcnow` (aware), so a naive value
+    read back from the DB must be treated as UTC rather than raising on compare.
+    """
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt.timezone.utc)
+    return value.astimezone(dt.timezone.utc)
+
+
 class OrderSide(str, Enum):
     buy = "buy"
     sell = "sell"
@@ -61,6 +74,11 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
+    # Optional handle a client can log in with instead of their email. Unique
+    # (case-insensitive enforced at the API layer); NULL for legacy accounts.
+    username: Mapped[str | None] = mapped_column(
+        String(64), unique=True, index=True, nullable=True
+    )
     password_hash: Mapped[str] = mapped_column(String(255))
     role: Mapped[str] = mapped_column(String(8), default=UserRole.user.value)
     license_status: Mapped[str] = mapped_column(
@@ -80,6 +98,34 @@ class User(Base):
     licensed_at: Mapped[dt.datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # When set, the licence AUTO-EXPIRES at this instant (time-limited plan sold
+    # via a licence key with a day count). NULL = no expiry (lifetime / admin).
+    license_expires_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+    @property
+    def license_expired(self) -> bool:
+        """True only for a time-limited licence that has passed its expiry."""
+        exp = _as_utc(self.license_expires_at)
+        return exp is not None and _utcnow() >= exp
+
+    @property
+    def license_active(self) -> bool:
+        """Licensed AND not expired — the single source of truth for access."""
+        return (
+            self.license_status == LicenseStatus.active.value
+            and not self.license_expired
+        )
+
+    @property
+    def license_days_left(self) -> int | None:
+        """Whole days until expiry (ceil), 0 if past, None if no expiry set."""
+        exp = _as_utc(self.license_expires_at)
+        if exp is None:
+            return None
+        secs = int((exp - _utcnow()).total_seconds())
+        return 0 if secs <= 0 else (secs + 86399) // 86400
 
 
 class Trade(Base):
@@ -175,6 +221,8 @@ class LicenseKey(Base):
     key_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     key_prefix: Mapped[str] = mapped_column(String(16))  # display only, e.g. "TT-Ab3x"
     label: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    # How many days of access the key grants when redeemed. NULL = lifetime.
+    duration_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(
         String(12), default=LicenseKeyStatus.unused.value, index=True
     )

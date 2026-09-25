@@ -149,12 +149,18 @@ class SettingsUpdate(BaseModel):
 
 
 class SignupRequest(BaseModel):
+    # A client signs up with the licence key you sold them, plus the username +
+    # email + password they'll log in with next time. The key is optional only
+    # for the bootstrap admin / auto-license mode (enforced server-side).
+    username: str = Field(min_length=3, max_length=64)
     email: str = Field(min_length=3, max_length=255)
     password: str = Field(min_length=8, max_length=200)
+    license_key: Optional[str] = Field(default=None, max_length=200)
 
 
 class LoginRequest(BaseModel):
-    email: str
+    # Accept either the username OR the email in a single field.
+    identifier: str = Field(min_length=1, max_length=255)
     password: str
 
 
@@ -167,9 +173,15 @@ class UserOut(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
     id: int
+    username: Optional[str] = None
     email: str
     role: str
     license_status: str
+    # Effective access (status active AND not past expiry) + how much time is
+    # left, so the admin sees at a glance who is truly live and for how long.
+    license_active: bool = False
+    license_expires_at: Optional[dt.datetime] = None
+    license_days_left: Optional[int] = None
     created_at: dt.datetime
     licensed_at: Optional[dt.datetime] = None
 
@@ -178,9 +190,13 @@ class MeOut(BaseModel):
     """Current user + capability flags the UI needs to render correctly."""
 
     id: int
+    username: Optional[str] = None
     email: str
     role: str
     license_status: str
+    license_active: bool = False
+    license_expires_at: Optional[dt.datetime] = None
+    license_days_left: Optional[int] = None
     webhook_path: str
     binance_keys_set: bool
     binance_testnet: bool
@@ -205,13 +221,25 @@ class LicenseUpdate(BaseModel):
     status: Literal["pending", "active", "revoked"]
 
 
+class AddLicenseDays(BaseModel):
+    """Admin action: extend (or start) a user's time-limited licence by N days."""
+
+    days: int = Field(ge=1, le=3650)
+
+
 # ---- Licence keys (admin generates, users self-redeem) --------------
 
 
 class LicenseKeyCreate(BaseModel):
-    """Admin request to mint a new licence key. Label is a free-text reminder."""
+    """Admin request to mint a new licence key.
+
+    ``label`` is a free-text reminder (e.g. the client's name). ``duration_days``
+    sets how long the licence lasts once redeemed — omit (or null) for a
+    lifetime key that never expires.
+    """
 
     label: Optional[str] = Field(default=None, max_length=120)
+    duration_days: Optional[int] = Field(default=None, ge=1, le=3650)
 
 
 class LicenseKeyOut(BaseModel):
@@ -223,6 +251,7 @@ class LicenseKeyOut(BaseModel):
     id: int
     key_prefix: str
     label: Optional[str] = None
+    duration_days: Optional[int] = None
     status: str
     created_at: dt.datetime
     redeemed_by: Optional[int] = None

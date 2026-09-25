@@ -77,10 +77,18 @@ export default function App() {
   if (!me) {
     return <Login onAuthed={() => { setChecking(true); loadMe() }} theme={theme} onToggleTheme={toggleTheme} />
   }
-  if (me.license_status !== 'active') {
+  // Gate on EFFECTIVE access (active AND not expired), not status alone, so an
+  // expired time-limited licence is stopped at the door just like a pending one.
+  if (!me.license_active) {
+    const gate: 'pending' | 'revoked' | 'expired' =
+      me.license_status === 'revoked'
+        ? 'revoked'
+        : me.license_status === 'active'
+          ? 'expired' // status active but past its expiry
+          : 'pending'
     return (
       <LicenseGate
-        status={me.license_status as 'pending' | 'revoked'}
+        status={gate}
         email={me.email}
         onLogout={logout}
         onRedeemed={setMe}

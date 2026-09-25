@@ -31,8 +31,24 @@ export function Admin({ onError }: { onError: (msg: string) => void }) {
     }
   }
 
-  const remove = async (id: number, email: string) => {
-    if (!confirm(`Delete ${email}? This removes the account permanently.`)) return
+  const addDays = async (id: number) => {
+    const v = prompt('Add how many days of access for this client?', '30')
+    if (v == null) return
+    const n = parseInt(v, 10)
+    if (!Number.isFinite(n) || n < 1 || n > 3650) {
+      onError('Enter a whole number of days between 1 and 3650.')
+      return
+    }
+    try {
+      await api.adminAddDays(id, n)
+      await load()
+    } catch (e) {
+      onError((e as Error).message)
+    }
+  }
+
+  const remove = async (id: number, who: string) => {
+    if (!confirm(`Delete ${who}? This removes the account permanently.`)) return
     try {
       await api.adminDeleteUser(id)
       await load()
@@ -41,18 +57,30 @@ export function Admin({ onError }: { onError: (msg: string) => void }) {
     }
   }
 
-  const badge = (s: string) =>
-    s === 'active' ? 'on' : s === 'revoked' ? 'off' : ''
+  // Effective-access badge: green only when truly live (active AND not expired).
+  const badge = (u: UserRow) =>
+    u.license_active ? 'on' : u.license_status === 'revoked' ? 'off' : ''
 
-  const active = users.filter((u) => u.license_status === 'active').length
+  // What to show in the Licence cell: an expired time-limited licence reads
+  // "expired" even though its raw status is still "active".
+  const licenceLabel = (u: UserRow) =>
+    u.license_status === 'active' && !u.license_active ? 'expired' : u.license_status
+
+  const accessLabel = (u: UserRow) => {
+    if (!u.license_active) return '—'
+    if (u.license_days_left == null) return 'lifetime'
+    return `${u.license_days_left}d left`
+  }
+
+  const active = users.filter((u) => u.license_active).length
   const pending = users.filter((u) => u.license_status === 'pending').length
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 20 }}>
       <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
         <p className="hint">
-          Grant or revoke user licences. Only licensed users can enter API keys and
-          trade. {users.length} users · {active} active · {pending} pending.
+          Grant, revoke or extend user licences. Only currently-live users can enter
+          API keys and trade. {users.length} users · {active} live · {pending} pending.
         </p>
         <div className="row">
           <button className="btn" onClick={load} disabled={busy}>
@@ -66,9 +94,11 @@ export function Admin({ onError }: { onError: (msg: string) => void }) {
             <thead>
               <tr>
                 <th>ID</th>
+                <th>Username</th>
                 <th>Email</th>
                 <th>Role</th>
                 <th>Licence</th>
+                <th>Access</th>
                 <th>Registered</th>
                 <th></th>
               </tr>
@@ -77,17 +107,17 @@ export function Admin({ onError }: { onError: (msg: string) => void }) {
               {users.map((u) => (
                 <tr key={u.id}>
                   <td className="mono">{u.id}</td>
+                  <td>{u.username || <span className="hint">—</span>}</td>
                   <td>{u.email}</td>
                   <td>{u.role}</td>
                   <td>
-                    <span className={`tag ${badge(u.license_status)}`}>
-                      {u.license_status}
-                    </span>
+                    <span className={`tag ${badge(u)}`}>{licenceLabel(u)}</span>
                   </td>
+                  <td className="mono">{accessLabel(u)}</td>
                   <td className="mono">{u.created_at?.slice(0, 10)}</td>
                   <td>
-                    <div className="row" style={{ gap: 6 }}>
-                      {u.license_status !== 'active' ? (
+                    <div className="row" style={{ gap: 6, flexWrap: 'wrap' }}>
+                      {!u.license_active ? (
                         <button className="btn buy" onClick={() => setLicense(u.id, 'active')}>
                           Grant
                         </button>
@@ -96,8 +126,14 @@ export function Admin({ onError }: { onError: (msg: string) => void }) {
                           Revoke
                         </button>
                       )}
+                      <button className="btn" onClick={() => addDays(u.id)}>
+                        + Days
+                      </button>
                       {u.role !== 'admin' && (
-                        <button className="btn" onClick={() => remove(u.id, u.email)}>
+                        <button
+                          className="btn"
+                          onClick={() => remove(u.id, u.username || u.email)}
+                        >
                           Delete
                         </button>
                       )}
@@ -124,6 +160,7 @@ export function Admin({ onError }: { onError: (msg: string) => void }) {
 function LicenseKeys({ onError }: { onError: (msg: string) => void }) {
   const [keys, setKeys] = useState<LicenseKeyRow[]>([])
   const [label, setLabel] = useState('')
+  const [days, setDays] = useState('') // blank = lifetime key
   const [busy, setBusy] = useState(false)
   const [justCreated, setJustCreated] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
@@ -141,12 +178,23 @@ function LicenseKeys({ onError }: { onError: (msg: string) => void }) {
   }, [load])
 
   const generate = async () => {
+    // Empty days = a lifetime key; otherwise validate the day count up front.
+    let duration: number | null = null
+    if (days.trim()) {
+      const n = parseInt(days, 10)
+      if (!Number.isFinite(n) || n < 1 || n > 3650) {
+        onError('Days must be a whole number between 1 and 3650 (or blank for lifetime).')
+        return
+      }
+      duration = n
+    }
     setBusy(true)
     setCopied(false)
     try {
-      const created = await api.adminCreateLicenseKey(label.trim() || undefined)
+      const created = await api.adminCreateLicenseKey(label.trim() || undefined, duration)
       setJustCreated(created.key) // shown once; never returned again
       setLabel('')
+      setDays('')
       await load()
     } catch (e) {
       onError((e as Error).message)
@@ -185,20 +233,30 @@ function LicenseKeys({ onError }: { onError: (msg: string) => void }) {
       <div>
         <h3 style={{ margin: '0 0 4px' }}>Licence keys</h3>
         <p className="hint" style={{ margin: 0 }}>
-          Generate a key and share it with a new user — they paste it on the
-          activation screen to license themselves instantly. {keys.length} keys ·{' '}
-          {unused} unused.
+          Generate a key (give it a client name and how many days it lasts), then
+          share it — the client pastes it when signing up to go live instantly. A
+          blank day count makes a lifetime key. {keys.length} keys · {unused} unused.
         </p>
       </div>
 
       <div className="row" style={{ gap: 8, flexWrap: 'wrap' }}>
         <input
           className="input"
-          style={{ maxWidth: 260 }}
+          style={{ maxWidth: 220 }}
           value={label}
           onChange={(e) => setLabel(e.target.value)}
-          placeholder="Label (optional, e.g. “Alice”)"
+          placeholder="Client name (optional, e.g. “Alice”)"
           maxLength={120}
+        />
+        <input
+          className="input"
+          style={{ maxWidth: 150 }}
+          type="number"
+          min={1}
+          max={3650}
+          value={days}
+          onChange={(e) => setDays(e.target.value)}
+          placeholder="Days (blank = lifetime)"
         />
         <button className="btn primary" onClick={generate} disabled={busy}>
           {busy ? 'Generating…' : 'Generate key'}
@@ -232,7 +290,8 @@ function LicenseKeys({ onError }: { onError: (msg: string) => void }) {
           <thead>
             <tr>
               <th>Key</th>
-              <th>Label</th>
+              <th>Client</th>
+              <th>Duration</th>
               <th>Status</th>
               <th>Created</th>
               <th></th>
@@ -243,6 +302,9 @@ function LicenseKeys({ onError }: { onError: (msg: string) => void }) {
               <tr key={k.id}>
                 <td className="mono">{k.key_prefix}…</td>
                 <td>{k.label || <span className="hint">—</span>}</td>
+                <td className="mono">
+                  {k.duration_days ? `${k.duration_days}d` : 'lifetime'}
+                </td>
                 <td>
                   <span className={`tag ${keyBadge(k.status)}`}>{k.status}</span>
                 </td>
