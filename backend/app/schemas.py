@@ -93,6 +93,45 @@ class TickerOut(BaseModel):
     source: Optional[str] = None
 
 
+class PerfBucket(BaseModel):
+    """Realized-P&L stats for a set of closed trades (all figures from real
+    trades; ``profit_factor`` is null when there are no losing trades)."""
+
+    closed_trades: int
+    wins: int
+    losses: int
+    breakeven: int
+    win_rate_pct: float
+    total_pnl: float
+    gross_profit: float
+    gross_loss: float
+    profit_factor: Optional[float] = None
+    avg_win: float
+    avg_loss: float
+    expectancy: float
+    largest_win: float
+    largest_loss: float
+    max_drawdown: float
+
+
+class PerfSymbol(BaseModel):
+    symbol: str
+    trades: int
+    pnl: float
+    wins: int
+
+
+class PerformanceOut(PerfBucket):
+    """Overall stats (inherited) plus paper/live splits and a per-symbol
+    breakdown. Paper and live are separate so simulated gains are never counted
+    as real money."""
+
+    avg_hold_seconds: Optional[float] = None
+    paper: PerfBucket
+    live: PerfBucket
+    by_symbol: list[PerfSymbol]
+
+
 class BotStatus(BaseModel):
     running: bool
     trading_mode: str

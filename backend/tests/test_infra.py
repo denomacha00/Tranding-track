@@ -375,3 +375,107 @@ def test_geo_block_without_fallback_reraises_honestly():
     conn._fallback_client = None
     with pytest.raises(ccxt.ExchangeNotAvailable):
         conn.fetch_ticker("BTC/USDT")  # no fallback -> the real 451 still surfaces
+
+
+# ---- performance analytics (computed from REAL closed trades) --------
+
+import datetime as _dt  # noqa: E402
+import types as _types  # noqa: E402
+
+_PERF_T0 = _dt.datetime(2026, 1, 1, tzinfo=_dt.timezone.utc)
+_perf_seq = {"i": 0}
+
+
+def _trade(pnl, *, status="closed", mode="paper", symbol="BTC/USDT", opened=None, closed=None):
+    """A minimal stand-in for a Trade row (no DB)."""
+    _perf_seq["i"] += 1
+    if opened is None:
+        opened = _PERF_T0
+    if closed is None and status == "closed":
+        # monotonically increasing close time -> deterministic close ordering
+        closed = _PERF_T0 + _dt.timedelta(minutes=_perf_seq["i"])
+    return _types.SimpleNamespace(
+        pnl=pnl, status=status, mode=mode, symbol=symbol,
+        entry_price=100.0, amount=1.0, side="buy",
+        opened_at=opened, closed_at=closed,
+    )
+
+
+def test_performance_empty_is_all_zero_not_fabricated():
+    from app.performance import compute_performance
+
+    p = compute_performance([])
+    assert p["closed_trades"] == 0
+    assert p["win_rate_pct"] == 0.0
+    assert p["total_pnl"] == 0.0
+    assert p["profit_factor"] is None  # undefined -> null, never a fake number
+    assert p["by_symbol"] == []
+    assert p["avg_hold_seconds"] is None
+
+
+def test_performance_ignores_open_trades():
+    from app.performance import compute_performance
+
+    p = compute_performance([_trade(50.0, status="open"), _trade(20.0)])
+    assert p["closed_trades"] == 1  # the still-open position has no realized result
+    assert p["total_pnl"] == 20.0
+
+
+def test_performance_core_metrics_and_drawdown():
+    from app.performance import compute_performance
+
+    # close order +100, -50, -30, +20 -> equity 100, 50, 20, 40 (peak 100)
+    p = compute_performance([_trade(100.0), _trade(-50.0), _trade(-30.0), _trade(20.0)])
+    assert p["closed_trades"] == 4
+    assert p["wins"] == 2 and p["losses"] == 2
+    assert p["win_rate_pct"] == 50.0
+    assert p["total_pnl"] == 40.0
+    assert p["gross_profit"] == 120.0 and p["gross_loss"] == 80.0
+    assert p["profit_factor"] == 1.5
+    assert p["expectancy"] == 10.0
+    assert p["largest_win"] == 100.0 and p["largest_loss"] == -50.0
+    assert p["max_drawdown"] == 80.0  # peak 100 down to trough 20
+
+
+def test_performance_profit_factor_none_when_no_losses():
+    from app.performance import compute_performance
+
+    p = compute_performance([_trade(10.0), _trade(5.0)])
+    assert p["losses"] == 0
+    assert p["profit_factor"] is None
+    assert p["win_rate_pct"] == 100.0
+
+
+def test_performance_splits_paper_and_live():
+    from app.performance import compute_performance
+
+    p = compute_performance([
+        _trade(10.0, mode="paper"),
+        _trade(-4.0, mode="live"),
+        _trade(6.0, mode="live"),
+    ])
+    assert p["paper"]["closed_trades"] == 1 and p["paper"]["total_pnl"] == 10.0
+    assert p["live"]["closed_trades"] == 2 and p["live"]["total_pnl"] == 2.0
+    assert p["total_pnl"] == 12.0  # overall combines both, honestly
+
+
+def test_performance_by_symbol_breakdown_sorted():
+    from app.performance import compute_performance
+
+    p = compute_performance([
+        _trade(5.0, symbol="ETH/USDT"),
+        _trade(-2.0, symbol="ETH/USDT"),
+        _trade(30.0, symbol="BTC/USDT"),
+    ])
+    syms = p["by_symbol"]
+    assert syms[0]["symbol"] == "BTC/USDT" and syms[0]["pnl"] == 30.0  # best first
+    eth = next(s for s in syms if s["symbol"] == "ETH/USDT")
+    assert eth["trades"] == 2 and eth["pnl"] == 3.0 and eth["wins"] == 1
+
+
+def test_performance_avg_hold_seconds_from_timestamps():
+    from app.performance import compute_performance
+
+    o = _dt.datetime(2026, 1, 1, 12, 0, tzinfo=_dt.timezone.utc)
+    p = compute_performance([_trade(1.0, opened=o, closed=o + _dt.timedelta(hours=2))])
+    assert p["avg_hold_seconds"] == 7200.0

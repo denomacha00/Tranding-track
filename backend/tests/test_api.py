@@ -237,6 +237,20 @@ def test_trades_empty_initially(client):
     assert isinstance(r.json(), list)
 
 
+def test_performance_endpoint_shape_no_trades(client):
+    r = client.get("/api/performance")
+    assert r.status_code == 200
+    p = r.json()
+    # No trades yet: honest zeros, undefined profit factor is null (not faked).
+    assert p["closed_trades"] == 0
+    assert p["total_pnl"] == 0.0
+    assert p["profit_factor"] is None
+    assert p["by_symbol"] == []
+    # Paper/live are always split so simulated gains never look like real money.
+    assert p["paper"]["closed_trades"] == 0
+    assert p["live"]["closed_trades"] == 0
+
+
 # ---- multi-user, licensing & admin ---------------------------------
 
 

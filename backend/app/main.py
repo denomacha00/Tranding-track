@@ -61,6 +61,7 @@ from app.schemas import (
     LoginRequest,
     ManualOrder,
     MeOut,
+    PerformanceOut,
     RedeemLicenseKey,
     SettingsOut,
     SettingsUpdate,
@@ -85,6 +86,7 @@ from app.security import (
 from app.usermgr import get_manager
 from app.learn import PARAM_GRIDS, train
 from app.news import fetch_market_news
+from app.performance import compute_performance
 from app.strategies import STRATEGY_REGISTRY, build_strategy
 from app.tasks import monitor_loop
 from app.ws import Broadcaster
@@ -637,6 +639,18 @@ def list_trades(
         stmt = stmt.where(Trade.status == status)
     stmt = stmt.order_by(Trade.opened_at.desc()).limit(min(limit, 500))
     return list(db.scalars(stmt).all())
+
+
+@app.get("/api/performance", response_model=PerformanceOut)
+def performance(db: Session = Depends(get_db), user: User = Depends(get_current_user)):
+    """Realized performance analytics for the current user, computed live from
+    their CLOSED trades. Read-only — never places or changes an order. Paper and
+    live results are split so simulated gains are not counted as real money.
+    """
+    stmt = select(Trade).where(
+        Trade.user_id == user.id, Trade.status == TradeStatus.closed.value
+    )
+    return compute_performance(db.scalars(stmt).all())
 
 
 @app.get("/api/signals", response_model=list[SignalOut])
