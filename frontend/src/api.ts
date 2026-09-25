@@ -15,6 +15,7 @@ import type {
   OrderBook,
   Performance,
   ScaledResult,
+  SavedStrategy,
   Settings,
   SignalRow,
   StrategyInfo,
@@ -195,17 +196,31 @@ export const api = {
     timeframe = '1h',
     feePct?: number,
     slippagePct?: number,
+    useSaved = false,
   ) => {
     const params = new URLSearchParams({ symbol, strategy, timeframe })
     if (feePct !== undefined) params.set('fee_pct', String(feePct))
     if (slippagePct !== undefined) params.set('slippage_pct', String(slippagePct))
+    if (useSaved) params.set('use_saved', 'true')
     return req<BacktestResult>(`/api/backtest?${params.toString()}`)
   },
   strategies: () => req<StrategyInfo[]>('/api/strategies'),
-  train: (symbol: string, strategy: string, timeframe = '1h') =>
+  // Train and (by default) SAVE the winning config to this account so the bot
+  // can trade it. Pass save=false to preview a training run without persisting.
+  train: (symbol: string, strategy: string, timeframe = '1h', save = true) =>
     req<TrainingReport>(
-      `/api/train?symbol=${encodeURIComponent(symbol)}&strategy=${strategy}&timeframe=${timeframe}`,
+      `/api/train?symbol=${encodeURIComponent(symbol)}&strategy=${strategy}&timeframe=${timeframe}&save=${save}`,
       { method: 'POST' },
+    ),
+  // The strategies this user has trained and saved (one per symbol). These are
+  // what the bot trades with when Settings `use_saved_strategy` is on. Empty
+  // means nothing trained-and-saved yet — never a stub.
+  savedStrategies: () => req<SavedStrategy[]>('/api/strategies/saved'),
+  // Forget a saved strategy for a symbol; the bot falls back to the analyzer.
+  deleteSavedStrategy: (symbol: string) =>
+    req<{ removed: boolean; symbol: string }>(
+      `/api/strategies/saved/${encodeURIComponent(symbol)}`,
+      { method: 'DELETE' },
     ),
   analyze: (symbol: string, timeframe = '1h', explain = false, assess = false) =>
     req<MarketAnalysis>(

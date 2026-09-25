@@ -123,6 +123,10 @@ select {
   display: grid;
   grid-template-rows: auto 1fr;
   height: 100vh;
+  /* Dynamic viewport unit so the layout fills the screen on mobile browsers
+     whose address bar shows/hides (100vh there is the TALLER state and gets
+     clipped). Falls back to 100vh where dvh is unsupported. */
+  height: 100dvh;
   overflow: hidden;
 }
 
@@ -240,6 +244,12 @@ select {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
   gap: 12px;
+}
+
+/* A 3-up variant for six-metric panels (backtest, performance). Drops to two-up
+   on phones via the mobile breakpoint below, instead of staying cramped at 3. */
+.stats.cols-3 {
+  grid-template-columns: repeat(3, 1fr);
 }
 
 .stat {
@@ -785,6 +795,14 @@ pre.code {
   gap: 4px;
 }
 
+/* The current-view label that replaces the tab strip on phones (see the mobile
+   breakpoint). Hidden on desktop, where the tabs themselves show the state. */
+.tab-current {
+  display: none;
+  font-weight: 700;
+  font-size: 15px;
+}
+
 .tab {
   padding: 6px 12px;
   border-radius: 8px 8px 0 0;
@@ -923,6 +941,37 @@ pre.code {
   }
   .stats {
     grid-template-columns: repeat(2, 1fr);
+  }
+  /* Six-metric panels also drop to two-up (were forced to 3 via a class). */
+  .stats.cols-3 {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  /* Wide tables (Signals, Trades, Admin users, licence keys, leaderboards,
+     saved strategies) scroll horizontally inside their panel instead of
+     overflowing the page or squishing columns. Cells already keep
+     white-space:nowrap, so each row stays readable while you swipe across. */
+  table {
+    display: block;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+  /* Slightly smaller stat numbers so two-up cards don't wrap on small phones. */
+  .stat .value {
+    font-size: 19px;
+  }
+  /* Keep toasts clear of the screen edges on a phone. */
+  .toast {
+    left: 12px;
+    right: 12px;
+    max-width: none;
+  }
+  /* The wrapping 10-tab strip is replaced by the hamburger drawer on phones;
+     show only the current view's name in the panel header instead. */
+  .tabs {
+    display: none;
+  }
+  .tab-current {
+    display: block;
   }
 }
 

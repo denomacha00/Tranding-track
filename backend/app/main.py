@@ -775,11 +775,13 @@ def _settings_out(engine, user: User) -> SettingsOut:
         default_take_profit_pct=s.default_take_profit_pct,
         trailing_stop_pct=s.trailing_stop_pct,
         max_total_exposure_pct=s.max_total_exposure_pct,
+        paper_taker_fee_pct=getattr(s, "paper_taker_fee_pct", 0.0),
         min_signal_confidence=s.min_signal_confidence,
         auto_trade_enabled=s.auto_trade_enabled,
         auto_symbols=s.auto_symbols,
         auto_timeframe=s.auto_timeframe,
         auto_confirm_timeframe=s.auto_confirm_timeframe,
+        use_saved_strategy=getattr(s, "use_saved_strategy", False),
         ai_trade_confirm=getattr(s, "ai_trade_confirm", False),
         ai_enabled=bool(s.ai_api_key),
         ai_model=s.ai_model,
@@ -807,6 +809,38 @@ def update_settings(
     engine = _engine_for(db, user)
     s = engine.settings
     data = update.model_dump(exclude_unset=True)
+    # SAFETY GATE: before flipping to LIVE (real money), verify this user's keys
+    # actually exist and can TRADE. Switching to live without a permissioned key
+    # would let the bot *think* it's trading live while every order silently
+    # fails — the opposite of "a money task is serious". We refuse with the real
+    # reason instead. Only runs on the OFF→LIVE transition; paper is never gated.
+    if data.get("trading_mode") == "live" and s.trading_mode != "live":
+        if not (user.binance_api_key_enc and user.binance_api_secret_enc):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Can't switch to LIVE: no exchange API key is set for your "
+                    "account. Add Binance API keys (with Spot trading permission) "
+                    "under Keys first, then switch to live."
+                ),
+            )
+        try:
+            access = engine.connector.check_trading_access()
+        except Exception as exc:
+            raise HTTPException(
+                status_code=502,
+                detail=f"Can't verify live trading access right now: {exc}",
+            )
+        if not access.get("can_trade"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Can't switch to LIVE: your API key can't place trades. "
+                    + (access.get("detail") or "Check the key's Spot trading "
+                       "permission, IP restrictions, and that it matches the "
+                       "configured exchange/testnet.")
+                ),
+            )
     for key, value in data.items():
         setattr(s, key, value)
     engine.apply_settings(s)
@@ -921,6 +955,7 @@ def backtest(
     stop_loss_pct: float | None = None,
     take_profit_pct: float | None = None,
     trailing_stop_pct: float | None = None,
+    use_saved: bool = False,
     db: Session = Depends(get_db),
     user: User = Depends(require_licensed_user),
 ):
@@ -932,6 +967,14 @@ def backtest(
     sl = s.default_stop_loss_pct if stop_loss_pct is None else stop_loss_pct
     tp = s.default_take_profit_pct if take_profit_pct is None else take_profit_pct
     trail = s.trailing_stop_pct if trailing_stop_pct is None else trailing_stop_pct
+    # Optionally backtest the user's SAVED, trained params for this symbol (the
+    # exact config the bot trades with) rather than the strategy's defaults.
+    saved_params: dict | None = None
+    saved_cfg = engine.strategy_configs.get(symbol.upper()) if use_saved else None
+    if saved_cfg:
+        strategy = saved_cfg.get("strategy", strategy)
+        timeframe = saved_cfg.get("timeframe", timeframe)
+        saved_params = saved_cfg.get("params") or {}
     try:
         raw = engine.connector.fetch_ohlcv(symbol.upper(), timeframe, min(limit, 1000))
     except Exception as exc:
@@ -942,7 +985,7 @@ def backtest(
         raw, columns=["timestamp", "open", "high", "low", "close", "volume"]
     )
     try:
-        strat = build_strategy(strategy)
+        strat = build_strategy(strategy, **(saved_params or {}))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     result = run_backtest(
@@ -959,6 +1002,7 @@ def backtest(
         "symbol": symbol.upper(),
         "strategy": strategy,
         "timeframe": timeframe,
+        "used_saved": bool(saved_cfg),
         "starting_balance": result.starting_balance,
         "ending_balance": round(result.ending_balance, 2),
         "total_return_pct": round(result.total_return_pct, 2),
@@ -1250,6 +1294,7 @@ def train_strategy(
     stop_loss_pct: float | None = None,
     take_profit_pct: float | None = None,
     trailing_stop_pct: float | None = None,
+    save: bool = True,
     db: Session = Depends(get_db),
     user: User = Depends(require_licensed_user),
 ):
@@ -1281,6 +1326,34 @@ def train_strategy(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
+    # Persist the winning config to THIS user's account so the bot can actually
+    # trade with it later (Settings → "use saved strategy"). This is the answer
+    # to "where do the strategies I trained go" — they are saved per-symbol and
+    # survive restarts. We save real, measured params only; never a fabricated
+    # winner. `save=false` lets a caller train-and-preview without persisting.
+    saved = False
+    if save and report.best is not None:
+        b = report.best
+        engine.set_strategy_config(
+            db,
+            symbol.upper(),
+            {
+                "strategy": report.strategy,
+                "timeframe": report.timeframe,
+                "params": b.params,
+                "metrics": {
+                    "total_return_pct": b.total_return_pct,
+                    "win_rate_pct": b.win_rate_pct,
+                    "max_drawdown_pct": b.max_drawdown_pct,
+                    "num_trades": b.num_trades,
+                    "score": b.score,
+                    "validation_return_pct": b.validation_return_pct,
+                    "overfit_gap_pct": b.overfit_gap_pct,
+                },
+                "trained_at": _utcnow().isoformat(),
+            },
+        )
+        saved = True
     return {
         "symbol": report.symbol,
         "strategy": report.strategy,
@@ -1291,7 +1364,41 @@ def train_strategy(
         "warning": report.warning,
         "best": report.best.__dict__ if report.best else None,
         "leaderboard": [c.__dict__ for c in report.leaderboard],
+        "saved": saved,
     }
+
+
+@app.get("/api/strategies/saved")
+def saved_strategies(
+    db: Session = Depends(get_db), user: User = Depends(require_licensed_user)
+):
+    """The strategies THIS user has trained and saved, keyed by symbol.
+
+    These are the configs the bot trades with when Settings
+    ``use_saved_strategy`` is on. Real, persisted training results only — an
+    empty list means nothing has been trained-and-saved yet, never a stub.
+    """
+    engine = _engine_for(db, user)
+    return [
+        {"symbol": sym, **cfg} for sym, cfg in sorted(engine.strategy_configs.items())
+    ]
+
+
+@app.delete("/api/strategies/saved/{symbol:path}")
+def delete_saved_strategy(
+    symbol: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    """Forget a saved strategy for a symbol. The bot immediately stops trading
+    that symbol with it (falls back to the analyzer brain)."""
+    engine = _engine_for(db, user)
+    removed = engine.remove_strategy_config(db, symbol.upper())
+    if not removed:
+        raise HTTPException(
+            status_code=404, detail=f"No saved strategy for {symbol.upper()}"
+        )
+    return {"removed": True, "symbol": symbol.upper()}
 
 
 # ---- Admin: user & licence management ------------------------------

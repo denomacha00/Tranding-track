@@ -497,3 +497,28 @@ def test_orderbook_failure_is_502_not_faked(client, monkeypatch):
     r = client.get("/api/orderbook/BTC/USDT")
     assert r.status_code == 502
     assert "unavailable" in r.json()["detail"].lower()
+
+
+# ---- saved strategies + live-key safety gate ------------------------
+
+
+def test_saved_strategies_start_empty(client):
+    r = client.get("/api/strategies/saved")
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_delete_missing_saved_strategy_is_404(client):
+    r = client.delete("/api/strategies/saved/BTC/USDT")
+    assert r.status_code == 404
+
+
+def test_switch_to_live_without_keys_is_refused(client):
+    # A money-safety gate: you can't flip to LIVE with no permissioned key, or
+    # the bot would "trade live" while every order silently fails. The test
+    # admin has no Binance keys, so this must be refused and stay on paper.
+    r = client.patch("/api/settings", json={"trading_mode": "live"})
+    assert r.status_code == 400
+    assert "live" in r.json()["detail"].lower()
+    # Mode is unchanged — still paper.
+    assert client.get("/api/settings").json()["trading_mode"] == "paper"

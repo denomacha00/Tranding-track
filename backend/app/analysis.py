@@ -125,6 +125,10 @@ class MarketAnalyzer:
         buy_threshold: float = 0.25,
         min_confidence: float = 0.4,
         max_volatility_pct: float = 8.0,
+        overext_pct: float = 15.0,
+        overext_rsi: float = 78.0,
+        shock_atr_mult: float = 3.0,
+        weak_volume_ratio: float = 0.6,
     ) -> None:
         # Score above +threshold => buy, below -threshold => sell, else hold.
         self.buy_threshold = buy_threshold
@@ -132,6 +136,17 @@ class MarketAnalyzer:
         self.min_confidence = min_confidence
         # If a single bar's ATR exceeds this % of price, stand aside.
         self.max_volatility_pct = max_volatility_pct
+        # Chase guard: veto a BUY only when price is BOTH this far above the
+        # 21-EMA AND RSI is this hot — a genuine parabolic blow-off, not a normal
+        # trend. Buying euphoric extension is a top way traders give back gains.
+        self.overext_pct = overext_pct
+        self.overext_rsi = overext_rsi
+        # A latest bar whose true range exceeds this multiple of ATR is a shock
+        # candle (news/liquidation wick): stand aside one bar, don't get whipsawed.
+        self.shock_atr_mult = shock_atr_mult
+        # A trend/breakout bar on less than this fraction of average volume is
+        # weakly backed — keep the trade allowed but discount its confidence.
+        self.weak_volume_ratio = weak_volume_ratio
 
     def min_bars(self) -> int:
         return MIN_BARS
@@ -151,15 +166,36 @@ class MarketAnalyzer:
         close = candles["close"]
         factors: list[Factor] = []
 
+        # 0) Long-term regime — the single most important loss-avoidance filter.
+        #    Only lean long ABOVE a rising long EMA, only lean short BELOW a
+        #    falling one. Buying a downtrend / shorting an uptrend is where most
+        #    accounts bleed out, so counter-regime entries are vetoed outright
+        #    further down (not merely down-weighted).
+        reg_span = 100 if len(close) >= 120 else 50
+        ema_reg = ema(close, reg_span)
+        reg_now = float(ema_reg.iloc[-1])
+        reg_ref = float(ema_reg.iloc[-6]) if len(close) > 6 else reg_now
+        bull_regime = price > reg_now and reg_now >= reg_ref
+        bear_regime = price < reg_now and reg_now <= reg_ref
+        if bull_regime:
+            factors.append(Factor("regime", "buy", 0.25, f"price > rising EMA{reg_span} (bull regime)"))
+        elif bear_regime:
+            factors.append(Factor("regime", "sell", 0.25, f"price < falling EMA{reg_span} (bear regime)"))
+        else:
+            factors.append(Factor("regime", "hold", 0.25, f"price ≈ EMA{reg_span} (no clear regime)"))
+
         # 1) Trend via EMA stack (fast>mid>slow = uptrend).
         ema_fast = ema(close, 9).iloc[-1]
         ema_mid = ema(close, 21).iloc[-1]
         ema_slow = ema(close, 50).iloc[-1]
         if ema_fast > ema_mid > ema_slow:
+            trend_sig = "buy"
             factors.append(Factor("trend", "buy", 0.30, "EMA 9>21>50 (uptrend)"))
         elif ema_fast < ema_mid < ema_slow:
+            trend_sig = "sell"
             factors.append(Factor("trend", "sell", 0.30, "EMA 9<21<50 (downtrend)"))
         else:
+            trend_sig = "hold"
             factors.append(Factor("trend", "hold", 0.30, "EMAs tangled (no clear trend)"))
 
         # 2) Momentum via RSI (with slope). A reversal signal requires RSI to be
@@ -211,6 +247,31 @@ class MarketAnalyzer:
             )
         )
 
+        # 6) Shock-bar guard: a latest true range far above ATR is a news /
+        #    liquidation spike — stand aside one bar rather than chase a wick.
+        prev_close = float(close.iloc[-2])
+        hi, lo = float(candles["high"].iloc[-1]), float(candles["low"].iloc[-1])
+        last_tr = max(hi - lo, abs(hi - prev_close), abs(lo - prev_close))
+        shock = atr_now > 0 and last_tr > self.shock_atr_mult * atr_now
+        if shock:
+            factors.append(
+                Factor("shock", "hold", 0.0,
+                       f"latest bar range {last_tr / atr_now:.1f}× ATR — spike, standing aside")
+            )
+
+        # 7) Volume confirmation: a move on thin volume is weakly backed. We never
+        #    force a trade off volume, but a weak-volume action is de-confidenced.
+        weak_volume = False
+        if "volume" in candles and len(candles) >= 20:
+            vol_now = float(candles["volume"].iloc[-1])
+            vol_ma = float(candles["volume"].tail(20).mean())
+            weak_volume = vol_ma > 0 and vol_now < self.weak_volume_ratio * vol_ma
+            factors.append(
+                Factor("volume", "hold", 0.0,
+                       f"vol vs 20-bar avg {(vol_now / vol_ma if vol_ma else 0):.2f}×"
+                       + (" — thin, discounting" if weak_volume else ""))
+            )
+
         # ---- combine ----
         score = 0.0
         total_weight = 0.0
@@ -223,13 +284,24 @@ class MarketAnalyzer:
         # Normalise to [-1, 1].
         norm = score / total_weight if total_weight else 0.0
 
-        # Confidence = agreement strength (absolute normalised score), reduced
-        # when factors conflict. Volatility gate zeroes confidence for action.
+        # Agreement strength: of the weighted factors that took a side, how much
+        # weight backs the leading direction vs opposes it. A split market has no
+        # edge, so conflict HARSHLY cuts confidence -> more holds -> fewer losses.
+        lean = "buy" if norm > 0 else "sell" if norm < 0 else "hold"
+        agree = sum(f.weight for f in factors if f.weight > 0 and f.signal == lean)
+        oppose = sum(
+            f.weight for f in factors
+            if f.weight > 0 and f.signal in ("buy", "sell") and f.signal != lean
+        )
         confidence = abs(norm)
-        if vol_gated:
-            confidence = 0.0
+        if agree + oppose > 0:
+            confidence *= agree / (agree + oppose)
+        if weak_volume:
+            confidence *= 0.85  # thin participation — trust the signal less
+        if vol_gated or shock:
+            confidence = 0.0  # no action into extreme vol / a shock bar
 
-        if confidence < self.min_confidence or vol_gated:
+        if confidence < self.min_confidence or vol_gated or shock:
             verdict: Verdict = "hold"
         elif norm >= self.buy_threshold:
             verdict = "buy"
@@ -238,7 +310,24 @@ class MarketAnalyzer:
         else:
             verdict = "hold"
 
-        summary = self._summarize(verdict, confidence, norm, vol_gated)
+        # ---- capital-preservation vetoes: never trade against the tide ----
+        # These only ever turn an action into HOLD; they never invent a trade.
+        stand_aside = ""
+        ext_pct = (price / float(ema_mid) - 1.0) * 100 if ema_mid else 0.0
+        if verdict == "buy":
+            if bear_regime:
+                verdict, stand_aside = "hold", "buy blocked — price is under a falling long-term EMA (don't catch a falling knife)"
+            elif trend_sig == "sell":
+                verdict, stand_aside = "hold", "buy blocked — the short-term trend is still down"
+            elif ext_pct > self.overext_pct and rsi_now > self.overext_rsi:
+                verdict, stand_aside = "hold", f"buy blocked — overextended (+{ext_pct:.0f}% over EMA21, RSI {rsi_now:.0f}); wait for a pullback"
+        elif verdict == "sell":
+            if bull_regime:
+                verdict, stand_aside = "hold", "sell blocked — price is over a rising long-term EMA (don't short strength)"
+            elif trend_sig == "buy":
+                verdict, stand_aside = "hold", "sell blocked — the short-term trend is still up"
+
+        summary = self._summarize(verdict, confidence, norm, vol_gated, shock, stand_aside)
         return MarketAnalysis(
             symbol=symbol,
             verdict=verdict,
@@ -251,9 +340,16 @@ class MarketAnalyzer:
         )
 
     @staticmethod
-    def _summarize(verdict: Verdict, confidence: float, norm: float, vol_gated: bool) -> str:
+    def _summarize(
+        verdict: Verdict, confidence: float, norm: float,
+        vol_gated: bool, shock: bool = False, stand_aside: str = "",
+    ) -> str:
         if vol_gated:
             return "Volatility too high to trade safely — standing aside to protect capital."
+        if shock:
+            return "A volatility spike just hit — standing aside one bar to avoid a whipsaw."
+        if stand_aside:
+            return f"Standing aside to protect capital: {stand_aside}."
         bias = "bullish" if norm > 0 else "bearish" if norm < 0 else "neutral"
         if verdict == "hold":
             return (
@@ -261,6 +357,6 @@ class MarketAnalyzer:
                 "Holding — no clear edge."
             )
         return (
-            f"{verdict.upper()} with {confidence:.0%} confidence: overall {bias} "
-            "across trend, momentum and MACD."
+            f"{verdict.upper()} with {confidence:.0%} confidence: {bias} across "
+            "regime, trend and momentum, aligned with the higher-timeframe tide."
         )

@@ -6,7 +6,7 @@ import { Admin } from './Admin'
 import { useSocket } from './useSocket'
 import { useTheme, type Theme } from './theme'
 import { ThemeToggle } from './ThemeToggle'
-import type { AiHealth, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, MarketAnalysis, Me, NewsItem, OrderBook as OrderBookData, Performance, PerfBucket, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
+import type { AiHealth, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, MarketAnalysis, Me, NewsItem, OrderBook as OrderBookData, Performance, PerfBucket, SavedStrategy, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
 
 const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
@@ -1041,6 +1041,9 @@ function Dashboard({
                   </span>
                 )}
               </div>
+              {/* On phones the tab strip is hidden (the hamburger drawer is the
+                 nav); show just the current view's name so context isn't lost. */}
+              <div className="tab-current">{NAV_LABEL[tab]}</div>
             </div>
             <div className="panel-body">
               {tab === 'trades' && (
@@ -1915,7 +1918,7 @@ function PerformancePanel({ onError }: { onError: (msg: string) => void }) {
         </button>
       </div>
 
-      <div className="stats" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
+      <div className="stats cols-3">
         <div className="stat">
           <div className="label">Closed trades</div>
           <div className="value">{perf.closed_trades}</div>
@@ -2631,6 +2634,7 @@ function BacktestPanel({
   const [strategy, setStrategy] = useState('ma_cross')
   const [feePct, setFeePct] = useState('0.1')
   const [slippagePct, setSlippagePct] = useState('0.05')
+  const [useSaved, setUseSaved] = useState(false)
   const [result, setResult] = useState<BacktestResult | null>(null)
   const [busy, setBusy] = useState(false)
 
@@ -2661,6 +2665,7 @@ function BacktestPanel({
           timeframe,
           feePct === '' ? undefined : Number(feePct),
           slippagePct === '' ? undefined : Number(slippagePct),
+          useSaved,
         ),
       )
     } catch (e) {
@@ -2710,10 +2715,24 @@ function BacktestPanel({
           {busy ? 'Running…' : 'Run backtest'}
         </button>
       </div>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <input
+          type="checkbox"
+          checked={useSaved}
+          onChange={(e) => setUseSaved(e.target.checked)}
+        />
+        Use my saved (trained) strategy for {symbol} if one exists
+      </label>
 
       {result && (
         <div>
-          <div className="stats" style={{ gridTemplateColumns: 'repeat(3, 1fr)' }}>
+          {result.used_saved && (
+            <p className="hint" style={{ color: 'var(--green, #16a34a)' }}>
+              ✅ Replayed your saved <b>{result.strategy}</b> strategy for {symbol} (the
+              same config the bot trades with).
+            </p>
+          )}
+          <div className="stats cols-3">
             <div className="stat">
               <div className="label">Return</div>
               <div className={`value ${result.total_return_pct >= 0 ? 'pos' : 'neg'}`}>
@@ -2803,6 +2822,9 @@ function TrainPanel({
   const [strategy, setStrategy] = useState('ma_cross')
   const [report, setReport] = useState<TrainingReport | null>(null)
   const [busy, setBusy] = useState(false)
+  // Bumped after a successful train so the saved-strategies list below refetches
+  // and the freshly-saved config appears immediately.
+  const [savedKey, setSavedKey] = useState(0)
 
   useEffect(() => {
     api
@@ -2824,7 +2846,9 @@ function TrainPanel({
     setBusy(true)
     setReport(null)
     try {
-      setReport(await api.train(symbol, strategy, timeframe))
+      const r = await api.train(symbol, strategy, timeframe)
+      setReport(r)
+      if (r.saved) setSavedKey((k) => k + 1) // refresh the saved list below
     } catch (e) {
       onError((e as Error).message)
     } finally {
@@ -2869,6 +2893,18 @@ function TrainPanel({
                 <p className="hint" style={{ color: 'var(--red)' }}>⚠️ {report.warning}</p>
               )}
               <pre className="code">{JSON.stringify(report.best.params, null, 2)}</pre>
+              {report.saved ? (
+                <p className="hint" style={{ color: 'var(--green, #16a34a)' }}>
+                  ✅ Saved to your account for <b>{report.symbol}</b>. Turn on{' '}
+                  <b>“Trade with my saved strategies”</b> in Settings and the bot
+                  will trade {report.symbol} with this exact setup.
+                </p>
+              ) : (
+                <p className="hint">
+                  Not saved — no configuration beat a flat baseline on this data, so
+                  nothing was persisted (the bot won't trade a losing setup).
+                </p>
+              )}
               <table>
                 <thead>
                   <tr>
@@ -2917,6 +2953,126 @@ function TrainPanel({
           )}
         </div>
       )}
+
+      <SavedStrategiesCard refreshKey={savedKey} onError={onError} />
+    </div>
+  )
+}
+
+function SavedStrategiesCard({
+  refreshKey,
+  onError,
+}: {
+  refreshKey: number
+  onError: (msg: string) => void
+}) {
+  const [saved, setSaved] = useState<SavedStrategy[]>([])
+  const [loading, setLoading] = useState(true)
+  const [busy, setBusy] = useState<string | null>(null)
+
+  const load = async () => {
+    setLoading(true)
+    try {
+      setSaved(await api.savedStrategies())
+    } catch (e) {
+      onError((e as Error).message)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    load()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [refreshKey])
+
+  const remove = async (symbol: string) => {
+    setBusy(symbol)
+    try {
+      await api.deleteSavedStrategy(symbol)
+      setSaved((prev) => prev.filter((s) => s.symbol !== symbol))
+    } catch (e) {
+      onError((e as Error).message)
+    } finally {
+      setBusy(null)
+    }
+  }
+
+  return (
+    <div className="panel" style={{ marginTop: 8 }}>
+      <div className="panel-head">Your saved strategies</div>
+      <div className="panel-body">
+        <p className="hint">
+          The setups you've trained and saved, one per symbol. When{' '}
+          <b>“Trade with my saved strategies”</b> is on in Settings, the bot trades
+          each of these symbols with its saved config (its buy still yields to
+          capital-preservation gates; its exit is always honoured). These live on
+          your account and survive restarts.
+        </p>
+        {loading ? (
+          <div className="empty">Loading…</div>
+        ) : saved.length === 0 ? (
+          <div className="empty">
+            Nothing saved yet. Train a strategy above and the winning setup is saved
+            here automatically.
+          </div>
+        ) : (
+          <div style={{ overflowX: 'auto' }}>
+            <table>
+              <thead>
+                <tr>
+                  <th>Symbol</th>
+                  <th>Strategy</th>
+                  <th>Timeframe</th>
+                  <th className="mono">Return %</th>
+                  <th className="mono">Win %</th>
+                  <th className="mono">Max DD %</th>
+                  <th>Trained</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {saved.map((s) => (
+                  <tr key={s.symbol}>
+                    <td><b>{s.symbol}</b></td>
+                    <td>{s.strategy}</td>
+                    <td>{s.timeframe ?? '—'}</td>
+                    <td
+                      className={`mono ${
+                        s.metrics?.total_return_pct == null
+                          ? ''
+                          : s.metrics.total_return_pct >= 0
+                          ? 'pos'
+                          : 'neg'
+                      }`}
+                    >
+                      {s.metrics?.total_return_pct == null ? '—' : fmt(s.metrics.total_return_pct)}
+                    </td>
+                    <td className="mono">
+                      {s.metrics?.win_rate_pct == null ? '—' : fmt(s.metrics.win_rate_pct)}
+                    </td>
+                    <td className="mono">
+                      {s.metrics?.max_drawdown_pct == null ? '—' : fmt(s.metrics.max_drawdown_pct)}
+                    </td>
+                    <td className="mono" style={{ whiteSpace: 'nowrap' }}>
+                      {s.trained_at ? new Date(s.trained_at).toLocaleDateString() : '—'}
+                    </td>
+                    <td>
+                      <button
+                        className="btn danger"
+                        onClick={() => remove(s.symbol)}
+                        disabled={busy === s.symbol}
+                      >
+                        {busy === s.symbol ? '…' : 'Delete'}
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
     </div>
   )
 }
@@ -2987,11 +3143,13 @@ function SettingsPanel({
         default_take_profit_pct: form.default_take_profit_pct,
         trailing_stop_pct: form.trailing_stop_pct,
         max_total_exposure_pct: form.max_total_exposure_pct,
+        paper_taker_fee_pct: form.paper_taker_fee_pct,
         min_signal_confidence: form.min_signal_confidence,
         auto_trade_enabled: form.auto_trade_enabled,
         auto_symbols: form.auto_symbols,
         auto_timeframe: form.auto_timeframe,
         auto_confirm_timeframe: form.auto_confirm_timeframe,
+        use_saved_strategy: form.use_saved_strategy,
         ai_trade_confirm: form.ai_trade_confirm,
       })
       onSaved(saved)
@@ -3135,7 +3293,23 @@ function SettingsPanel({
             inputMode="decimal"
           />
         </div>
+        <div className="field">
+          <label>Paper taker fee % (0 = off)</label>
+          <input
+            className="input"
+            value={form.paper_taker_fee_pct}
+            onChange={(e) => num('paper_taker_fee_pct', e.target.value)}
+            inputMode="decimal"
+          />
+        </div>
       </div>
+      <p className="hint">
+        Paper taker fee models a real exchange fee on <b>both legs</b> of every
+        simulated round trip, so your paper track record reflects the true cost of
+        trading (e.g. 0.1% is Binance's standard taker rate). It only affects{' '}
+        <b>paper</b> results — live P&amp;L always books the real fees already in
+        your fills, never an invented number. Leave at 0 to keep paper fee-free.
+      </p>
 
       <div className="panel-head" style={{ paddingLeft: 0, borderBottom: 'none' }}>
         Autonomous trading (the bot analyses & trades by itself)
@@ -3212,6 +3386,21 @@ function SettingsPanel({
         {form.ai_enabled
           ? 'Test it in paper mode before trusting it with live orders.'
           : 'Add an AI key (Credentials) to enable this.'}
+      </p>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <input
+          type="checkbox"
+          checked={form.use_saved_strategy}
+          onChange={(e) => setForm({ ...form, use_saved_strategy: e.target.checked })}
+        />
+        Trade with my saved (trained) strategies
+      </label>
+      <p className="hint">
+        When on, the bot trades each symbol with the strategy you trained and
+        saved for it (see <b>Train</b>) instead of its built-in analyzer. Capital
+        preservation still comes first: a saved <b>BUY</b> is suppressed in a bear
+        regime or a volatility shock, while its <b>SELL/exit is always honoured</b>.
+        Symbols with no saved strategy fall back to the analyzer brain.
       </p>
       <p className="hint">
         Trailing stop ratchets an open long's stop-loss upward as price rises to

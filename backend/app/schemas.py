@@ -209,11 +209,13 @@ class SettingsOut(BaseModel):
     default_take_profit_pct: float
     trailing_stop_pct: float
     max_total_exposure_pct: float
+    paper_taker_fee_pct: float = 0.0
     min_signal_confidence: float
     auto_trade_enabled: bool
     auto_symbols: str
     auto_timeframe: str
     auto_confirm_timeframe: str
+    use_saved_strategy: bool = False
     ai_trade_confirm: bool = False
     ai_enabled: bool
     ai_model: str = ""
@@ -236,9 +238,11 @@ class SettingsUpdate(BaseModel):
     auto_symbols: Optional[str] = None
     auto_timeframe: Optional[str] = None
     auto_confirm_timeframe: Optional[str] = None
+    use_saved_strategy: Optional[bool] = None
     ai_trade_confirm: Optional[bool] = None
     trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=100)
     max_total_exposure_pct: Optional[float] = Field(default=None, ge=0, le=1000)
+    paper_taker_fee_pct: Optional[float] = Field(default=None, ge=0, le=5)
 
 
 # ---- Auth & multi-user ----------------------------------------------

@@ -75,11 +75,19 @@ export interface Settings {
   default_take_profit_pct: number
   trailing_stop_pct: number
   max_total_exposure_pct: number
+  // Paper-only modeled taker fee charged on BOTH legs of a simulated round trip
+  // so paper P&L reflects the real cost of trading. 0 = fee-free (default).
+  // LIVE P&L is never adjusted by this — real fills already include real fees.
+  paper_taker_fee_pct: number
   min_signal_confidence: number
   auto_trade_enabled: boolean
   auto_symbols: string
   auto_timeframe: string
   auto_confirm_timeframe: string
+  // When on, the bot trades a symbol with the strategy you trained and SAVED for
+  // it (instead of the built-in analyzer brain). Capital-preservation gates still
+  // override its BUY in a bear regime; its SELL/exit is always honoured.
+  use_saved_strategy: boolean
   // When on AND autonomous trading is on, the AI reviews each deterministic
   // entry and may VETO it (it can never invent or force a trade). Off by default.
   ai_trade_confirm: boolean
@@ -235,6 +243,9 @@ export interface BacktestResult {
   stop_loss_pct?: number
   take_profit_pct?: number
   trailing_stop_pct?: number
+  // True when this run replayed the saved (trained) strategy for the symbol
+  // rather than the raw picker selection — so the UI can label it honestly.
+  used_saved?: boolean
   equity_curve: number[]
 }
 
@@ -265,6 +276,31 @@ export interface TrainingReport {
   leaderboard: TrainingCandidate[]
   train_fraction: number
   warning?: string | null
+  // True when the winning config was persisted to this account (so the bot can
+  // trade it). False when nothing beat the baseline or save was disabled.
+  saved?: boolean
+}
+
+// A strategy the user trained and SAVED for a symbol — the persisted config the
+// bot trades with when `use_saved_strategy` is on. `metrics` are the real,
+// measured results from the training run that produced it (never fabricated);
+// older saves may omit some fields. This is the answer to "where did the
+// strategies I trained go" — they live on the account, keyed by symbol.
+export interface SavedStrategy {
+  symbol: string
+  strategy: string
+  timeframe?: string
+  params: Record<string, number | string>
+  metrics?: {
+    total_return_pct?: number
+    win_rate_pct?: number
+    max_drawdown_pct?: number
+    num_trades?: number
+    score?: number
+    validation_return_pct?: number | null
+    overfit_gap_pct?: number | null
+  }
+  trained_at?: string
 }
 
 export interface AnalysisFactor {

@@ -162,3 +162,56 @@ def test_paper_equity_counts_open_position_value(db):
     assert st["equity"] == pytest.approx(10_010.0)
     # Sanity: equity == starting balance + unrealized gain.
     assert st["equity"] == pytest.approx(10_000.0 + st["unrealized_pnl"])
+
+
+def test_paper_close_is_fee_free_by_default(db):
+    # Default paper_taker_fee_pct is 0 -> realized PnL is the raw price move, so
+    # existing paper track records are unchanged unless the operator opts in.
+    conn = FakeConnector(price=100.0)
+    eng = _engine(conn)  # paper
+    eng.execute_signal(
+        db, action="buy", symbol="BTC/USDT", amount=1.0,
+        stop_loss=None, take_profit=None, source="manual",
+    )
+    conn.set_price(110.0)
+    ok, msg, trade = eng.execute_signal(
+        db, action="close", symbol="BTC/USDT", amount=None,
+        stop_loss=None, take_profit=None, source="manual",
+    )
+    assert ok, msg
+    assert trade.pnl == pytest.approx(10.0)  # (110 - 100) * 1, no fee
+
+
+def test_paper_close_charges_configurable_taker_fee(db):
+    # With a modeled taker fee, a paper round trip pays it on BOTH legs, so the
+    # realized PnL is the price move MINUS the fees (honest cost of trading).
+    conn = FakeConnector(price=100.0)
+    eng = _engine(conn, paper_taker_fee_pct=0.1)  # 0.1% taker per fill
+    eng.execute_signal(
+        db, action="buy", symbol="BTC/USDT", amount=1.0,
+        stop_loss=None, take_profit=None, source="manual",
+    )
+    conn.set_price(110.0)
+    ok, msg, trade = eng.execute_signal(
+        db, action="close", symbol="BTC/USDT", amount=None,
+        stop_loss=None, take_profit=None, source="manual",
+    )
+    assert ok, msg
+    # Gross = (110-100)*1 = 10. Fees = (100+110)*1*0.001 = 0.21. Net = 9.79.
+    assert trade.pnl == pytest.approx(9.79)
+
+
+def test_live_pnl_is_never_touched_by_paper_fee(db):
+    # The modeled fee is PAPER-only: a live close still books the raw fill-price
+    # PnL. We never invent a fee figure for real money.
+    conn = FakeConnector(price=110.0, has_credentials=True, market_fill=108.0)
+    eng = _engine(conn, trading_mode="live", paper_taker_fee_pct=0.5)
+    db.add(Trade(symbol="BTC/USDT", side="buy", amount=1.0, entry_price=100.0,
+                 status=TradeStatus.open.value, mode="live"))
+    db.commit()
+    ok, msg, trade = eng.execute_signal(
+        db, action="close", symbol="BTC/USDT", amount=None,
+        stop_loss=None, take_profit=None, source="manual",
+    )
+    assert ok, msg
+    assert trade.pnl == pytest.approx(8.0)  # (108 - 100) * 1, fee not applied

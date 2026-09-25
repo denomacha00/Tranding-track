@@ -24,11 +24,14 @@ from app.ai import AICommentator
 from app.models import SignalLog, Trade, TradeStatus
 from app.risk import RiskManager
 from app.notifier import Notifier
+from app.strategies import build_strategy
 from app.state import (
     load_paper_balance,
     load_settings_overrides,
+    load_strategy_configs,
     save_paper_balance,
     save_settings_overrides,
+    save_strategy_configs,
 )
 
 logger = logging.getLogger(__name__)
@@ -69,6 +72,10 @@ class TradingEngine:
         self._monitor_degraded: set[str] = set()
         # Paper wallet (quote currency, e.g. USDT).
         self.paper_balance = settings.paper_starting_balance
+        # Trained strategies the user saved, keyed by uppercase SYMBOL. Loaded in
+        # restore_state; used to OVERRIDE the analyzer verdict when the user opts
+        # in via settings.use_saved_strategy (see analyze_symbol).
+        self.strategy_configs: dict[str, dict[str, Any]] = {}
         # Event broadcaster set by the app on startup.
         self._broadcaster: Optional[Any] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
@@ -107,6 +114,9 @@ class TradingEngine:
         self.paper_balance = load_paper_balance(
             db, self.settings.paper_starting_balance, self.user_id
         )
+        # Trained strategies saved to this account, so "train once, trade with it"
+        # survives restarts instead of being lost when the request returned.
+        self.strategy_configs = load_strategy_configs(db, self.user_id)
         self._reconcile_live_positions(db)
 
     def _reconcile_live_positions(self, db: Session) -> None:
@@ -200,6 +210,87 @@ class TradingEngine:
         self.analyzer.min_confidence = settings.min_signal_confidence
         self.notifier.reload(settings)
         self.ai.reload(settings)
+
+    # ---- saved strategies (train once, let the bot trade it) ---------
+
+    def set_strategy_config(
+        self, db: Session, symbol: str, config: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Save (or replace) the active trained strategy for a symbol.
+
+        Updates the in-memory engine AND persists, mirroring persist/apply for
+        settings, so the running bot trades the new strategy immediately and a
+        restart keeps it.
+        """
+        sym = symbol.upper()
+        self.strategy_configs[sym] = config
+        save_strategy_configs(db, self.strategy_configs, self.user_id)
+        return config
+
+    def remove_strategy_config(self, db: Session, symbol: str) -> bool:
+        sym = symbol.upper()
+        if sym in self.strategy_configs:
+            del self.strategy_configs[sym]
+            save_strategy_configs(db, self.strategy_configs, self.user_id)
+            return True
+        return False
+
+    @staticmethod
+    def _protective_hold(analysis) -> bool:
+        """True when the analyzer is standing aside to protect capital (extreme
+        volatility or a shock bar). A saved strategy must not override this."""
+        for f in analysis.factors:
+            if f.name in ("volatility", "shock") and (
+                "aside" in f.detail or "spike" in f.detail
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _bear_regime(analysis) -> bool:
+        """True when price is under a falling long-term EMA — no new longs."""
+        return any(f.name == "regime" and f.signal == "sell" for f in analysis.factors)
+
+    def _apply_saved_strategy(self, symbol: str, df, analysis):
+        """Let the user's SAVED strategy own the verdict when they've opted in.
+
+        Capital-preservation is non-negotiable: a strategy BUY is still refused
+        while the analyzer is protectively standing aside (extreme vol / shock)
+        or in a bear regime (don't catch a falling knife). A strategy SELL/exit
+        is never blocked — reducing risk is always allowed.
+        """
+        if not getattr(self.settings, "use_saved_strategy", False):
+            return analysis
+        cfg = self.strategy_configs.get(symbol.upper())
+        if not cfg:
+            return analysis
+        try:
+            strat = build_strategy(cfg["strategy"], **(cfg.get("params") or {}))
+            sig = strat.generate(df)
+        except Exception as exc:  # bad params / unknown strategy -> stay with analyzer
+            logger.warning("saved strategy for %s failed, using analyzer: %s", symbol, exc)
+            return analysis
+
+        action = sig.action
+        reason = getattr(sig, "reason", "") or ""
+        label = f"Saved {cfg['strategy']} strategy"
+        if action == "buy":
+            if self._protective_hold(analysis) or self._bear_regime(analysis):
+                analysis.verdict = "hold"
+                analysis.summary = (
+                    f"{label} signalled BUY, but standing aside to protect "
+                    f"capital: {analysis.summary}"
+                )
+                return analysis
+            analysis.verdict = "buy"
+            analysis.confidence = 1.0
+        elif action == "sell":
+            analysis.verdict = "sell"
+            analysis.confidence = 1.0
+        else:
+            analysis.verdict = "hold"
+        analysis.summary = f"{label} → {action.upper()}" + (f": {reason}" if reason else "")
+        return analysis
 
     def _emit(self, event: str, payload: dict[str, Any]) -> None:
         if self._broadcaster and self._loop:
@@ -1100,11 +1191,22 @@ class TradingEngine:
         )
         return True, f"Closed {trade.symbol} @ {price:.2f} (PnL {pnl:.2f})", trade
 
-    @staticmethod
-    def _realized_pnl(trade: Trade, exit_price: float) -> float:
+    def _realized_pnl(self, trade: Trade, exit_price: float) -> float:
         if trade.side == "buy":
-            return (exit_price - trade.entry_price) * trade.amount
-        return (trade.entry_price - exit_price) * trade.amount
+            gross = (exit_price - trade.entry_price) * trade.amount
+        else:
+            gross = (trade.entry_price - exit_price) * trade.amount
+        # PAPER mode charges a realistic, configurable taker fee on BOTH legs so
+        # the simulated wallet reflects the true cost of trading (fees are a real
+        # drag every trader pays). This is honest simulation. LIVE P&L stays the
+        # raw fill-price difference — Binance deducts its own real fees on the
+        # user's actual account, and we never invent a fee we didn't observe.
+        if not self.settings.is_live:
+            fee_pct = max(getattr(self.settings, "paper_taker_fee_pct", 0.0) or 0.0, 0.0)
+            if fee_pct > 0:
+                fee_rate = fee_pct / 100.0
+                gross -= (trade.entry_price + exit_price) * trade.amount * fee_rate
+        return gross
 
     @staticmethod
     def unrealized_pnl(trade: Trade, price: float) -> float:
@@ -1209,8 +1311,17 @@ class TradingEngine:
 
     # ---- autonomous analysis-driven trading --------------------------
 
-    def analyze_symbol(self, symbol: str, timeframe: str = "1h", limit: int = 200):
-        """Fetch candles and run the deterministic market analyzer."""
+    def analyze_symbol(
+        self, symbol: str, timeframe: str = "1h", limit: int = 200,
+        apply_strategy: bool = False,
+    ):
+        """Fetch candles and run the deterministic market analyzer.
+
+        When ``apply_strategy`` is set (autonomous + observe paths), a saved,
+        trained strategy for this symbol can OVERRIDE the analyzer verdict — but
+        only if the user opted in and never against the capital-preservation
+        gates (see _apply_saved_strategy).
+        """
         import pandas as pd
 
         raw = self.connector.fetch_ohlcv(symbol.upper(), timeframe, min(limit, 1000))
@@ -1219,7 +1330,10 @@ class TradingEngine:
         df = pd.DataFrame(
             raw, columns=["timestamp", "open", "high", "low", "close", "volume"]
         )
-        return self.analyzer.analyze(df, symbol.upper())
+        analysis = self.analyzer.analyze(df, symbol.upper())
+        if apply_strategy:
+            analysis = self._apply_saved_strategy(symbol, df, analysis)
+        return analysis
 
     def auto_trade_symbol(
         self, db: Session, symbol: str, timeframe: str = "1h"
@@ -1232,7 +1346,7 @@ class TradingEngine:
           (spot, long-only autonomous mode) — avoids doubling risk on noise.
         """
         try:
-            analysis = self.analyze_symbol(symbol, timeframe)
+            analysis = self.analyze_symbol(symbol, timeframe, apply_strategy=True)
         except Exception as exc:
             return False, f"analysis failed for {symbol}: {exc}"
         ok, msg = self._decide_and_act(db, symbol, timeframe, analysis)
@@ -1256,7 +1370,7 @@ class TradingEngine:
         _confirm_tf = (self.settings.auto_confirm_timeframe or "").strip()
         if _confirm_tf and _confirm_tf != timeframe:
             try:
-                _higher = self.analyze_symbol(symbol, _confirm_tf)
+                _higher = self.analyze_symbol(symbol, _confirm_tf, apply_strategy=True)
             except Exception as exc:
                 return False, f"{symbol}: confirm timeframe {_confirm_tf} failed: {exc}"
             if analysis.verdict == "buy" and _higher.verdict == "sell":
@@ -1368,7 +1482,7 @@ class TradingEngine:
         ever placed here — this observes and records only.
         """
         try:
-            analysis = self.analyze_symbol(symbol, timeframe)
+            analysis = self.analyze_symbol(symbol, timeframe, apply_strategy=True)
         except Exception as exc:
             return False, f"analysis failed for {symbol}: {exc}"
         try:

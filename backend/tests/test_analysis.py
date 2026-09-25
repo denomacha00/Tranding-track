@@ -77,3 +77,39 @@ def test_as_dict_shape():
     d = a.as_dict()
     assert set(d) >= {"symbol", "verdict", "confidence", "score", "price", "factors", "summary"}
     assert all({"name", "signal", "weight", "detail"} <= set(f) for f in d["factors"])
+
+
+# ---- capital-preservation upgrades (avoid losses first) --------------
+
+def test_bounce_inside_downtrend_is_not_bought():
+    # A relief bounce at the tail of a long, deep downtrend can perk up RSI and
+    # short-term momentum, but price is still far under a falling long-term EMA.
+    # Buying that is "catching a falling knife" — the regime veto must refuse it.
+    down = [300 - i * 0.8 for i in range(220)]           # long, deep downtrend
+    bounce = [down[-1] + i * 1.2 for i in range(1, 19)]  # modest 18-bar bounce
+    a = MarketAnalyzer().analyze(_frame(down + bounce), "BTC/USDT")
+    assert a.verdict != "buy"  # never long a broken market on a bounce
+
+
+def test_shock_bar_stands_aside():
+    # A clean uptrend, but the latest bar prints a huge range (news/liquidation
+    # wick) far above ATR -> stand aside one bar rather than be whipsawed.
+    closes = [100 + i * 0.8 for i in range(120)]
+    highs = [c * 1.001 for c in closes]
+    lows = [c * 0.999 for c in closes]
+    highs[-1] = closes[-1] * 1.02   # ~4% spike range, dwarfs the ~0.5% ATR
+    lows[-1] = closes[-1] * 0.98
+    a = MarketAnalyzer().analyze(_frame(closes, high=highs, low=lows), "BTC/USDT")
+    assert a.verdict == "hold"
+    assert a.confidence == 0.0
+    assert "spike" in a.summary.lower() or "whipsaw" in a.summary.lower()
+
+
+def test_conflicting_signals_reduce_confidence_below_clean_trend():
+    # A choppy, directionless tape must read as LOWER confidence than a clean
+    # trend — conflict has no edge, so the bot should prefer to hold.
+    clean = MarketAnalyzer().analyze(_frame([100 + i * 0.8 for i in range(120)]), "X")
+    chop = [100 + (5 if i % 2 else -5) for i in range(120)]  # saw-tooth, no trend
+    choppy = MarketAnalyzer().analyze(_frame(chop), "X")
+    assert choppy.confidence < clean.confidence
+    assert choppy.verdict == "hold"

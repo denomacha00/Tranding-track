@@ -24,6 +24,7 @@ from app.models import KeyValue
 
 SETTINGS_KEY = "settings_overrides"
 PAPER_BALANCE_KEY = "paper_balance"
+STRATEGY_KEY = "strategy_config"
 
 
 def _scoped(base: str, user_id: Optional[int]) -> str:
@@ -75,3 +76,21 @@ def save_paper_balance(
     db: Session, balance: float, user_id: Optional[int] = None
 ) -> None:
     kv_set(db, _scoped(PAPER_BALANCE_KEY, user_id), float(balance))
+
+
+def load_strategy_configs(db: Session, user_id: Optional[int] = None) -> dict[str, Any]:
+    """The user's saved, trained strategies keyed by uppercase SYMBOL.
+
+    Each value is a dict: ``{strategy, timeframe, params, metrics, trained_at}``.
+    This is how a strategy tuned in training becomes something the live bot can
+    actually trade with (see TradingEngine.analyze_symbol) — it is not thrown
+    away when the training request returns.
+    """
+    data = kv_get(db, _scoped(STRATEGY_KEY, user_id), {})
+    return data if isinstance(data, dict) else {}
+
+
+def save_strategy_configs(
+    db: Session, configs: dict[str, Any], user_id: Optional[int] = None
+) -> None:
+    kv_set(db, _scoped(STRATEGY_KEY, user_id), configs)

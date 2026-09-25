@@ -116,6 +116,13 @@ class Settings(BaseSettings):
     # timeframe is not a buy. Empty = single-timeframe (disabled).
     auto_confirm_timeframe: str = Field(default="")
 
+    # Trade with a SAVED, trained strategy instead of the built-in analyzer. When
+    # true, for any symbol that has a trained strategy saved to the account the
+    # autonomous/observe path uses that strategy's signal as the verdict. Off by
+    # default (paper-test a strategy before letting it drive real orders); the
+    # capital-preservation gates and risk manager still apply.
+    use_saved_strategy: bool = Field(default=False)
+
     # AI trade review (permission gate). When true AND an AI key is configured
     # AND autonomous trading is on, the AI layer reviews each ENTRY the
     # deterministic brain proposes and may VETO it (risk-first). It can only
@@ -137,6 +144,14 @@ class Settings(BaseSettings):
 
     # Paper trading
     paper_starting_balance: float = Field(default=10_000.0)
+    # Simulated taker fee (percent per fill) applied to PAPER trades so the
+    # simulated wallet reflects the REAL cost of trading — a round trip pays this
+    # on entry AND exit (Binance spot taker is ~0.1%). This is honest simulation,
+    # not a fabricated live figure: LIVE P&L is never adjusted by this number
+    # (the exchange charges its own real fees on the user's account). 0 = model
+    # no fee (the historical default), so existing paper track records are
+    # unchanged unless the operator opts in.
+    paper_taker_fee_pct: float = Field(default=0.0)
 
     # Server
     cors_origins: str = Field(default="http://localhost:5173")
