@@ -51,10 +51,9 @@ export function Login({
         setError('Password must be at least 8 characters.')
         return
       }
-      if (!licenseKey.trim()) {
-        setError('Enter the licence key you were given to create your account.')
-        return
-      }
+      // The licence key is required for normal clients but the operator/admin
+      // (first user or ADMIN_EMAIL) is exempt server-side — so we don't hard-block
+      // an empty key here; the server returns a precise error if one is needed.
     }
     setBusy(true)
     try {

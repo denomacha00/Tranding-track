@@ -23,7 +23,7 @@ TradingView alert ──▶ /webhook ──▶ risk checks ──▶ Binance ord
   places a real Binance market order or a simulated paper fill. Paper is the
   default.
 - **The "brain" is deterministic** (`app/analysis.py`): a transparent,
-  multi-signal analyzer (EMA trend stack, RSI + MACD momentum, ATR/Bollinger
+  multi-signal analyzer (EMA trend stack, RSI + MACD momentum, ATR
   volatility, recent return) that produces one confidence-scored verdict with a
   human-readable reason for every component. When signals disagree or
   volatility is extreme it returns **HOLD** — "no trade" is a valid decision.
@@ -36,24 +36,32 @@ TradingView alert ──▶ /webhook ──▶ risk checks ──▶ Binance ord
 
 ## Multi-user, licensing & admin
 
-Tranding-track is **multi-tenant**: anyone can self-sign-up with an email +
-password, but an account must be **licensed by the administrator** before it can
-enter exchange keys or trade. Each user brings their **own trade-only Binance
-keys** (stored encrypted at rest), gets their **own isolated trading engine**
-(separate positions, paper wallet, settings and AI config), and a **unique,
-unguessable TradingView webhook URL** that authenticates alerts to their account.
+Tranding-track is **multi-tenant**: each client signs up with a **username,
+email, password and the licence key you gave them** — redeeming the key
+activates the account **instantly**, no manual approval step. Each user brings
+their **own trade-only Binance keys** (stored encrypted at rest), gets their
+**own isolated trading engine** (separate positions, paper wallet and settings),
+and a **unique, unguessable TradingView webhook URL** that authenticates alerts
+to their account. The LLM assistant is **app-wide** — one operator-provided key
+shared by every user — not per-user.
 
-- **Auth:** email + password. Passwords are hashed with PBKDF2-HMAC-SHA256
-  (stdlib). Sessions use HS256 JWTs signed with `SECRET_KEY`; the frontend sends
-  `Authorization: Bearer <token>`.
-- **Licensing gate:** new users default to `pending` and see an "awaiting
-  approval" screen until the admin grants a licence. Set
-  `AUTO_LICENSE_NEW_USERS=true` to auto-activate new signups instead.
+- **Auth:** log in with **username _or_ email** + password. Passwords are hashed
+  with PBKDF2-HMAC-SHA256 (stdlib). Sessions use HS256 JWTs signed with
+  `SECRET_KEY`; the frontend sends `Authorization: Bearer <token>`.
+- **Licence keys:** mint single-use keys in the **Admin** dashboard — give each
+  a client label and a **duration in days** (blank = lifetime). The full key is
+  shown **once** (only its SHA-256 hash is stored), so copy it immediately. A
+  client pastes the key at signup to go live at once; a redeemed key **cannot be
+  reused**, and keys are random per client so no two clients' data can mix.
+  Time-limited licences count down and expire automatically; **+ Days** extends
+  (or restarts) them. `AUTO_LICENSE_NEW_USERS=true` bypasses keys entirely (every
+  signup auto-activates) — handy for a single-tenant or dev server.
 - **Admin:** the account whose email equals `ADMIN_EMAIL` is auto-promoted to
-  admin (or, if `ADMIN_EMAIL` is empty, the first registered user). The admin
-  gets an **Admin dashboard** to list users and grant/revoke licences (revoking
-  immediately stops that user's engine) and delete accounts.
-- **Key encryption:** users' Binance/AI secrets are encrypted with Fernet, keyed
+  admin (or, if `ADMIN_EMAIL` is empty, the first registered user). The admin is
+  **key-exempt** and gets an **Admin dashboard** to mint/revoke keys, list users,
+  grant/revoke/extend licences (revoking immediately stops that user's engine)
+  and delete accounts.
+- **Key encryption:** users' Binance secrets are encrypted with Fernet, keyed
   off `SECRET_KEY`. **If `SECRET_KEY` is unset, key storage is disabled** (we
   refuse to store secrets we cannot encrypt) and login/signup are disabled — so
   set `SECRET_KEY` in any real deployment.
@@ -170,11 +178,11 @@ Steps:
      long random value. Without it, login and key storage are disabled.)
    - `ADMIN_EMAIL` (the account promoted to admin; grants licences to others)
    - `TRADING_MODE` (`paper` to start; `live` only when ready)
-   - `AUTO_LICENSE_NEW_USERS` (`false` to require admin approval — the default
-     licensing gate; `true` to auto-activate signups)
+   - `AUTO_LICENSE_NEW_USERS` (`false` — the default — makes clients redeem a
+     licence key at signup; `true` auto-activates every signup, no key needed)
    - Optional global fallbacks: `BINANCE_TESTNET`, AI vars (`AI_API_KEY`,
-     `AI_BASE_URL`, `AI_MODEL`, `AI_API_STYLE`). Each user normally supplies
-     their own Binance/AI keys via the dashboard.
+     `AI_BASE_URL`, `AI_MODEL`, `AI_API_STYLE`). Each user supplies their own
+     Binance keys via the dashboard; the AI key is app-wide (operator-set).
    - Do **not** set `PORT` — Railway injects it and the app binds to it.
 4. (Recommended) Add a **Volume** mounted at `/data` so the SQLite DB (users,
    encrypted keys, trades, settings) survives redeploys. The image already
@@ -198,7 +206,7 @@ All settings load from environment / `backend/.env`. Key variables:
 | `TRADING_MODE` | `paper` | `paper` (simulated) or `live` (REAL orders) |
 | `SECRET_KEY` | – | **Required in production.** Signs JWTs and encrypts users' API keys. Empty = login & key storage disabled |
 | `ADMIN_EMAIL` | – | Account auto-promoted to admin (empty = first registered user) |
-| `AUTO_LICENSE_NEW_USERS` | `false` | `false` = new users need admin approval (licensing gate); `true` = auto-activate |
+| `AUTO_LICENSE_NEW_USERS` | `false` | `false` = clients redeem a licence key at signup; `true` = auto-activate every signup |
 | `ACCESS_TOKEN_TTL_MINUTES` | `10080` | JWT lifetime (default 7 days) |
 | `BINANCE_API_KEY` / `BINANCE_API_SECRET` | – | Optional global fallback (users normally set their own) |
 | `BINANCE_TESTNET` | `true` | Use Binance testnet |

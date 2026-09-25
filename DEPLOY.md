@@ -42,9 +42,10 @@ TRADING_MODE=paper
   and makes stored keys undecryptable. Need a fresh one for a brand-new deploy?
   `python -c "import secrets; print(secrets.token_urlsafe(48))"`
 - `ADMIN_EMAIL` — sign up with this exact email → you become admin → the
-  **Admin** tab appears, where you Grant/Revoke user licenses.
+  **Admin** tab appears, where you mint licence keys and grant/revoke access.
 - `DATABASE_URL` — the four slashes = absolute `/data` path (the volume in §1).
-- `AUTO_LICENSE_NEW_USERS=false` keeps the "users need my approval" gate.
+- `AUTO_LICENSE_NEW_USERS=false` (the default) makes clients redeem a licence
+  key you minted at signup; `true` auto-activates every signup (no key needed).
 - `TRADING_MODE=paper` for testing. New users start in paper regardless.
 
 ### Tier 2 — TradingView webhook (set before wiring TradingView)
@@ -99,21 +100,34 @@ Other: `LOG_FORMAT=json`, `LOG_LEVEL=INFO`, `PAPER_STARTING_BALANCE`,
 1. Add the `/data` volume (§1).
 2. Set the Tier 1 variables (§2), plus Tier 2/3 as needed.
 3. Redeploy.
-4. Open the site → **Sign up** with the exact `ADMIN_EMAIL` → confirm the
-   **Admin** tab appears.
-5. Create a second test account → in **Admin**, click **Grant** on its row.
-6. Log in as the test account → Settings → add Binance **testnet** keys →
-   place a **paper** trade and confirm it opens/closes with real prices.
+4. Open the site → **Sign up** with the exact `ADMIN_EMAIL` (the admin is
+   key-exempt) → confirm the **Admin** tab appears.
+5. In **Admin → Licence keys**, mint a key → **Sign up** a second account with
+   it → confirm that account is **live instantly** (no manual grant needed).
+6. Log in as the test account (by username **or** email) → Settings → add
+   Binance **testnet** keys → place a **paper** trade and confirm it opens/closes
+   with real prices.
 
-## 4. Licensing model (there are no license "keys")
+## 4. Licensing model (single-use keys + admin control)
 
-Licensing is admin approval, not redeemable codes:
+Clients activate themselves with a **licence key** you mint — no manual approval
+step in the common case:
 
-- New signup → `pending` (can log in, cannot trade).
-- Admin → **Admin** tab → **Grant** → `active` (can add keys and trade).
-- **Revoke** → access withdrawn.
+- In **Admin → Licence keys**, mint a key: give it a client label and a
+  **duration in days** (blank = lifetime). The full key shows **once** (only its
+  SHA-256 hash is stored) — copy it and send it to the client.
+- The client signs up with **username + email + password + that key** and goes
+  **live instantly**. A key is single-use and random per client (so no two
+  clients' data can mix), and cannot be redeemed twice.
+- Time-limited licences expire on their own; **+ Days** on the user's row extends
+  or restarts access. **Revoke** withdraws access immediately (and stops that
+  user's engine); **Grant** hands a lifetime licence manually.
+- `AUTO_LICENSE_NEW_USERS=true` skips keys entirely — every signup auto-activates
+  (single-tenant / dev only).
 
-If `ADMIN_EMAIL` is blank, the **first** account to sign up becomes admin.
+If `ADMIN_EMAIL` is blank, the **first** account to sign up becomes admin. The
+admin is key-exempt. Clients log in afterwards with **either their username or
+their email** + password.
 
 ## 5. Going live (per user, later)
 
