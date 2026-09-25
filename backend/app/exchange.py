@@ -27,11 +27,24 @@ _RETRYABLE = (
 )
 
 
+def _is_geo_block(exc: Exception) -> bool:
+    """True if the error is a Binance regional block (HTTP 451).
+
+    A 451 "restricted location" is permanent — it depends on where the server
+    runs, not on transient network weather — so retrying it only wastes time and
+    floods the logs. Detect it so callers fail fast instead of looping.
+    """
+    msg = str(exc)
+    low = msg.lower()
+    return "451" in msg or "restricted location" in low or "eligibility" in low
+
+
 def _with_retry(fn: Callable[[], T], *, attempts: int = 3, base_delay: float = 0.5) -> T:
     """Call fn, retrying transient network errors with exponential backoff.
 
     Non-retryable errors (auth, insufficient funds, bad symbol) are raised
-    immediately — retrying those just wastes time and hammers the exchange.
+    immediately — retrying those just wastes time and hammers the exchange. A
+    regional geo-block (HTTP 451) is likewise permanent, so it fails fast too.
     """
     last_exc: Exception | None = None
     for i in range(attempts):
@@ -39,6 +52,9 @@ def _with_retry(fn: Callable[[], T], *, attempts: int = 3, base_delay: float = 0
             return fn()
         except _RETRYABLE as exc:
             last_exc = exc
+            if _is_geo_block(exc):
+                # Permanent regional block — retrying cannot help. Fail fast.
+                raise
             if i == attempts - 1:
                 break
             delay = base_delay * (2 ** i)
