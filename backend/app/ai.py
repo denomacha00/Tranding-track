@@ -465,6 +465,28 @@ class AICommentator:
         )
 
 
+def _is_edge_block(resp: httpx.Response) -> bool:
+    """True when a response looks like a CDN/WAF (e.g. Cloudflare) block or
+    challenge page rather than a genuine API reply — i.e. the request never
+    reached the provider's API. Detected from the ``server`` header, a
+    Cloudflare ray id, or an HTML challenge body ("Attention Required",
+    "Just a moment"). Kept defensive: diagnostics must never raise."""
+    try:
+        if "cloudflare" in resp.headers.get("server", "").lower():
+            return True
+        if resp.headers.get("cf-ray") or resp.headers.get("cf-mitigated"):
+            return True
+        if "text/html" in resp.headers.get("content-type", "").lower():
+            body = resp.text[:2000].lower()
+            markers = ("attention required", "just a moment", "cloudflare",
+                       "cf-browser-verification", "enable javascript")
+            if any(m in body for m in markers):
+                return True
+    except Exception:  # noqa: BLE001 — never let error-describing itself fail
+        return False
+    return False
+
+
 def _describe_ai_error(exc: Exception) -> str:
     """Turn a provider exception into a short, secret-free reason string.
 
@@ -473,6 +495,14 @@ def _describe_ai_error(exc: Exception) -> str:
     """
     if isinstance(exc, httpx.HTTPStatusError):
         code = exc.response.status_code
+        if _is_edge_block(exc.response):
+            return (
+                f"the provider's edge/firewall (e.g. Cloudflare) blocked the "
+                f"request (HTTP {code}) — this is NOT a key problem; the request "
+                "never reached the AI API. The gateway is refusing server-to-server "
+                "calls. Use a provider that allows API access from servers, or ask "
+                "the gateway operator to allowlist your server."
+            )
         if code in (401, 403):
             return (
                 f"the AI provider rejected the key (HTTP {code}) — check AI_API_KEY "
