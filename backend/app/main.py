@@ -593,6 +593,9 @@ def set_bot_state(
 ):
     engine = _engine_for(db, user)
     if state == "start":
+        # Restarting is the operator's explicit acknowledgement: clear any tripped
+        # drawdown kill-switch and reseed the equity peak from here.
+        engine.reset_killswitch()
         engine.running = True
     elif state == "stop":
         engine.running = False

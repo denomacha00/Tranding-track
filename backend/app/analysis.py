@@ -45,6 +45,7 @@ class MarketAnalysis:
     confidence: float  # 0..1
     score: float  # signed: >0 bullish, <0 bearish
     price: float
+    atr: float = 0.0  # latest ATR (absolute, same units as price); 0 if unknown
     factors: list[Factor] = field(default_factory=list)
     summary: str = ""
 
@@ -55,6 +56,7 @@ class MarketAnalysis:
             "confidence": round(self.confidence, 3),
             "score": round(self.score, 3),
             "price": self.price,
+            "atr": round(self.atr, 8),
             "summary": self.summary,
             "factors": [
                 {
@@ -243,6 +245,7 @@ class MarketAnalyzer:
             confidence=confidence,
             score=norm,
             price=price,
+            atr=atr_now,
             factors=factors,
             summary=summary,
         )

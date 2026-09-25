@@ -199,6 +199,35 @@ class BinanceConnector:
             raise RuntimeError(f"No price available for {symbol}")
         return float(last)
 
+    def spread_pct(self, symbol: str) -> Optional[float]:
+        """Current bid/ask spread as a % of mid price, or None if unknowable.
+
+        Used as a pre-trade liquidity guard: a wide spread means a thin/volatile
+        book and a poor fill. Returns None when the exchange doesn't expose both a
+        bid and an ask (we refuse to *fabricate* a spread and block on it — the
+        caller then proceeds rather than inventing a reason to skip).
+        """
+        if not self._client:
+            return None
+        try:
+            ticker = _with_retry(lambda: self._client.fetch_ticker(symbol))
+        except Exception as exc:
+            logger.warning("spread probe failed for %s: %s", symbol, exc)
+            return None
+        bid = ticker.get("bid")
+        ask = ticker.get("ask")
+        try:
+            bid_f = float(bid) if bid is not None else 0.0
+            ask_f = float(ask) if ask is not None else 0.0
+        except (TypeError, ValueError):
+            return None
+        if bid_f <= 0 or ask_f <= 0 or ask_f < bid_f:
+            return None
+        mid = (bid_f + ask_f) / 2.0
+        if mid <= 0:
+            return None
+        return (ask_f - bid_f) / mid * 100.0
+
     def fetch_ohlcv(
         self, symbol: str, timeframe: str = "1h", limit: int = 200
     ) -> list[list[float]]:

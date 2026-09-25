@@ -65,6 +65,35 @@ class Settings(BaseSettings):
     # winners run. Never loosened.
     trailing_stop_pct: float = Field(default=0.0)
 
+    # Account-level max-drawdown KILL-SWITCH (% below the peak total equity seen
+    # while running). If equity falls this far from its peak, the engine HALTS:
+    # autonomous trading stops and ALL new entries are blocked (open positions
+    # keep their stops) until the operator restarts the bot. This is the
+    # catastrophe backstop sitting ABOVE the daily-loss breaker, so one very bad
+    # run can never quietly drain the account. 0 disables.
+    max_drawdown_pct: float = Field(default=25.0)
+    # Pre-trade liquidity guard for LIVE market ENTRIES: if the current bid/ask
+    # spread is wider than this % of mid price, skip the entry (a wide spread
+    # means a thin/volatile book and a bad fill). Applies to opening market
+    # orders only — an exit is NEVER blocked. 0 disables.
+    max_spread_pct: float = Field(default=1.0)
+    # Anti-whipsaw: after a LOSING autonomous exit on a symbol, wait this many
+    # minutes before the bot may re-enter that same symbol. Stops the bot from
+    # repeatedly buying back into a chop and bleeding fees + losses. Only affects
+    # autonomous re-entries; a manual trade is never cooldown-blocked. 0 disables.
+    reentry_cooldown_minutes: float = Field(default=15.0)
+    # Consecutive-loss circuit breaker: after this many losing CLOSED trades in a
+    # row, the bot stops opening NEW autonomous positions until a win breaks the
+    # streak (manual trades still work). Caps damage from a losing regime. 0
+    # disables.
+    max_consecutive_losses: int = Field(default=3)
+    # ATR-based stop FLOOR for autonomous entries. The auto stop-loss is placed at
+    # least atr_stop_mult × ATR away from entry, so a fixed default_stop_loss_pct
+    # can't sit inside normal market noise and get knocked out immediately. Sizing
+    # uses the actual (wider) stop, so the position shrinks to keep risk constant.
+    # 0 disables (use the fixed % stop only).
+    atr_stop_mult: float = Field(default=1.5)
+
     # Autonomous trading: only act on analysis at/above this confidence (0..1).
     min_signal_confidence: float = Field(default=0.5)
     # When true, the bot analyses `auto_symbols` on each monitor tick and trades

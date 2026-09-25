@@ -55,6 +55,18 @@ class TradingEngine:
         # Last autonomous verdict per symbol, so a signal row is logged only when
         # the brain's decision CHANGES (not an identical row every ~5s tick).
         self._last_auto_verdict: dict[str, str] = {}
+        # ---- risk-safeguard state (in-memory; reset on restart) ----
+        # Peak TOTAL equity (free cash + open-position value) seen so far, for the
+        # max-drawdown kill-switch. Seeded on the first drawdown check.
+        self._peak_equity: float = 0.0
+        # True once the drawdown kill-switch has fired. While set, ALL new entries
+        # are blocked (open positions keep their stops); cleared by restarting.
+        self._killswitch_tripped: bool = False
+        # Per-symbol time of the last LOSING exit, for the re-entry cooldown.
+        self._last_loss_exit: dict[str, dt.datetime] = {}
+        # Symbols whose price feed is currently unreachable during monitoring, so
+        # a "protection degraded" alert is emitted once per outage, not every tick.
+        self._monitor_degraded: set[str] = set()
         # Paper wallet (quote currency, e.g. USDT).
         self.paper_balance = settings.paper_starting_balance
         # Event broadcaster set by the app on startup.
@@ -265,6 +277,148 @@ class TradingEngine:
             total += self.unrealized_pnl(t, price)
         return total
 
+    # ---- risk safeguards --------------------------------------------
+
+    def _total_equity(self, db: Session) -> float:
+        """Total account equity = free cash + current market value of open
+        positions.
+
+        Matches the ``equity`` figure reported by ``status`` and is the basis for
+        the max-drawdown kill-switch.
+        """
+        balance = self._equity(db)
+        position_value = 0.0
+        open_trades = db.scalars(
+            self._scope(select(Trade).where(Trade.status == TradeStatus.open.value))
+        ).all()
+        for t in open_trades:
+            try:
+                price = self._price(t.symbol, fallback=t.entry_price)
+            except Exception:
+                price = t.entry_price
+            position_value += t.entry_price * t.amount + self.unrealized_pnl(t, price)
+        return balance + position_value
+
+    def _update_drawdown(self, db: Session) -> bool:
+        """Track peak equity and trip the kill-switch on catastrophic drawdown.
+
+        Returns True if the kill-switch is (now) tripped. On the FIRST trip it
+        halts autonomous trading (``running=False``), emits an event and notifies.
+        Open positions keep being managed — only NEW entries are blocked — until
+        the operator restarts the bot (which calls :meth:`reset_killswitch`).
+        """
+        dd_pct = getattr(self.settings, "max_drawdown_pct", 0.0) or 0.0
+        if dd_pct <= 0:
+            return False
+        try:
+            equity = self._total_equity(db)
+        except Exception:
+            # Can't value the account right now — never fabricate a breach.
+            return self._killswitch_tripped
+        if equity <= 0:
+            return self._killswitch_tripped
+        if equity > self._peak_equity:
+            self._peak_equity = equity
+        if self._peak_equity <= 0:
+            return False
+        drawdown = (self._peak_equity - equity) / self._peak_equity * 100.0
+        if drawdown >= dd_pct and not self._killswitch_tripped:
+            self._killswitch_tripped = True
+            was_running = self.running
+            self.running = False
+            self._emit(
+                "killswitch",
+                {
+                    "peak_equity": round(self._peak_equity, 2),
+                    "equity": round(equity, 2),
+                    "drawdown_pct": round(drawdown, 2),
+                    "max_drawdown_pct": dd_pct,
+                },
+            )
+            self._notify(
+                f"\U0001F6D1 KILL-SWITCH: equity {equity:.2f} is {drawdown:.1f}% below "
+                f"peak {self._peak_equity:.2f} (limit {dd_pct:.0f}%). Autonomous trading "
+                f"halted and new entries blocked; open positions keep their stops. "
+                f"Restart the bot to resume."
+            )
+            if was_running:
+                logger.warning(
+                    "kill-switch tripped for user=%s (drawdown %.1f%% >= %.1f%%)",
+                    self.user_id, drawdown, dd_pct,
+                )
+        return self._killswitch_tripped
+
+    def _drawdown_block(self, db: Session) -> tuple[bool, str]:
+        """Return (blocked, reason) for a prospective NEW entry."""
+        if self._update_drawdown(db):
+            return True, (
+                "max-drawdown kill-switch active — new entries are blocked "
+                "until the bot is restarted"
+            )
+        return False, ""
+
+    def reset_killswitch(self) -> None:
+        """Clear the kill-switch and reseed the equity peak.
+
+        Called when the operator (re)starts the bot: restarting is the explicit
+        acknowledgement that resumes trading, and the drawdown budget is measured
+        fresh from the equity at restart rather than an old, higher peak.
+        """
+        self._killswitch_tripped = False
+        self._peak_equity = 0.0
+
+    def _consecutive_losses(self, db: Session) -> int:
+        """Count the current run of losing CLOSED trades (most recent first)."""
+        rows = db.scalars(
+            self._scope(
+                select(Trade)
+                .where(Trade.status == TradeStatus.closed.value)
+                .order_by(Trade.closed_at.desc())
+            )
+        ).all()
+        streak = 0
+        for t in rows:
+            if (t.pnl or 0.0) < 0:
+                streak += 1
+            else:
+                break
+        return streak
+
+    def _reentry_cooldown_remaining(self, symbol: str) -> float:
+        """Seconds left before the bot may re-enter ``symbol`` after a loss."""
+        minutes = getattr(self.settings, "reentry_cooldown_minutes", 0.0) or 0.0
+        if minutes <= 0:
+            return 0.0
+        last = self._last_loss_exit.get(symbol)
+        if not last:
+            return 0.0
+        remaining = minutes * 60.0 - (_utcnow() - last).total_seconds()
+        return remaining if remaining > 0 else 0.0
+
+    def _spread_guard(self, symbol: str) -> str | None:
+        """Reason string if the live bid/ask spread is too wide to enter, else None.
+
+        Only meaningful for LIVE market entries. Never blocks when the spread
+        can't be measured (missing bid/ask) — refusing on unknowable data would
+        be inventing a reason.
+        """
+        max_spread = getattr(self.settings, "max_spread_pct", 0.0) or 0.0
+        if max_spread <= 0:
+            return None
+        fn = getattr(self.connector, "spread_pct", None)
+        if not callable(fn):
+            return None
+        try:
+            spread = fn(symbol)
+        except Exception:
+            return None
+        if spread is None or spread <= max_spread:
+            return None
+        return (
+            f"{symbol}: bid/ask spread {spread:.2f}% exceeds max {max_spread:.2f}% "
+            "— skipping entry to avoid a bad fill"
+        )
+
     # ---- core execution ---------------------------------------------
 
     def execute_signal(
@@ -314,6 +468,13 @@ class TradingEngine:
                 return False, f"Already in a {state} position for {symbol}", None
 
             # ---- OPEN a new position ---------------------------------
+            # Account-level kill-switch first: on catastrophic drawdown, refuse
+            # ALL new entries (manual, webhook or autonomous) until the bot is
+            # restarted. Exits above already returned, so this never blocks a
+            # close — only new risk.
+            blocked, why = self._drawdown_block(db)
+            if blocked:
+                return False, f"Rejected by risk manager: {why}", None
             # Spot markets can't be shorted: a live SELL with no existing long to
             # close (all closing cases returned above) would attempt to sell base
             # currency we don't hold and be rejected by Binance — or, worse, sell
@@ -404,6 +565,12 @@ class TradingEngine:
                 )
 
             if self.settings.is_live:
+                # Liquidity guard: don't take a market entry into a wide book.
+                # Applies to opening orders only (this branch); exits are never
+                # spread-blocked.
+                spread_reason = self._spread_guard(symbol)
+                if spread_reason:
+                    return False, f"Rejected: {spread_reason}", None
                 adj_qty, err = self.connector.normalize_amount(symbol, qty, price)
                 if err:
                     return False, f"Rejected: {err}", None
@@ -467,6 +634,29 @@ class TradingEngine:
     def _auto_take(self, price: float, side: str) -> float:
         pct = self.settings.default_take_profit_pct / 100.0
         return price * (1 + pct) if side == "buy" else price * (1 - pct)
+
+    def _atr_floored_stop(self, analysis) -> float | None:
+        """Autonomous BUY stop: the wider of the fixed % stop and an ATR floor.
+
+        A fixed ``default_stop_loss_pct`` can sit inside normal volatility and get
+        knocked out on noise. We ensure the stop is at least ``atr_stop_mult`` ×
+        ATR below entry (never tighter than ATR noise). ``execute_signal`` then
+        sizes the position against this real distance, so a wider stop shrinks the
+        position and keeps risk-per-trade constant. Returns None to fall back to
+        ``execute_signal``'s own auto-stop when there's no usable price/ATR.
+        """
+        price = getattr(analysis, "price", 0.0) or 0.0
+        if price <= 0:
+            return None
+        pct_stop = price * (1 - self.settings.default_stop_loss_pct / 100.0)
+        atr_val = getattr(analysis, "atr", 0.0) or 0.0
+        mult = getattr(self.settings, "atr_stop_mult", 0.0) or 0.0
+        if mult <= 0 or atr_val <= 0:
+            return pct_stop if pct_stop > 0 else None
+        atr_stop = price - mult * atr_val
+        # Lower price = wider (safer) stop for a long; clear the ATR noise band.
+        stop = min(pct_stop, atr_stop)
+        return stop if stop > 0 else (pct_stop if pct_stop > 0 else None)
 
     # ---- resting limit orders ---------------------------------------
 
@@ -624,6 +814,10 @@ class TradingEngine:
         trade.note = (trade.note + " | " if trade.note else "") + reason
         db.commit()
         db.refresh(trade)
+        # Remember a LOSING exit so the anti-whipsaw re-entry cooldown can keep
+        # the bot from immediately buying back into the same falling symbol.
+        if pnl < 0:
+            self._last_loss_exit[trade.symbol] = _utcnow()
         self._emit("trade_closed", {"id": trade.id, "symbol": trade.symbol, "pnl": pnl})
         self._notify(
             f"\U0001F4B0 Closed {trade.symbol} @ {price:.2f} | PnL <b>{pnl:.2f}</b> "
@@ -651,9 +845,39 @@ class TradingEngine:
         stmt = self._scope(select(Trade).where(Trade.status == TradeStatus.open.value))
         for trade in list(db.scalars(stmt).all()):
             try:
-                price = self._price(trade.symbol, fallback=trade.entry_price)
-            except Exception:
+                # Fetch WITHOUT a fallback: during a real data outage we must NOT
+                # silently pretend the price is the entry price (which reads as
+                # "no trigger" and hides that protection is degraded).
+                price = self._price(trade.symbol)
+            except Exception as exc:
+                # Can't evaluate this position's stop/target right now. Surface it
+                # once per symbol instead of skipping in silence, so the operator
+                # knows in-process protection is paused. On LIVE the exchange-side
+                # stop order remains the backstop.
+                if trade.symbol not in self._monitor_degraded:
+                    self._monitor_degraded.add(trade.symbol)
+                    self._emit(
+                        "monitor_degraded",
+                        {"symbol": trade.symbol, "error": str(exc)},
+                    )
+                    backstop = (
+                        " Exchange-side stop still protects it."
+                        if self.settings.is_live
+                        else ""
+                    )
+                    self._notify(
+                        f"⚠️ Price feed for {trade.symbol} is unreachable — "
+                        f"in-process stop/target checks are paused for it.{backstop}"
+                    )
                 continue
+            if trade.symbol in self._monitor_degraded:
+                # Feed recovered: clear the flag and let the operator know.
+                self._monitor_degraded.discard(trade.symbol)
+                self._emit("monitor_recovered", {"symbol": trade.symbol})
+                self._notify(
+                    f"✅ Price feed for {trade.symbol} recovered — stop/target "
+                    f"checks resumed."
+                )
             self._maybe_trail_stop(db, trade, price)
             hit: str | None = None
             if trade.side == "buy":
@@ -770,6 +994,27 @@ class TradingEngine:
         if analysis.verdict == "buy":
             if existing:
                 return False, f"{symbol}: already long"
+            _sym = symbol.upper()
+            # Anti-whipsaw: honour the re-entry cooldown after a losing exit on
+            # this symbol so the bot doesn't buy straight back into a chop.
+            cooldown = self._reentry_cooldown_remaining(_sym)
+            if cooldown > 0:
+                return (
+                    False,
+                    f"{symbol}: re-entry cooldown ({cooldown / 60:.1f} min left "
+                    "after a losing exit)",
+                )
+            # Consecutive-loss circuit breaker: stop opening new autonomous risk
+            # after a losing streak until a win breaks it.
+            max_streak = getattr(self.settings, "max_consecutive_losses", 0) or 0
+            if max_streak > 0:
+                streak = self._consecutive_losses(db)
+                if streak >= max_streak:
+                    return (
+                        False,
+                        f"{symbol}: paused after {streak} consecutive losses "
+                        "(circuit breaker)",
+                    )
             # Permission-gated AI review of the ENTRY. Risk-first and veto-only:
             # it can BLOCK new risk but never invent a trade, and if the AI is
             # unavailable it falls back to the deterministic decision. Governed by
@@ -778,10 +1023,12 @@ class TradingEngine:
                 proceed, reason = self.ai.confirm_trade(analysis)
                 if not proceed:
                     return False, f"{symbol}: {reason}"
+            # Use an ATR-floored stop so a fixed % stop can't sit inside noise;
+            # execute_signal sizes the position against this real stop distance.
             ok, msg, _ = self.execute_signal(
                 db, action="buy", symbol=symbol, amount=None,
-                stop_loss=None, take_profit=None, source="auto",
-                note=f"auto: {analysis.summary}",
+                stop_loss=self._atr_floored_stop(analysis), take_profit=None,
+                source="auto", note=f"auto: {analysis.summary}",
             )
             return ok, msg
         # sell verdict: close a long if we hold one, else stand aside.
@@ -907,4 +1154,9 @@ class TradingEngine:
             "unrealized_pnl": unrealized,
             "day_pnl": self.risk.day_realized_pnl(db),
             "max_open_positions": self.settings.max_open_positions,
+            # Risk-safeguard state (honest, in-memory): the kill-switch flag lets
+            # the UI show a clear HALTED state instead of a silently idle bot.
+            "killswitch": self._killswitch_tripped,
+            "max_drawdown_pct": getattr(self.settings, "max_drawdown_pct", 0.0),
+            "peak_equity": round(self._peak_equity, 2),
         }
