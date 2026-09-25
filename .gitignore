@@ -22,6 +22,10 @@ dist/
 .vite/
 *.tsbuildinfo
 
+# Built dashboard served by the backend (generated: Dockerfile copies frontend/dist here;
+# locally `cp -r frontend/dist backend/static`). Never commit a stale bundle.
+backend/static/
+
 # Editor / OS
 .vscode/
 .idea/
