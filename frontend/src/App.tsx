@@ -100,7 +100,7 @@ export default function App() {
   return <Dashboard me={me} onLogout={logout} onMeChanged={setMe} theme={theme} onToggleTheme={toggleTheme} />
 }
 
-type TabKey = 'trades' | 'performance' | 'signals' | 'assistant' | 'analyze' | 'train' | 'backtest' | 'settings' | 'admin'
+type TabKey = 'trades' | 'performance' | 'signals' | 'assistant' | 'news' | 'analyze' | 'train' | 'backtest' | 'settings' | 'admin'
 
 // Left-drawer navigation. `admin: true` items only render for admins. The same
 // keys drive the in-panel tab strip, so the two stay in sync off one `tab`.
@@ -109,6 +109,7 @@ const NAV: { key: TabKey; label: string; icon: string; admin?: boolean }[] = [
   { key: 'performance', label: 'Performance', icon: '🏆' },
   { key: 'signals', label: 'Signals', icon: '📡' },
   { key: 'assistant', label: 'AI Assistant', icon: '🤖' },
+  { key: 'news', label: 'News', icon: '📰' },
   { key: 'analyze', label: 'Analyze', icon: '🔍' },
   { key: 'train', label: 'Train', icon: '🧠' },
   { key: 'backtest', label: 'Backtest', icon: '↺' },
@@ -122,6 +123,7 @@ const NAV_LABEL: Record<TabKey, string> = {
   performance: 'Performance',
   signals: 'Signals',
   assistant: 'AI Assistant',
+  news: 'News',
   analyze: 'Analyze',
   train: 'Train',
   backtest: 'Backtest',
@@ -137,6 +139,7 @@ const NAV_ALIAS: Record<string, TabKey> = {
   pnl: 'performance', analytics: 'performance',
   signals: 'signals', signal: 'signals',
   assistant: 'assistant', ai: 'assistant', chat: 'assistant',
+  news: 'news', headlines: 'news', feed: 'news', feeds: 'news',
   analyze: 'analyze', analysis: 'analyze', analyse: 'analyze',
   train: 'train', training: 'train',
   backtest: 'backtest', backtesting: 'backtest',
@@ -870,6 +873,12 @@ function Dashboard({
                   AI Assistant
                 </span>
                 <span
+                  className={`tab ${tab === 'news' ? 'active' : ''}`}
+                  onClick={() => setTab('news')}
+                >
+                  News
+                </span>
+                <span
                   className={`tab ${tab === 'analyze' ? 'active' : ''}`}
                   onClick={() => setTab('analyze')}
                 >
@@ -928,6 +937,7 @@ function Dashboard({
                   onError={(m) => showToast('error', m)}
                 />
               )}
+              {tab === 'news' && <NewsPanel onError={(m) => showToast('error', m)} />}
               {tab === 'analyze' && (
                 <AnalyzePanel
                   symbol={symbol}
@@ -1568,11 +1578,6 @@ function AssistantPanel({
   const [useNews, setUseNews] = useState(false)
   const [readAloud, setReadAloud] = useState(false)
   const [listening, setListening] = useState(false)
-  const [news, setNews] = useState<NewsItem[]>([])
-  const [newsErrors, setNewsErrors] = useState<string[]>([])
-  const [newsLoading, setNewsLoading] = useState(false)
-  // When the headlines were last refreshed, so the panel can show it's live.
-  const [newsFetchedAt, setNewsFetchedAt] = useState<number | null>(null)
   // Live connection dashboard: real AI-provider reachability + exchange access,
   // so "the AI isn't working" / "am I connected?" show a concrete answer.
   const [aiHealth, setAiHealth] = useState<AiHealth | null>(null)
@@ -1598,20 +1603,6 @@ function AssistantPanel({
     },
     [],
   )
-
-  const loadNews = useCallback(async () => {
-    setNewsLoading(true)
-    try {
-      const res = await api.news(8)
-      setNews(res.items)
-      setNewsErrors(res.errors)
-      setNewsFetchedAt(Date.now())
-    } catch (e) {
-      onError((e as Error).message)
-    } finally {
-      setNewsLoading(false)
-    }
-  }, [onError])
 
   // Probe the built-in AI provider once on mount (real ping, no secrets) so the
   // dashboard can say "connected" or the concrete reason it can't answer.
@@ -1640,14 +1631,6 @@ function AssistantPanel({
       setTesting(false)
     }
   }, [onRefreshAccess, onError])
-
-  // Load headlines on mount, then auto-refresh so the panel stays near-real-time
-  // (the backend already limits results to the last day and caches briefly).
-  useEffect(() => {
-    loadNews()
-    const id = setInterval(loadNews, 60000)
-    return () => clearInterval(id)
-  }, [loadNews])
 
   const speak = (text: string) => {
     if (!readAloud || !ttsSupported) return
@@ -1718,12 +1701,6 @@ function AssistantPanel({
     } catch {
       setListening(false)
     }
-  }
-
-  const fmtNewsTime = (iso: string) => {
-    if (!iso) return ''
-    const d = new Date(iso)
-    return Number.isNaN(d.getTime()) ? iso : d.toLocaleString()
   }
 
   const suggestions = [
@@ -1924,62 +1901,103 @@ function AssistantPanel({
             </p>
           )}
         </div>
-
-        <div className="news-col">
-          <div className="news-head">
-            <span>📰 Live market news</span>
-            <span className="news-updated muted">
-              {newsFetchedAt
-                ? `updated ${new Date(newsFetchedAt).toLocaleTimeString([], {
-                    hour: '2-digit',
-                    minute: '2-digit',
-                  })}`
-                : ''}
-            </span>
-            <button
-              type="button"
-              className="btn ghost sm"
-              onClick={loadNews}
-              disabled={newsLoading}
-              title="Refresh headlines"
-            >
-              {newsLoading ? '…' : '↻'}
-            </button>
-          </div>
-          <p className="hint tiny news-sub">
-            Real headlines from public feeds, newest first — today’s news (or the
-            most recent day if today is quiet). Never fabricated.
-          </p>
-          {news.length === 0 && !newsLoading ? (
-            <div className="empty sm">
-              {newsErrors.length
-                ? 'News sources are unreachable right now. Nothing is fabricated — this is empty because the real feeds could not be fetched.'
-                : 'No headlines available.'}
-            </div>
-          ) : (
-            <ul className="news-list">
-              {news.map((n, i) => (
-                <li key={`${n.link ?? n.title}:${i}`}>
-                  {n.link ? (
-                    <a href={n.link} target="_blank" rel="noopener noreferrer">
-                      {n.title}
-                    </a>
-                  ) : (
-                    <span>{n.title}</span>
-                  )}
-                  <div className="news-meta muted">
-                    {n.source}
-                    {n.published ? ` · ${fmtNewsTime(n.published)}` : ''}
-                  </div>
-                </li>
-              ))}
-            </ul>
-          )}
-          {newsErrors.length > 0 && news.length > 0 && (
-            <p className="hint tiny">Some feeds failed: {newsErrors.join(', ')}.</p>
-          )}
-        </div>
       </div>
+    </div>
+  )
+}
+
+// Dedicated News dashboard: its own tab so headlines get full width instead of
+// sharing the assistant column. Real public-feed items only — an empty list
+// means the feeds were unreachable (never fabricated).
+function NewsPanel({ onError }: { onError: (msg: string) => void }) {
+  const [news, setNews] = useState<NewsItem[]>([])
+  const [newsErrors, setNewsErrors] = useState<string[]>([])
+  const [newsLoading, setNewsLoading] = useState(false)
+  // When the headlines were last refreshed, so the dashboard shows it's live.
+  const [newsFetchedAt, setNewsFetchedAt] = useState<number | null>(null)
+
+  const loadNews = useCallback(async () => {
+    setNewsLoading(true)
+    try {
+      const res = await api.news(12)
+      setNews(res.items)
+      setNewsErrors(res.errors)
+      setNewsFetchedAt(Date.now())
+    } catch (e) {
+      onError((e as Error).message)
+    } finally {
+      setNewsLoading(false)
+    }
+  }, [onError])
+
+  // Load on mount, then auto-refresh so the dashboard stays near-real-time (the
+  // backend already limits results to the last day and caches briefly).
+  useEffect(() => {
+    loadNews()
+    const id = setInterval(loadNews, 60000)
+    return () => clearInterval(id)
+  }, [loadNews])
+
+  const fmtNewsTime = (iso: string) => {
+    if (!iso) return ''
+    const d = new Date(iso)
+    return Number.isNaN(d.getTime()) ? iso : d.toLocaleString()
+  }
+
+  return (
+    <div className="news-panel">
+      <div className="news-head">
+        <span>📰 Live market news</span>
+        <span className="news-updated muted">
+          {newsFetchedAt
+            ? `updated ${new Date(newsFetchedAt).toLocaleTimeString([], {
+                hour: '2-digit',
+                minute: '2-digit',
+              })}`
+            : ''}
+        </span>
+        <button
+          type="button"
+          className="btn ghost sm"
+          onClick={loadNews}
+          disabled={newsLoading}
+          title="Refresh headlines"
+        >
+          {newsLoading ? '…' : '↻'}
+        </button>
+      </div>
+      <p className="hint tiny news-sub">
+        Real headlines from public feeds, newest first — today’s news (or the most
+        recent day if today is quiet). Never fabricated.
+      </p>
+      {news.length === 0 && !newsLoading ? (
+        <div className="empty sm">
+          {newsErrors.length
+            ? 'News sources are unreachable right now. Nothing is fabricated — this is empty because the real feeds could not be fetched.'
+            : 'No headlines available.'}
+        </div>
+      ) : (
+        <ul className="news-list">
+          {news.map((n, i) => (
+            <li key={`${n.link ?? n.title}:${i}`}>
+              {n.link ? (
+                <a href={n.link} target="_blank" rel="noopener noreferrer">
+                  {n.title}
+                </a>
+              ) : (
+                <span>{n.title}</span>
+              )}
+              <div className="news-meta muted">
+                {n.source}
+                {n.published ? ` · ${fmtNewsTime(n.published)}` : ''}
+              </div>
+            </li>
+          ))}
+        </ul>
+      )}
+      {newsErrors.length > 0 && news.length > 0 && (
+        <p className="hint tiny">Some feeds failed: {newsErrors.join(', ')}.</p>
+      )}
     </div>
   )
 }

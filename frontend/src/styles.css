@@ -1077,11 +1077,9 @@ pre.code {
 .conn-state { color: var(--muted); flex: 1 1 120px; min-width: 0; overflow-wrap: anywhere; line-height: 1.4; }
 .nav-cta { margin-top: 8px; }
 
-.news-col {
-  border: 1px solid var(--border);
-  border-radius: 10px;
-  background: var(--panel-2);
-  padding: 12px;
+/* News has its own tab now, so it fills the panel body rather than sitting in a
+   bordered side rail next to the chat. */
+.news-panel {
   min-width: 0;
 }
 .news-head {
