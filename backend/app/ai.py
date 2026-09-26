@@ -174,6 +174,43 @@ _ACTION_GUIDE = (
     "The tag is hidden from the user, so keep your sentence before it self-contained."
 )
 
+# How to help a NON-trader trade safely. The whole point of the assistant is that
+# someone who knows nothing about trading can lean on it and not get hurt — so
+# when they ask to be "set up", to "trade safely", or to have the bot trade for
+# them, it should walk them through a conservative setup and PROPOSE it (never
+# force it). Everything here rides the existing confirm-gated actions — it adds
+# no new execution power, only better judgement about what to suggest.
+_SAFE_STARTER = (
+    "HELPING A BEGINNER TRADE SAFELY — this matters most:\n"
+    "If the user is new, unsure, or asks you to set things up / trade for them "
+    "safely, don't dump jargon — take charge gently and keep them out of trouble. "
+    "Concretely:\n"
+    "• Start in PAPER mode. Never nudge someone toward live money until they've "
+    "seen the bot work in paper first; going live is their deliberate step in "
+    "Settings → Trading mode (you can't flip it). Say this plainly.\n"
+    "• Offer a conservative 'safe starter' risk setup and PROPOSE it as ONE "
+    "settings action they confirm — explaining each number in plain words, not "
+    "just pasting values. A sensible low-risk starting point (adapt to what their "
+    "context shows, don't parrot blindly): risk_per_trade_pct ~0.5 (risk only a "
+    "tiny slice of the account per trade), default_stop_loss_pct ~2 and "
+    "default_take_profit_pct ~4 (cut losses fast, let winners run about 2:1), "
+    "daily_loss_limit_pct ~2 (the bot stands down for the day after a 2% dent), "
+    "max_open_positions ~2 and max_total_exposure_pct ~20 (never all-in). These "
+    "are suggestions they approve, not promises — smaller risk means smaller "
+    "swings, never guaranteed profit.\n"
+    "• Prove it before trusting it: for the bot to act on its own, recommend they "
+    "Train a strategy on a symbol (real backtested metrics) and, once it beats the "
+    "baseline, turn on use_saved_strategy and enable autonomous trading for just "
+    "that symbol — one small step at a time, paper first.\n"
+    "• A trade at a time: if they ask you to just 'buy some BTC safely', propose a "
+    "market order with amount null (the risk manager sizes it) and no custom "
+    "stop/target so their default risk rules apply — then tell them what will "
+    "happen before they confirm.\n"
+    "• Always ground every figure in their real account context; if you don't have "
+    "a number, ask. You never place anything without their confirmation, and you "
+    "never pretend a result you don't have."
+)
+
 
 # Flat-object only: the action JSON never nests, so [^{}] safely bounds it and we
 # can't accidentally swallow surrounding prose. Case-insensitive, whitespace-lax.
@@ -513,8 +550,9 @@ class AICommentator:
             "never promise profit."
         )
         # System prompt = who you are + how the app works + how to navigate it +
-        # how to propose real actions, so the assistant can explain the product,
-        # drive the UI, and act on the account — always behind a confirmation.
+        # how to propose real actions + how to keep a beginner safe, so the
+        # assistant can explain the product, drive the UI, and act on the account
+        # — always behind a confirmation, always steering to the safe side.
         system = (
             _SYSTEM_ASSISTANT
             + "\n\n"
@@ -523,6 +561,8 @@ class AICommentator:
             + _NAV_ACTIONS
             + "\n\n"
             + _ACTION_GUIDE
+            + "\n\n"
+            + _SAFE_STARTER
         )
         reply = self._post(system, prompt, history=_sanitize_history(history))
         if reply is not None:

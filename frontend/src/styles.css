@@ -562,9 +562,92 @@ th.mono {
   color: var(--red);
 }
 
-.sym-input {
-  width: 130px;
-  text-transform: uppercase;
+/* Market picker: a click-to-open, searchable dropdown of the real live pairs. */
+.sym-picker {
+  position: relative;
+}
+
+.sym-picker-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 130px;
+  justify-content: space-between;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 8px 10px;
+  border-radius: 8px;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  outline: none;
+}
+
+.sym-picker-btn:hover {
+  border-color: var(--accent);
+}
+
+.sym-picker-caret {
+  color: var(--muted);
+  font-size: 11px;
+}
+
+.sym-picker-menu {
+  position: absolute;
+  z-index: 40;
+  top: calc(100% + 4px);
+  left: 0;
+  width: 240px;
+  max-width: 80vw;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  padding: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.sym-picker-search {
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.sym-picker-list {
+  max-height: 280px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.sym-picker-item {
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--text);
+  padding: 7px 9px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+}
+
+.sym-picker-item:hover {
+  background: var(--panel-2);
+}
+
+.sym-picker-item.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+.sym-picker-empty,
+.sym-picker-more {
+  color: var(--muted);
+  font-size: 12px;
+  padding: 6px 9px;
 }
 
 /* Live order-book depth ladder. */

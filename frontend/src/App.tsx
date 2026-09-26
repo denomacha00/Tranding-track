@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type KeyboardEvent as ReactKeyboardEvent, type SetStateAction } from 'react'
 import { api, setToken, getToken, setAuthFailureHandler } from './api'
 import { PriceChart } from './PriceChart'
 import { useBinanceStream } from './useBinanceStream'
@@ -201,9 +201,6 @@ function Dashboard({
   // the majors as a fallback so the picker is never empty if markets are briefly
   // unreachable; replaced with the live Binance listing once it loads.
   const [symbolList, setSymbolList] = useState<string[]>(SYMBOLS)
-  // Free-text draft for the symbol box (committed on Enter/blur) so you can
-  // chart ANY pair, not just the presets, without reloading on every keystroke.
-  const [symbolDraft, setSymbolDraft] = useState(SYMBOLS[0])
   // Wall-clock of the last status we received (WS push or poll), so the bot
   // activity strip can show an honest "updated Ns ago" heartbeat.
   const [statusTs, setStatusTs] = useState(0)
@@ -551,23 +548,6 @@ function Dashboard({
       clearInterval(id)
     }
   }, [symbol])
-
-  // Keep the symbol box's draft in step when the pair changes elsewhere (e.g.
-  // picking a preset), then commit a typed pair: uppercased, and defaulted to a
-  // /USDT quote when none is given, so "doge" becomes "DOGE/USDT".
-  useEffect(() => {
-    setSymbolDraft(symbol)
-  }, [symbol])
-  const commitSymbol = () => {
-    let s = symbolDraft.trim().toUpperCase()
-    if (!s) {
-      setSymbolDraft(symbol)
-      return
-    }
-    if (!s.includes('/')) s = `${s}/USDT`
-    setSymbolDraft(s)
-    if (s !== symbol) setSymbol(s)
-  }
 
   const openTrades = useMemo(
     () => trades.filter((t) => t.status === 'open' || t.status === 'pending'),
@@ -935,29 +915,7 @@ function Dashboard({
                 )}
               </div>
               <div className="row" style={{ alignItems: 'center' }}>
-                <input
-                  className="input sym-input"
-                  list="symbol-presets"
-                  value={symbolDraft}
-                  onChange={(e) => setSymbolDraft(e.target.value)}
-                  onBlur={commitSymbol}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') {
-                      e.preventDefault()
-                      commitSymbol()
-                      ;(e.target as HTMLInputElement).blur()
-                    }
-                  }}
-                  spellCheck={false}
-                  autoComplete="off"
-                  aria-label="Symbol (any Binance pair, e.g. BTC/USDT)"
-                  title="Type any Binance pair (e.g. DOGE/USDT) and press Enter"
-                />
-                <datalist id="symbol-presets">
-                  {symbolList.map((s) => (
-                    <option key={s} value={s} />
-                  ))}
-                </datalist>
+                <SymbolPicker value={symbol} symbols={symbolList} onChange={setSymbol} />
                 <select
                   className="select"
                   value={timeframe}
@@ -1552,24 +1510,154 @@ function MarketStats({
     </div>
   )
 }
-// Running cumulative sum of order-book amounts from the top of book outward, so
-// each level shows the TOTAL resting liquidity up to (and including) it — the
-// depth ladder every exchange draws.
-function cumulative(levels: { amount: number }[]): number[] {
+// Running cumulative QUOTE VALUE (price × amount) of the order book from the top
+// outward, so each level shows the total resting liquidity in the quote currency
+// (USDT for a USDT pair — i.e. dollars) up to and including it. Quote value reads
+// far easier than tiny base-coin amounts, and it's a straight multiply of the
+// venue's own real price and size — nothing invented.
+function cumulativeValue(levels: { price: number; amount: number }[]): number[] {
   const out: number[] = []
   let run = 0
   for (const l of levels) {
-    run += Number.isFinite(l.amount) ? l.amount : 0
+    run += Number.isFinite(l.price) && Number.isFinite(l.amount) ? l.price * l.amount : 0
     out.push(run)
   }
   return out
 }
+
+// Market picker: click to open a searchable dropdown of the REAL live Binance
+// markets (from /api/symbols) and pick one — no need to type a pair by hand.
+// Typing in the search box only FILTERS that live list; if you search something
+// not yet in it (a brand-new listing), pressing Enter still accepts it as a pair
+// (adding a /USDT quote when none is given) so you're never blocked. Nothing here
+// is fabricated — the list is exactly what the exchange reports.
+function SymbolPicker({
+  value,
+  symbols,
+  onChange,
+}: {
+  value: string
+  symbols: string[]
+  onChange: (s: string) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [query, setQuery] = useState('')
+  const wrapRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLInputElement>(null)
+
+  // Close when clicking outside the menu.
+  useEffect(() => {
+    if (!open) return
+    const onDoc = (e: MouseEvent) => {
+      if (wrapRef.current && !wrapRef.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [open])
+
+  // Fresh, focused filter each time it opens so you can type-to-narrow instantly
+  // — but never have to; the full market list is right there to click.
+  useEffect(() => {
+    if (open) {
+      setQuery('')
+      const t = setTimeout(() => inputRef.current?.focus(), 0)
+      return () => clearTimeout(t)
+    }
+  }, [open])
+
+  const q = query.trim().toUpperCase()
+  const matches = useMemo(
+    () => (q ? symbols.filter((s) => s.toUpperCase().includes(q)) : symbols),
+    [q, symbols],
+  )
+  const CAP = 200
+  const shown = matches.slice(0, CAP)
+
+  const pick = (s: string) => {
+    onChange(s)
+    setOpen(false)
+  }
+  const onKeyDown = (e: ReactKeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter') {
+      e.preventDefault()
+      if (matches.length) {
+        pick(matches[0])
+        return
+      }
+      let s = q
+      if (s) {
+        if (!s.includes('/')) s = `${s}/USDT`
+        pick(s)
+      }
+    } else if (e.key === 'Escape') {
+      setOpen(false)
+    }
+  }
+
+  return (
+    <div className="sym-picker" ref={wrapRef}>
+      <button
+        type="button"
+        className="sym-picker-btn"
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        title="Choose a market"
+      >
+        <span className="sym-picker-val">{value}</span>
+        <span className="sym-picker-caret">▾</span>
+      </button>
+      {open && (
+        <div className="sym-picker-menu" role="listbox">
+          <input
+            ref={inputRef}
+            className="input sym-picker-search"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            onKeyDown={onKeyDown}
+            placeholder={`Search ${symbols.length} live markets…`}
+            spellCheck={false}
+            autoComplete="off"
+            aria-label="Search markets"
+          />
+          <div className="sym-picker-list">
+            {shown.length === 0 ? (
+              <div className="sym-picker-empty">
+                No market matches “{query}”. Press Enter to use it as a pair.
+              </div>
+            ) : (
+              shown.map((s) => (
+                <button
+                  type="button"
+                  key={s}
+                  className={`sym-picker-item ${s === value ? 'active' : ''}`}
+                  role="option"
+                  aria-selected={s === value}
+                  onClick={() => pick(s)}
+                >
+                  {s}
+                </button>
+              ))
+            )}
+          </div>
+          {matches.length > CAP && (
+            <div className="sym-picker-more">
+              {matches.length - CAP} more — keep typing to narrow.
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
 // Live order-book depth: the market's REAL resting bids (buy side) and asks
 // (sell side). When a real-time depth stream is available it's used directly
 // (100ms, exchange-grade); otherwise REST is polled every 2.5s. Each side shows
-// price, amount, and a running Total (cumulative amount from the top of book
-// outward), with depth bars scaled to that cumulative total. Empty sides mean
-// the venue returned no depth — never invented.
+// price, the level's VALUE in the quote currency (price × amount — USDT/dollars
+// for a USDT pair, far easier to read than fractional coin amounts), and a
+// running Total (cumulative quote value from the top of book outward), with
+// depth bars scaled to that cumulative value. Empty sides mean the venue
+// returned no depth — never invented.
 function OrderBook({
   symbol,
   exchange,
@@ -1618,8 +1706,10 @@ function OrderBook({
   const LEVELS = 12
   const asks = (active?.asks ?? []).slice(0, LEVELS)
   const bids = (active?.bids ?? []).slice(0, LEVELS)
-  const askCum = cumulative(asks)
-  const bidCum = cumulative(bids)
+  // Sizes shown as quote VALUE (price × amount) — USDT/dollars for a USDT pair.
+  const quote = symbol.split('/')[1] || ''
+  const askCum = cumulativeValue(asks)
+  const bidCum = cumulativeValue(bids)
   const maxCum = Math.max(
     1e-9,
     askCum[askCum.length - 1] ?? 0,
@@ -1668,18 +1758,18 @@ function OrderBook({
           <div className="ob">
             <div className="ob-headrow">
               <span>Price</span>
-              <span>Amount</span>
-              <span>Total</span>
+              <span>Amount{quote ? ` (${quote})` : ''}</span>
+              <span>Total{quote ? ` (${quote})` : ''}</span>
             </div>
             <div className="ob-side">
               {[...asks].reverse().map((lvl, i) => {
                 const orig = asks.length - 1 - i
-                const cum = askCum[orig] ?? lvl.amount
+                const cum = askCum[orig] ?? lvl.price * lvl.amount
                 return (
-                  <div className="ob-row ask" key={`a${i}`} title={`Cumulative ${compact(cum)} up to ${fmtPx(lvl.price)}`}>
+                  <div className="ob-row ask" key={`a${i}`} title={`${compact(lvl.amount)} ${quote ? `${symbol.split('/')[0]} ` : ''}resting at ${fmtPx(lvl.price)} · cumulative ${compact(cum)} ${quote}`}>
                     <div className="ob-depth" style={{ width: `${(cum / maxCum) * 100}%` }} />
                     <span className="ob-price sell">{fmtPx(lvl.price)}</span>
-                    <span className="ob-amt">{compact(lvl.amount)}</span>
+                    <span className="ob-amt">{compact(lvl.price * lvl.amount)}</span>
                     <span className="ob-total">{compact(cum)}</span>
                   </div>
                 )
@@ -1690,12 +1780,12 @@ function OrderBook({
             </div>
             <div className="ob-side">
               {bids.map((lvl, i) => {
-                const cum = bidCum[i] ?? lvl.amount
+                const cum = bidCum[i] ?? lvl.price * lvl.amount
                 return (
-                  <div className="ob-row bid" key={`b${i}`} title={`Cumulative ${compact(cum)} down to ${fmtPx(lvl.price)}`}>
+                  <div className="ob-row bid" key={`b${i}`} title={`${compact(lvl.amount)} ${quote ? `${symbol.split('/')[0]} ` : ''}resting at ${fmtPx(lvl.price)} · cumulative ${compact(cum)} ${quote}`}>
                     <div className="ob-depth" style={{ width: `${(cum / maxCum) * 100}%` }} />
                     <span className="ob-price buy">{fmtPx(lvl.price)}</span>
-                    <span className="ob-amt">{compact(lvl.amount)}</span>
+                    <span className="ob-amt">{compact(lvl.price * lvl.amount)}</span>
                     <span className="ob-total">{compact(cum)}</span>
                   </div>
                 )

@@ -1213,7 +1213,6 @@ def _assistant_account_context(db: Session, user: User, engine) -> str:
         f"confirm_tf={s.auto_confirm_timeframe or 'off'}, min_conf={s.min_signal_confidence}); "
         f"AI trade review {'on' if getattr(s, 'ai_trade_confirm', False) else 'off'}"
     )
-    # __ACCOUNT_CONTEXT_TAIL__
     now = _utcnow()
 
     def _hours_since(ts) -> float | None:
@@ -1377,6 +1376,86 @@ def _assistant_account_context(db: Session, user: User, engine) -> str:
                     f"({'accepted' if x.accepted else 'rejected'})"
                     for x in sig_rows
                 )
+            )
+    except Exception:
+        pass
+    # Realized performance from this user's CLOSED trades — the honest answer to
+    # "how am I doing / is my strategy working": win rate, profit factor, total
+    # P&L, expectancy and realized drawdown, all computed from real booked
+    # results (never guessed). Paper and live are split so simulated gains are
+    # never mistaken for real money.
+    try:
+        closed_rows = db.scalars(
+            select(Trade).where(Trade.user_id == user.id, Trade.status == "closed")
+        ).all()
+        if closed_rows:
+            perf = compute_performance(closed_rows)
+            pf = perf.get("profit_factor")
+            pf_txt = f"{pf:.2f}" if isinstance(pf, (int, float)) else "n/a (no losing trades yet)"
+            lines.append(
+                f"- Realized performance: {perf.get('closed_trades')} closed, "
+                f"win rate {perf.get('win_rate_pct')}%, profit factor {pf_txt}, "
+                f"total P&L {perf.get('total_pnl')}, expectancy {perf.get('expectancy')}/trade, "
+                f"max realized drawdown {perf.get('max_drawdown')}"
+            )
+            paper = perf.get("paper") or {}
+            live = perf.get("live") or {}
+            lines.append(
+                f"- Paper vs live results: paper {paper.get('closed_trades', 0)} closed "
+                f"(P&L {paper.get('total_pnl', 0)}), live {live.get('closed_trades', 0)} closed "
+                f"(P&L {live.get('total_pnl', 0)})"
+            )
+    except Exception:
+        pass
+    # Saved (trained) strategies this account trades with when use_saved_strategy
+    # is on — so the assistant knows exactly what is trained, how it tested, and
+    # which symbols fall back to the built-in analyzer. Real persisted config and
+    # measured metrics only; nothing invented.
+    try:
+        cfgs = getattr(engine, "strategy_configs", {}) or {}
+        if cfgs:
+            parts: list[str] = []
+            for sym in sorted(cfgs):
+                cfg = cfgs[sym] or {}
+                bits = f"{sym}: {cfg.get('strategy', '?')}/{cfg.get('timeframe', '?')}"
+                m = cfg.get("metrics") or {}
+                extra: list[str] = []
+                ret = m.get("total_return_pct")
+                wr = m.get("win_rate_pct")
+                if isinstance(ret, (int, float)):
+                    extra.append(f"tested return {ret:.1f}%")
+                if isinstance(wr, (int, float)):
+                    extra.append(f"win {wr:.0f}%")
+                if extra:
+                    bits += " (" + ", ".join(extra) + ")"
+                parts.append(bits)
+            active = getattr(s, "use_saved_strategy", False)
+            lines.append(
+                "- Saved strategies "
+                + ("(ACTIVE — the bot trades these)" if active
+                   else "(inactive — use_saved_strategy is OFF, so the bot ignores them)")
+                + ": " + "; ".join(parts)
+            )
+        else:
+            lines.append(
+                "- Saved strategies: none trained yet (the bot uses its built-in "
+                "analyzer; a strategy can be trained per symbol in Train)"
+            )
+    except Exception:
+        pass
+    # The user's own armed price alerts, so the assistant knows what they are
+    # already watching and can reference them or propose sensible new ones.
+    try:
+        armed = db.scalars(
+            select(PriceAlert)
+            .where(PriceAlert.user_id == user.id, PriceAlert.status == "armed")
+            .order_by(PriceAlert.created_at.desc())
+            .limit(10)
+        ).all()
+        if armed:
+            lines.append(
+                "- Armed price alerts: "
+                + "; ".join(f"{a.symbol} {a.condition} {a.price}" for a in armed)
             )
     except Exception:
         pass
