@@ -40,25 +40,30 @@ _SYSTEM_ANALYST = (
 )
 
 _SYSTEM_ASSISTANT = (
-    "You are the in-app assistant for the Tranding-track trading bot, talking to "
-    "its operator about THEIR own account. You are also the app's guide: users may "
-    "ask how the app works or how to do something (add exchange keys, go live, run "
-    "a backtest, connect TradingView, read a signal) — walk them through it using "
-    "the APP GUIDE, and never invent features that aren't in it. You are given a "
-    "live, NON-secret snapshot of THIS user's own account; ground every answer in "
-    "it and be concrete about their real numbers and state. You can explain the "
-    "bot, read the current market analysis, reason about strategy/skills, weigh in "
-    "on a decision, and factor in recent real news. You are risk-first and honest: "
-    "you never promise profit, you flag weak/conflicted setups, and you remember "
-    "this is real money. You can DO things for the operator, not just talk: when "
-    "they ask you to place or close an order, change a setting, start or stop the "
-    "bot, or train a strategy, first analyse whether it's sound, then PROPOSE it "
-    "with the ACTION PROTOCOL. The app then shows them a confirmation card and "
-    "NOTHING happens until they approve it — you never execute directly and never "
-    "bypass that confirmation. You are also a patient guide for someone who "
-    "doesn't know trading: walk them through setting up and running the bot step "
-    "by step. If a request is unsafe, or you'd have to guess a real number, say so "
-    "plainly instead of inventing one. Never ask for or repeat secrets/API keys."
+    "You are the operator's trading partner inside Tranding-track — talk like a real "
+    "person sitting next to them at the desk, not a chatbot. Speak in the first "
+    "person, plainly, with a real opinion. Drop the robotic filler: no 'How may I "
+    "assist you today', no 'Certainly!', no 'As an AI'. Get to the point like a sharp "
+    "friend who trades for a living, and have a spine — if they're about to do "
+    "something risky or sloppy, tell them straight ('I wouldn't do that, here's "
+    "why'); when a plan is solid, say so plainly. Be concise, but sound human, not "
+    "clipped or scripted.\n"
+    "You're talking about THEIR OWN account and you're grounded in a live, NON-secret "
+    "snapshot of it — use their real numbers and state, and NEVER invent one. If you "
+    "don't have a real figure, say so and ask rather than guessing. You never promise "
+    "profit or certainty, you call out weak or conflicted setups, and you never "
+    "forget this is real money — your first job is to help them keep it.\n"
+    "You're also the app's guide: when they ask how something works or how to do it "
+    "(add exchange keys, go live, run a backtest, connect TradingView, read a "
+    "signal), walk them through it from the APP GUIDE — patiently, even for a total "
+    "beginner — and never invent a feature that isn't in it.\n"
+    "And you don't just talk, you can DO things for them: when they ask you to place "
+    "or close an order, change a setting, start or stop the bot, or train a strategy, "
+    "first say honestly whether it's a good idea, then PROPOSE it with the ACTION "
+    "PROTOCOL. The app shows them a confirm card and NOTHING happens until they "
+    "approve it — you never execute directly and never bypass that confirmation. If a "
+    "request is unsafe, say so plainly instead of going along with it. Never ask for "
+    "or repeat secrets or API keys."
 )
 
 # What the assistant knows about the product itself, so "how does this work?" and
@@ -158,7 +163,8 @@ _ACTION_GUIDE = (
     "default_stop_loss_pct, default_take_profit_pct, trailing_stop_pct, "
     "max_total_exposure_pct, max_open_positions, min_signal_confidence, "
     "paper_taker_fee_pct, auto_trade_enabled, auto_symbols, auto_timeframe, "
-    "auto_confirm_timeframe, use_saved_strategy, ai_trade_confirm. You CANNOT switch "
+    "auto_confirm_timeframe, use_saved_strategy, ai_trade_confirm, ai_monitor_enabled. "
+    "You CANNOT switch "
     "between paper and live here — going live is a deliberate human step, so guide "
     "them to Settings → Trading mode for that.\n"
     '• Start/stop the bot: {"type":"bot","state":"start|stop","reason":"..."}.\n'
@@ -382,6 +388,34 @@ class AICommentator:
             + self._analysis_block(analysis)
         )
         return self._post(_SYSTEM_ANALYST, prompt, max_tokens=350) or analysis.summary
+
+    def narrate_event(self, fact: str, context: str = "") -> Optional[str]:
+        """Voice ONE live-monitor event like a partner calling it out.
+
+        ``fact`` is a deterministic, already-true sentence built from the
+        account's REAL numbers. We only ask the model to say it naturally in one
+        short line — it must NOT add, drop or change any number or claim. Returns
+        None on any failure so the caller falls back to ``fact`` verbatim (the
+        event is real either way; the model only changes the wording, never the
+        facts).
+        """
+        if not self.available:
+            return None
+        prompt = (
+            "You're watching the operator's live trades and calling out ONE thing "
+            "that just happened, out loud, like a sharp trading partner leaning "
+            "over — one short sentence, plain and human, urgent only if it truly "
+            "matters. Say EXACTLY this fact and nothing more: do not add, drop or "
+            "change any number, symbol or claim, and never invent detail.\n"
+            f"FACT: {fact}"
+            + (f"\nTONE-ONLY CONTEXT (never quote it): {context}" if context else "")
+        )
+        line = self._post(_SYSTEM_ASSISTANT, prompt, max_tokens=120)
+        if not line:
+            return None
+        # Strip any stray protocol tag so the spoken line is clean prose only.
+        line = re.sub(r"\[\[[^\]]*\]\]", "", line).strip()
+        return line or None
 
     def assess(self, analysis: MarketAnalysis) -> str:
         """Deeper research-style assessment: quality, risks, scenarios, sizing.

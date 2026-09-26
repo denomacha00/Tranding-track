@@ -4,6 +4,7 @@ import type {
   BotStatus,
   Candle,
   AiHealth,
+  Alert,
   CloseAllResult,
   ExchangeAccess,
   ExecutionResult,
@@ -274,4 +275,18 @@ export const api = {
   // Real reachability of the app-wide AI provider (no secrets). Lets the
   // assistant show "connected" or the concrete reason it can't answer.
   aiHealth: () => req<AiHealth>('/api/ai/health'),
+
+  // ---- price alerts ----
+  // "Notify me when SYMBOL crosses PRICE." The background monitor checks each
+  // armed alert against the REAL live price and fires it once — nothing here is
+  // fabricated. Newest first.
+  listAlerts: () => req<Alert[]>('/api/alerts'),
+  createAlert: (body: {
+    symbol: string
+    condition: 'above' | 'below'
+    price: number
+    note?: string | null
+  }) => req<Alert>('/api/alerts', { method: 'POST', body: JSON.stringify(body) }),
+  deleteAlert: (id: number) =>
+    req<{ deleted: number }>(`/api/alerts/${id}`, { method: 'DELETE' }),
 }

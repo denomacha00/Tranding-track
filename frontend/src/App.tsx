@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type SetStateAction } from 'react'
 import { api, setToken, getToken, setAuthFailureHandler } from './api'
 import { PriceChart } from './PriceChart'
 import { useBinanceStream } from './useBinanceStream'
@@ -7,7 +7,7 @@ import { Admin } from './Admin'
 import { useSocket } from './useSocket'
 import { useTheme, type Theme } from './theme'
 import { ThemeToggle } from './ThemeToggle'
-import type { AiHealth, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, MarketAnalysis, Me, NewsItem, OrderBook as OrderBookData, Performance, PerfBucket, ProposedAction, SavedStrategy, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
+import type { AiHealth, Alert, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, MarketAnalysis, Me, NewsItem, OrderBook as OrderBookData, Performance, PerfBucket, ProposedAction, SavedStrategy, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
 
 const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
@@ -161,6 +161,19 @@ function parseNavAction(text: string): { text: string; dest: TabKey | null } {
   return { text: text.replace(m[0], '').trim(), dest }
 }
 
+// One message in the assistant transcript. An AI reply may carry a hidden
+// [[goto:…]] navigation target or a validated proposal (shown as a Confirm/Cancel
+// card; `actionState` tracks its lifecycle so it can't run twice). `live` marks a
+// proactive call-out the monitor/alerts pushed in — not a reply to something you
+// typed. Lifted to module scope + the Dashboard so pushed call-outs land here even
+// when the Assistant tab isn't mounted.
+type ChatMsg = ChatTurn & {
+  nav?: { dest: TabKey; label: string }
+  action?: ProposedAction
+  actionState?: 'pending' | 'running' | 'done' | 'dismissed'
+  live?: boolean
+}
+
 function Dashboard({
   me,
   onLogout,
@@ -228,6 +241,16 @@ function Dashboard({
   // behind the 🔔 bell, with an unread count.
   const [notifs, setNotifs] = useState<Notif[]>([])
   const [notifUnread, setNotifUnread] = useState(0)
+  // The AI-assistant transcript, LIFTED here (out of AssistantPanel) so proactive
+  // monitor/alert call-outs pushed over the socket land in it even when the
+  // Assistant tab isn't mounted — and so voice can read them regardless of tab.
+  const [turns, setTurns] = useState<ChatMsg[]>([])
+  // Read-aloud (Web Speech) is OFF by default; the user turns it on in the
+  // assistant. Lifted so a pushed alert can be spoken from any tab when it's on.
+  const [readAloud, setReadAloud] = useState(false)
+  // The user's price alerts (armed + recently triggered): real rows from the
+  // backend, driving the chart markers and the alerts panel. Never fabricated.
+  const [alerts, setAlerts] = useState<Alert[]>([])
 
   const showToast = useCallback((kind: 'ok' | 'error', text: string) => {
     setToast({ kind, text })
@@ -239,6 +262,23 @@ function Dashboard({
     setNotifUnread((u) => Math.min(u + 1, 999))
     setTimeout(() => setToast(null), 4000)
   }, [])
+
+  // Read a line aloud via the browser's Web Speech API — ONLY when the user has
+  // turned voice on (OFF by default) and the browser supports it. Shared by the
+  // assistant's typed replies and the proactive monitor/alert call-outs.
+  const ttsSupported = typeof window !== 'undefined' && 'speechSynthesis' in window
+  const speak = useCallback(
+    (text: string) => {
+      if (!readAloud || !ttsSupported || !text) return
+      try {
+        window.speechSynthesis.cancel()
+        window.speechSynthesis.speak(new SpeechSynthesisUtterance(text))
+      } catch {
+        /* ignore */
+      }
+    },
+    [readAloud, ttsSupported],
+  )
 
   // Close the nav drawer on Escape so it behaves like a normal modal drawer.
   useEffect(() => {
@@ -262,6 +302,16 @@ function Dashboard({
     try {
       setSignals(await api.signals())
     } catch (e) {
+      /* ignore */
+    }
+  }, [])
+
+  // The user's price alerts — refetched after one fires (its status flips to
+  // "triggered"), after an add/delete, and on a slow poll as a safety net.
+  const refreshAlerts = useCallback(async () => {
+    try {
+      setAlerts(await api.listAlerts())
+    } catch {
       /* ignore */
     }
   }, [])
@@ -303,6 +353,18 @@ function Dashboard({
         } else {
           showToast(m.data.accepted ? 'ok' : 'error', m.data.message)
         }
+      }
+      if (m.event === 'assistant') {
+        const d = m.data
+        // A proactive call-out (fired price alert, or a live risk read on an open
+        // position). Append it to the shared transcript (capped) so it's there
+        // whatever tab is open; toast by level; and speak it if the user turned
+        // voice on. A fired alert also flipped its row to "triggered" — refetch so
+        // the list + chart marker update.
+        setTurns((t) => [...t, { role: 'ai', text: d.text, live: true } as ChatMsg].slice(-200))
+        showToast(d.level === 'warn' ? 'error' : 'ok', d.text)
+        speak(d.text)
+        if (d.kind === 'alert') refreshAlerts()
       }
     },
   })
@@ -376,7 +438,8 @@ function Dashboard({
     loadAiHealth()
     refreshTrades()
     refreshSignals()
-  }, [loadSettings, refreshAccess, loadAiHealth, refreshTrades, refreshSignals, applyStatus])
+    refreshAlerts()
+  }, [loadSettings, refreshAccess, loadAiHealth, refreshTrades, refreshSignals, refreshAlerts, applyStatus])
 
   // Pull the REAL tradable pairs from the exchange once, so the symbol picker
   // reflects what actually exists on Binance instead of a hardcoded guess. If
@@ -407,6 +470,32 @@ function Dashboard({
     const id = setInterval(refreshSignals, 20000)
     return () => clearInterval(id)
   }, [refreshSignals])
+
+  // Slow safety-net poll for alerts (they also refresh on fire / add / delete),
+  // so a change made on another device still shows up here.
+  useEffect(() => {
+    const id = setInterval(refreshAlerts, 30000)
+    return () => clearInterval(id)
+  }, [refreshAlerts])
+
+  // Real horizontal levels to MARK on the chart for the CURRENT symbol: each
+  // ARMED price alert, plus every OPEN position's entry / stop-loss / take-profit.
+  // Every value is a genuine number from the user's own data — never decorative.
+  const chartPriceLines = useMemo(() => {
+    const sym = symbol.toUpperCase()
+    const lines: { price: number; color?: string; title?: string }[] = []
+    for (const a of alerts) {
+      if (a.status !== 'armed' || a.symbol.toUpperCase() !== sym) continue
+      lines.push({ price: a.price, color: '#f0a020', title: `Alert ${a.condition} ${fmt(a.price)}` })
+    }
+    for (const t of trades) {
+      if (t.status !== 'open' || t.symbol.toUpperCase() !== sym) continue
+      if (t.entry_price) lines.push({ price: t.entry_price, color: '#3b82f6', title: `Entry ${fmt(t.entry_price)}` })
+      if (t.stop_loss) lines.push({ price: t.stop_loss, color: '#ea3943', title: `SL ${fmt(t.stop_loss)}` })
+      if (t.take_profit) lines.push({ price: t.take_profit, color: '#16c784', title: `TP ${fmt(t.take_profit)}` })
+    }
+    return lines
+  }, [alerts, trades, symbol])
 
   // Load candles when symbol/timeframe changes, and poll periodically. The
   // poll is fairly frequent so a new closed bar shows up quickly; the live
@@ -896,6 +985,7 @@ function Dashboard({
                   fitKey={`${symbol}:${timeframe}`}
                   symbol={symbol}
                   timeframe={timeframe}
+                  priceLines={chartPriceLines}
                 />
               ) : (
                 <div className="empty">
@@ -910,6 +1000,14 @@ function Dashboard({
             exchange={access?.exchange}
             liveBook={streamingLive ? stream.book : null}
             streaming={streamingLive}
+          />
+
+          <AlertsPanel
+            symbol={symbol}
+            alerts={alerts}
+            lastPrice={livePrice ?? ticker?.last ?? null}
+            onChanged={refreshAlerts}
+            onError={(m) => showToast('error', m)}
           />
 
           <section className="panel">
@@ -1131,6 +1229,12 @@ function Dashboard({
                   symbol={symbol}
                   timeframe={timeframe}
                   tradingMode={status?.trading_mode}
+                  turns={turns}
+                  setTurns={setTurns}
+                  readAloud={readAloud}
+                  onReadAloudChange={setReadAloud}
+                  ttsSupported={ttsSupported}
+                  speak={speak}
                   onNavigate={setTab}
                   onError={(m) => showToast('error', m)}
                 />
@@ -1603,6 +1707,149 @@ function OrderBook({
     </section>
   )
 }
+
+// Price alerts for the current symbol: "tell me when SYMBOL crosses PRICE".
+// Real, one-shot, server-side alerts the background monitor checks against the
+// live price — never fabricated; a fired one flips to "triggered" with the real
+// time + price it crossed at. Armed alerts also draw as dashed lines on the
+// chart above (see chartPriceLines). Add / arm / delete here.
+function AlertsPanel({
+  symbol,
+  alerts,
+  lastPrice,
+  onChanged,
+  onError,
+}: {
+  symbol: string
+  alerts: Alert[]
+  lastPrice?: number | null
+  onChanged: () => void
+  onError: (msg: string) => void
+}) {
+  const [condition, setCondition] = useState<'above' | 'below'>('above')
+  const [price, setPrice] = useState('')
+  const [note, setNote] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  const sym = symbol.toUpperCase()
+  const mine = alerts.filter((a) => a.symbol.toUpperCase() === sym)
+  const others = alerts.length - mine.length
+
+  const add = async () => {
+    const p = Number(price)
+    if (!price.trim() || !Number.isFinite(p) || p <= 0) {
+      onError('Enter a valid alert price above 0.')
+      return
+    }
+    setBusy(true)
+    try {
+      await api.createAlert({ symbol, condition, price: p, note: note.trim() || null })
+      setPrice('')
+      setNote('')
+      onChanged()
+    } catch (e) {
+      onError((e as Error).message)
+    } finally {
+      setBusy(false)
+    }
+  }
+  const remove = async (id: number) => {
+    try {
+      await api.deleteAlert(id)
+      onChanged()
+    } catch (e) {
+      onError((e as Error).message)
+    }
+  }
+
+  return (
+    <section className="panel alerts">
+      <div className="panel-head">
+        <span>Price alerts</span>
+        {lastPrice != null && <span className="hint">Last {fmtPx(lastPrice)}</span>}
+      </div>
+      <div className="panel-body">
+        <div className="row">
+          <div className="field">
+            <label>When {sym}</label>
+            <select
+              className="select"
+              value={condition}
+              onChange={(e) => setCondition(e.target.value as 'above' | 'below')}
+            >
+              <option value="above">rises above</option>
+              <option value="below">falls below</option>
+            </select>
+          </div>
+          <div className="field">
+            <label>Price</label>
+            <input
+              className="input"
+              placeholder={lastPrice != null ? fmtPx(lastPrice) : 'price'}
+              value={price}
+              onChange={(e) => setPrice(e.target.value)}
+              onKeyDown={(e) => e.key === 'Enter' && add()}
+              inputMode="decimal"
+            />
+          </div>
+        </div>
+        <div className="field">
+          <label>Note (optional)</label>
+          <input
+            className="input"
+            placeholder="e.g. take profit / add here"
+            value={note}
+            maxLength={200}
+            onChange={(e) => setNote(e.target.value)}
+          />
+        </div>
+        <button type="button" className="btn" onClick={add} disabled={busy}>
+          {busy ? 'Adding…' : 'Add alert'}
+        </button>
+
+        {mine.length === 0 ? (
+          <div className="empty">No alerts for {sym} yet.</div>
+        ) : (
+          <ul className="alert-list">
+            {mine.map((a) => (
+              <li key={a.id} className={`alert-row ${a.status}`}>
+                <div className="alert-main">
+                  <span className="alert-cond">
+                    {a.condition === 'above' ? '▲' : '▼'} {a.condition} {fmtPx(a.price)}
+                  </span>
+                  {a.note && <span className="alert-note">{a.note}</span>}
+                </div>
+                <div className="alert-side">
+                  {a.status === 'triggered' ? (
+                    <span className="alert-fired" title={a.triggered_at ?? ''}>
+                      fired{a.triggered_price != null ? ` @ ${fmtPx(a.triggered_price)}` : ''}
+                    </span>
+                  ) : (
+                    <span className="alert-armed">● armed</span>
+                  )}
+                  <button
+                    type="button"
+                    className="btn ghost sm"
+                    onClick={() => remove(a.id)}
+                    title="Delete this alert"
+                  >
+                    ✕
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+        {others > 0 && (
+          <div className="hint">
+            {others} alert{others > 1 ? 's' : ''} on other symbols (switch pair to see them).
+          </div>
+        )}
+      </div>
+    </section>
+  )
+}
+
 // Bot activity heartbeat: an honest, at-a-glance answer to "is the bot actually
 // doing anything?". Shows the live monitor pulse, mode, open positions, the
 // most recent logged signal, an "updated Ns ago" stamp, and a plain-English
@@ -2258,62 +2505,54 @@ function AssistantPanel({
   symbol,
   timeframe,
   tradingMode,
+  turns,
+  setTurns,
+  readAloud,
+  onReadAloudChange,
+  ttsSupported,
+  speak,
   onNavigate,
   onError,
 }: {
   symbol: string
   timeframe: string
   tradingMode?: string
+  // Transcript + read-aloud + speak are owned by the Dashboard, so proactive
+  // monitor/alert call-outs land in the transcript (and can be spoken) even when
+  // this tab is closed. This panel reads and appends, but doesn't own them.
+  turns: ChatMsg[]
+  setTurns: Dispatch<SetStateAction<ChatMsg[]>>
+  readAloud: boolean
+  onReadAloudChange: (on: boolean) => void
+  ttsSupported: boolean
+  speak: (text: string) => void
   onNavigate: (dest: TabKey) => void
   onError: (msg: string) => void
 }) {
-  // AI replies may carry a hidden [[goto:…]] action (navigation) or a validated
-  // [[action:…]] proposal (place order / change setting / start-stop / train). We
-  // keep the resolved tab and/or the proposed action on the turn so the bubble can
-  // render a "take me there" button or a Confirm/Cancel card. `actionState` tracks
-  // the proposal's lifecycle so it can't be run twice.
-  type ChatMsg = ChatTurn & {
-    nav?: { dest: TabKey; label: string }
-    action?: ProposedAction
-    actionState?: 'pending' | 'running' | 'done' | 'dismissed'
-  }
-  const [turns, setTurns] = useState<ChatMsg[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
   const [useSymbol, setUseSymbol] = useState(true)
   const [useNews, setUseNews] = useState(false)
-  const [readAloud, setReadAloud] = useState(false)
   const [listening, setListening] = useState(false)
   const recRef = useRef<SpeechRec | null>(null)
   const listRef = useRef<HTMLDivElement | null>(null)
 
   const speechSupported = typeof window !== 'undefined' && getSpeechRecognition() != null
-  const ttsSupported = typeof window !== 'undefined' && 'speechSynthesis' in window
 
   // Keep the transcript pinned to the newest turn.
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight })
   }, [turns, busy])
 
-  // Stop listening / speaking if the user leaves the tab.
+  // Stop the mic if the user leaves the tab. Read-aloud is owned by the Dashboard
+  // now, so we don't cancel speech here — a pushed call-out being read shouldn't
+  // be cut off just because you switched tabs.
   useEffect(
     () => () => {
       recRef.current?.stop()
-      if (typeof window !== 'undefined' && 'speechSynthesis' in window)
-        window.speechSynthesis.cancel()
     },
     [],
   )
-
-  const speak = (text: string) => {
-    if (!readAloud || !ttsSupported) return
-    try {
-      window.speechSynthesis.cancel()
-      window.speechSynthesis.speak(new SpeechSynthesisUtterance(text))
-    } catch {
-      /* ignore */
-    }
-  }
 
   const send = async (q: string) => {
     const question = q.trim()
@@ -2574,6 +2813,7 @@ function AssistantPanel({
                     )
                   })()}
                   {t.usedNews && <div className="bubble-note">grounded in live news</div>}
+                  {t.live && <div className="bubble-note">🔔 live monitor</div>}
                 </div>
               ))
             )}
@@ -2607,9 +2847,9 @@ function AssistantPanel({
                 <input
                   type="checkbox"
                   checked={readAloud}
-                  onChange={(e) => setReadAloud(e.target.checked)}
+                  onChange={(e) => onReadAloudChange(e.target.checked)}
                 />
-                Read replies aloud
+                Read replies &amp; alerts aloud
               </label>
             )}
           </div>
@@ -3433,6 +3673,7 @@ function SettingsPanel({
         auto_confirm_timeframe: form.auto_confirm_timeframe,
         use_saved_strategy: form.use_saved_strategy,
         ai_trade_confirm: form.ai_trade_confirm,
+        ai_monitor_enabled: form.ai_monitor_enabled,
       })
       onSaved(saved)
     } catch (e) {
@@ -3683,6 +3924,26 @@ function SettingsPanel({
         preservation still comes first: a saved <b>BUY</b> is suppressed in a bear
         regime or a volatility shock, while its <b>SELL/exit is always honoured</b>.
         Symbols with no saved strategy fall back to the analyzer brain.
+      </p>
+      <label style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <input
+          type="checkbox"
+          checked={form.ai_monitor_enabled}
+          onChange={(e) => setForm({ ...form, ai_monitor_enabled: e.target.checked })}
+          disabled={!form.ai_enabled}
+        />
+        Live position monitor (proactive risk call-outs in the assistant)
+      </label>
+      <p className="hint">
+        Opt-in and <b>off by default</b>. When on, a background watcher checks your{' '}
+        <b>open positions and day P&amp;L on real live prices</b> and speaks up in
+        the assistant about the single most material risk right now — a stop about
+        to hit, a position deep in the red, or nearing your daily loss limit. It{' '}
+        <b>never trades</b>, only calls things out, and every number it states is
+        real.{' '}
+        {form.ai_enabled
+          ? 'Turn on "Read replies & alerts aloud" in the assistant to hear them.'
+          : 'Add an AI key (Credentials) to enable this.'}
       </p>
       <p className="hint">
         Trailing stop ratchets an open long's stop-loss upward as price rises to

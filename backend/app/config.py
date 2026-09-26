@@ -131,6 +131,16 @@ class Settings(BaseSettings):
     # fabricates a veto/approval). Off by default; paper-test before enabling live.
     ai_trade_confirm: bool = Field(default=False)
 
+    # Live "loud monitor" (opt-in, OFF by default). When true AND an AI key is
+    # configured, the background monitor watches this user's OPEN positions and
+    # day P&L and, when something MATERIAL happens (a trade turns red, price nears
+    # a stop or take-profit, the daily-loss limit is approached), pushes ONE short
+    # spoken-style line to the app in real time — "live and loud", like a partner
+    # calling it out. It never trades and never invents a number; on any failure
+    # it stays silent. Off by default; the user turns it on when they want the
+    # running commentary.
+    ai_monitor_enabled: bool = Field(default=False)
+
     # Live market-news sources for the AI assistant + News panel. Comma-separated
     # public RSS/Atom feed URLs (crypto/markets). Real headlines only — if a feed
     # is unreachable it's reported as unavailable, never faked. No user data is

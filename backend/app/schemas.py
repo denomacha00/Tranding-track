@@ -217,6 +217,7 @@ class SettingsOut(BaseModel):
     auto_confirm_timeframe: str
     use_saved_strategy: bool = False
     ai_trade_confirm: bool = False
+    ai_monitor_enabled: bool = False
     ai_enabled: bool
     ai_model: str = ""
     ai_style: str = ""
@@ -240,9 +241,31 @@ class SettingsUpdate(BaseModel):
     auto_confirm_timeframe: Optional[str] = None
     use_saved_strategy: Optional[bool] = None
     ai_trade_confirm: Optional[bool] = None
+    ai_monitor_enabled: Optional[bool] = None
     trailing_stop_pct: Optional[float] = Field(default=None, ge=0, le=100)
     max_total_exposure_pct: Optional[float] = Field(default=None, ge=0, le=1000)
     paper_taker_fee_pct: Optional[float] = Field(default=None, ge=0, le=5)
+
+
+class AlertCreate(BaseModel):
+    """Create a price alert: notify when ``symbol`` crosses ``price``."""
+
+    symbol: str
+    condition: Literal["above", "below"]
+    price: float = Field(gt=0)
+    note: Optional[str] = Field(default=None, max_length=200)
+
+
+class AlertOut(BaseModel):
+    id: int
+    symbol: str
+    condition: str
+    price: float
+    note: Optional[str] = None
+    status: str
+    created_at: Optional[dt.datetime] = None
+    triggered_at: Optional[dt.datetime] = None
+    triggered_price: Optional[float] = None
 
 
 # ---- Auth & multi-user ----------------------------------------------

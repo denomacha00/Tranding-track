@@ -188,6 +188,33 @@ class SignalLog(Base):
         return float(val)
 
 
+class PriceAlert(Base):
+    """A user-defined price alert: notify when a symbol crosses a level.
+
+    Deterministic and real — it fires only when the LIVE market price actually
+    crosses the level, and fires once (``status`` flips to ``triggered``) so it
+    never spams. No price is ever fabricated: if the price can't be read on a
+    tick the alert is simply left armed for the next one.
+    """
+
+    __tablename__ = "price_alerts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int | None] = mapped_column(Integer, index=True, nullable=True)
+    symbol: Mapped[str] = mapped_column(String(32), index=True)
+    condition: Mapped[str] = mapped_column(String(8))  # "above" | "below"
+    price: Mapped[float] = mapped_column(Float)
+    note: Mapped[str | None] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(12), default="armed", index=True)
+    created_at: Mapped[dt.datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow
+    )
+    triggered_at: Mapped[dt.datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    triggered_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+
+
 class KeyValue(Base):
     """Simple persisted key/value store for runtime state.
 

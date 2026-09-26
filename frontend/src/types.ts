@@ -117,6 +117,11 @@ export interface Settings {
   // When on AND autonomous trading is on, the AI reviews each deterministic
   // entry and may VETO it (it can never invent or force a trade). Off by default.
   ai_trade_confirm: boolean
+  // When on, a background monitor watches your OPEN positions + day P&L on REAL
+  // live prices and speaks up (in the assistant) about the single most material
+  // risk — a stop about to hit, a position deep red, nearing your loss limit.
+  // Opt-in and OFF by default; it never trades, only calls things out.
+  ai_monitor_enabled: boolean
   ai_enabled: boolean
   ai_model?: string
   ai_style?: string
@@ -349,6 +354,23 @@ export interface MarketAnalysis {
   ai_enabled?: boolean
 }
 
+// A user-defined price alert: "notify me when SYMBOL crosses PRICE". The
+// background monitor checks each armed alert against the REAL live price and
+// fires it once (status flips 'armed' -> 'triggered'), recording the real
+// trigger time + price. Nothing here is fabricated — an alert fires only on a
+// genuine crossing; if the live price can't be read it stays armed.
+export interface Alert {
+  id: number
+  symbol: string
+  condition: 'above' | 'below'
+  price: number
+  note: string | null
+  status: 'armed' | 'triggered'
+  created_at: string | null
+  triggered_at: string | null
+  triggered_price: number | null
+}
+
 export type WsMessage =
   | { event: 'status'; data: BotStatus; user_id?: number }
   | { event: 'trade_opened'; data: { id: number; symbol: string; side: string } }
@@ -368,6 +390,21 @@ export type WsMessage =
         accepted: boolean
         message: string
         confidence?: number
+      }
+    }
+  // A proactive assistant call-out pushed from the server: a fired price alert
+  // ('alert') or a live risk read on an open position ('monitor'). `text` is the
+  // real, already-true deterministic line (a monitor line may be rephrased by the
+  // LLM but its numbers are never changed). Routed per-user by `user_id`.
+  | {
+      event: 'assistant'
+      user_id?: number
+      data: {
+        kind: 'alert' | 'monitor'
+        event: string
+        symbol: string | null
+        text: string
+        level: 'info' | 'warn'
       }
     }
 

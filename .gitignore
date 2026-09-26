@@ -41,3 +41,8 @@ logs/
 COMMIT_MSG.tmp
 backend/_alembic_tmp/
 *_tmp.db
+
+# Local dev-only helpers (not shipped) + local tooling config
+backend/_preview_launch.py
+backend/app/_smoke.py
+.claude/

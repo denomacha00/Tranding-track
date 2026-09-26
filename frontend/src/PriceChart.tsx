@@ -3,9 +3,11 @@ import {
   createChart,
   ColorType,
   CrosshairMode,
+  LineStyle,
   type CandlestickData,
   type HistogramData,
   type IChartApi,
+  type IPriceLine,
   type ISeriesApi,
   type MouseEventParams,
   type Time,
@@ -97,6 +99,7 @@ export function PriceChart({
   fitKey,
   symbol,
   timeframe,
+  priceLines,
 }: {
   candles: Candle[]
   theme: Theme
@@ -113,6 +116,10 @@ export function PriceChart({
   fitKey?: string
   symbol?: string
   timeframe?: string
+  // Horizontal reference levels drawn on the price axis (real "marking"): armed
+  // price alerts and open-position entry / stop-loss / take-profit levels. Each
+  // is a genuine number from the user's OWN data — nothing decorative or faked.
+  priceLines?: { price: number; color?: string; title?: string }[]
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -130,6 +137,9 @@ export function PriceChart({
   // Tracks whether we've fitted the view, and for which symbol/timeframe.
   const didFitRef = useRef(false)
   const fitKeyRef = useRef<string | undefined>(undefined)
+  // Horizontal price lines we've drawn (alert / SL / TP / entry markers), kept so
+  // we can clear and redraw them when the set changes.
+  const priceLineObjsRef = useRef<IPriceLine[]>([])
 
   // Paint the OHLC + volume legend for one bar. Values are all numeric, so
   // writing them via innerHTML is safe; the symbol/timeframe label is rendered
@@ -342,6 +352,40 @@ export function PriceChart({
     const id = window.setInterval(tick, 1000)
     return () => window.clearInterval(id)
   }, [candles, timeframe])
+
+  // Draw horizontal reference levels (real "marking"): armed price alerts and
+  // open-position entry/SL/TP. Cleared and redrawn only when the set actually
+  // changes (via a stable key) so live ticks never churn them. Every level is a
+  // real number from the user's own data — the chart never invents a line.
+  const priceLinesKey = JSON.stringify(
+    (priceLines ?? []).map((l) => [l.price, l.color, l.title]),
+  )
+  useEffect(() => {
+    const series = seriesRef.current
+    if (!series) return
+    for (const ln of priceLineObjsRef.current) {
+      try {
+        series.removePriceLine(ln)
+      } catch {
+        /* series already torn down */
+      }
+    }
+    priceLineObjsRef.current = []
+    for (const pl of priceLines ?? []) {
+      if (!Number.isFinite(pl.price) || pl.price <= 0) continue
+      priceLineObjsRef.current.push(
+        series.createPriceLine({
+          price: pl.price,
+          color: pl.color || '#8b98a9',
+          lineWidth: 1,
+          lineStyle: LineStyle.Dashed,
+          axisLabelVisible: true,
+          title: pl.title || '',
+        }),
+      )
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [priceLinesKey])
 
   return (
     <div className="chart-wrap">

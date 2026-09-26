@@ -42,6 +42,7 @@ from app.models import (
     LicenseKey,
     LicenseKeyStatus,
     LicenseStatus,
+    PriceAlert,
     SignalLog,
     Trade,
     TradeStatus,
@@ -52,6 +53,8 @@ from app.models import (
 )
 from app.schemas import (
     AddLicenseDays,
+    AlertCreate,
+    AlertOut,
     BotStatus,
     CloseAllResult,
     CredentialsUpdate,
@@ -810,6 +813,7 @@ def _settings_out(engine, user: User) -> SettingsOut:
         auto_confirm_timeframe=s.auto_confirm_timeframe,
         use_saved_strategy=getattr(s, "use_saved_strategy", False),
         ai_trade_confirm=getattr(s, "ai_trade_confirm", False),
+        ai_monitor_enabled=getattr(s, "ai_monitor_enabled", False),
         ai_enabled=bool(s.ai_api_key),
         ai_model=s.ai_model,
         ai_style=engine.ai._style() if s.ai_api_key else "",
@@ -876,6 +880,65 @@ def update_settings(
     engine.apply_settings(s)
     engine.persist_settings(db, data)
     return _settings_out(engine, user)
+
+
+# ---- Price alerts ---------------------------------------------------
+# User-defined "notify me when price crosses X" alerts. The background monitor
+# checks each armed alert against the REAL live price and fires it once (see
+# tasks.py). Deterministic and honest: nothing here fabricates a price or a
+# trigger, and an alert only fires on a real crossing.
+
+
+@app.get("/api/alerts", response_model=list[AlertOut])
+def list_alerts(
+    db: Session = Depends(get_db), user: User = Depends(get_current_user)
+):
+    rows = db.scalars(
+        select(PriceAlert)
+        .where(PriceAlert.user_id == user.id)
+        .order_by(PriceAlert.created_at.desc())
+    ).all()
+    return [AlertOut.model_validate(a, from_attributes=True) for a in rows]
+
+
+@app.post("/api/alerts", response_model=AlertOut)
+def create_alert(
+    body: AlertCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    symbol = body.symbol.strip().upper()
+    if "/" not in symbol:
+        raise HTTPException(
+            status_code=400,
+            detail="Symbol must look like BASE/QUOTE, e.g. BTC/USDT.",
+        )
+    alert = PriceAlert(
+        user_id=user.id,
+        symbol=symbol,
+        condition=body.condition,
+        price=float(body.price),
+        note=(body.note or None),
+        status="armed",
+    )
+    db.add(alert)
+    db.commit()
+    db.refresh(alert)
+    return AlertOut.model_validate(alert, from_attributes=True)
+
+
+@app.delete("/api/alerts/{alert_id}")
+def delete_alert(
+    alert_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(require_licensed_user),
+):
+    alert = db.get(PriceAlert, alert_id)
+    if alert is None or alert.user_id != user.id:
+        raise HTTPException(status_code=404, detail="Alert not found.")
+    db.delete(alert)
+    db.commit()
+    return {"deleted": alert_id}
 
 
 # ---- Market data ----------------------------------------------------
@@ -1183,9 +1246,23 @@ def _assistant_account_context(db: Session, user: User, engine) -> str:
             for t in open_rows:
                 pnl = t.pnl or 0
                 state = "up" if pnl > 0 else "down" if pnl < 0 else "flat"
+                entry = float(t.entry_price or 0)
+                # Exact protection read-out per trade: where the stop/target sit
+                # and how far they are from entry — and, loudly, when there's NO
+                # stop at all (the single biggest avoidable-loss red flag).
+                guard: list[str] = []
+                if t.stop_loss and entry > 0:
+                    d = abs(entry - float(t.stop_loss)) / entry * 100
+                    guard.append(f"SL {t.stop_loss} ({d:.1f}% from entry)")
+                else:
+                    guard.append("NO STOP set")
+                if t.take_profit and entry > 0:
+                    d = abs(float(t.take_profit) - entry) / entry * 100
+                    guard.append(f"TP {t.take_profit} (+{d:.1f}%)")
                 parts.append(
                     f"{t.symbol} {t.side} {t.amount}@{t.entry_price} "
-                    f"(pnl {pnl} — {state}, open {_fmt_dur(_hours_since(t.opened_at))})"
+                    f"(pnl {pnl} — {state}, open {_fmt_dur(_hours_since(t.opened_at))}; "
+                    + ", ".join(guard) + ")"
                 )
             lines.append("- Open trades: " + "; ".join(parts))
             oldest = _hours_since(
@@ -1249,6 +1326,42 @@ def _assistant_account_context(db: Session, user: User, engine) -> str:
             lines.append("- Trading activity: no trades yet on this account")
     except Exception:
         pass
+    # Risk radar — deterministic, derived-from-real-numbers metrics so the
+    # assistant can warn concretely about capital at risk instead of vaguely.
+    # Every value is computed from the account's own stored figures; nothing is
+    # fetched or invented, and any piece that can't be computed is left out.
+    try:
+        rst = engine.status(db)
+        equity = float(rst.get("equity") or 0)
+        day_pnl = float(rst.get("day_pnl") or 0)
+        radar: list[str] = []
+        dll = float(getattr(s, "daily_loss_limit_pct", 0) or 0)
+        if dll > 0 and equity > 0:
+            limit_amt = equity * dll / 100.0
+            lost = max(0.0, -day_pnl)
+            room = max(0.0, limit_amt - lost)
+            radar.append(
+                f"today's loss {lost:.2f} against a {dll}% daily limit (~{limit_amt:.2f}); "
+                f"~{room:.2f} of room left"
+            )
+        mtx = float(getattr(s, "max_total_exposure_pct", 0) or 0)
+        notional = db.scalar(
+            select(func.coalesce(func.sum(Trade.amount * Trade.entry_price), 0.0))
+            .where(Trade.user_id == user.id, Trade.status == "open")
+        ) or 0.0
+        notional = float(notional)
+        if notional > 0:
+            if mtx > 0 and equity > 0:
+                cap = equity * mtx / 100.0
+                radar.append(
+                    f"open exposure ~{notional:.2f} vs {mtx}% cap (~{cap:.2f})"
+                )
+            else:
+                radar.append(f"open exposure ~{notional:.2f} (no exposure cap set)")
+        if radar:
+            lines.append("- Risk radar: " + "; ".join(radar))
+    except Exception:
+        pass
     try:
         sig_rows = db.scalars(
             select(SignalLog)
@@ -1285,7 +1398,12 @@ _AI_SETTINGS_FLOAT = {
     "paper_taker_fee_pct",
 }
 _AI_SETTINGS_INT = {"max_open_positions"}
-_AI_SETTINGS_BOOL = {"auto_trade_enabled", "use_saved_strategy", "ai_trade_confirm"}
+_AI_SETTINGS_BOOL = {
+    "auto_trade_enabled",
+    "use_saved_strategy",
+    "ai_trade_confirm",
+    "ai_monitor_enabled",
+}
 _AI_SETTINGS_STR = {"auto_symbols", "auto_timeframe", "auto_confirm_timeframe"}
 
 
