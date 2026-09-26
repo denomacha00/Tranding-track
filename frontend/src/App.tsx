@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type KeyboardEvent as ReactKeyboardEvent, type SetStateAction } from 'react'
 import { api, setToken, getToken, setAuthFailureHandler } from './api'
 import { PriceChart } from './PriceChart'
+import { TradingViewChart } from './TradingViewChart'
+import { DEFAULT_INDICATORS, type IndicatorPrefs } from './indicators'
 import { useBinanceStream } from './useBinanceStream'
 import { Login, LicenseGate } from './Login'
 import { Admin } from './Admin'
@@ -201,6 +203,30 @@ function Dashboard({
   // the majors as a fallback so the picker is never empty if markets are briefly
   // unreachable; replaced with the live Binance listing once it loads.
   const [symbolList, setSymbolList] = useState<string[]>(SYMBOLS)
+  // Which chart the user is looking at: our own real-data candle chart (with the
+  // bot's trades/alerts marked) or the embedded full TradingView chart. Remembered
+  // between visits.
+  const [chartView, setChartView] = useState<'bot' | 'tv'>(
+    () => (localStorage.getItem('tt.chartView') === 'tv' ? 'tv' : 'bot'),
+  )
+  // Which price-overlay indicators are switched on, loaded from localStorage so
+  // the choice sticks (like a saved TradingView layout). All real math on the
+  // bot chart's own candles.
+  const [indicators, setIndicators] = useState<IndicatorPrefs>(() => {
+    try {
+      const raw = localStorage.getItem('tt.indicators')
+      if (raw) return { ...DEFAULT_INDICATORS, ...(JSON.parse(raw) as Partial<IndicatorPrefs>) }
+    } catch {
+      /* ignore bad/absent stored prefs */
+    }
+    return DEFAULT_INDICATORS
+  })
+  useEffect(() => {
+    localStorage.setItem('tt.chartView', chartView)
+  }, [chartView])
+  useEffect(() => {
+    localStorage.setItem('tt.indicators', JSON.stringify(indicators))
+  }, [indicators])
   // Wall-clock of the last status we received (WS push or poll), so the bot
   // activity strip can show an honest "updated Ns ago" heartbeat.
   const [statusTs, setStatusTs] = useState(0)
@@ -914,7 +940,7 @@ function Dashboard({
                   </>
                 )}
               </div>
-              <div className="row" style={{ alignItems: 'center' }}>
+              <div className="row" style={{ alignItems: 'center', gap: 6, flexWrap: 'wrap' }}>
                 <SymbolPicker value={symbol} symbols={symbolList} onChange={setSymbol} />
                 <select
                   className="select"
@@ -925,6 +951,27 @@ function Dashboard({
                     <option key={t}>{t}</option>
                   ))}
                 </select>
+                {chartView === 'bot' && (
+                  <IndicatorsMenu value={indicators} onChange={setIndicators} />
+                )}
+                <div className="chart-view-toggle" role="tablist" aria-label="Chart view">
+                  <button
+                    type="button"
+                    className={`cvt-btn${chartView === 'bot' ? ' active' : ''}`}
+                    onClick={() => setChartView('bot')}
+                    title="Your bot's chart on real data — your trades, stops and alerts marked"
+                  >
+                    Bot chart
+                  </button>
+                  <button
+                    type="button"
+                    className={`cvt-btn${chartView === 'tv' ? ' active' : ''}`}
+                    onClick={() => setChartView('tv')}
+                    title="The full TradingView chart: every drawing tool and indicator (live market data)"
+                  >
+                    TradingView
+                  </button>
+                </div>
               </div>
             </div>
             <div className="panel-body">
@@ -934,7 +981,9 @@ function Dashboard({
                 stale={tickerStale && !streamingLive}
                 live={streamingLive}
               />
-              {candles.length ? (
+              {chartView === 'tv' ? (
+                <TradingViewChart symbol={symbol} timeframe={timeframe} theme={theme} />
+              ) : candles.length ? (
                 <PriceChart
                   candles={candles}
                   theme={theme}
@@ -944,6 +993,7 @@ function Dashboard({
                   symbol={symbol}
                   timeframe={timeframe}
                   priceLines={chartPriceLines}
+                  indicators={indicators}
                 />
               ) : (
                 <div className="empty">
@@ -1531,6 +1581,88 @@ function cumulativeValue(levels: { price: number; amount: number }[]): number[] 
 // not yet in it (a brand-new listing), pressing Enter still accepts it as a pair
 // (adding a /USDT quote when none is given) so you're never blocked. Nothing here
 // is fabricated — the list is exactly what the exchange reports.
+// The price-overlay indicators offered on the bot chart, with the exact line
+// colour each draws in (kept in sync with PriceChart) so the menu swatch matches
+// the chart. All are real math on the chart's own candles.
+const INDICATOR_DEFS: { key: keyof IndicatorPrefs; label: string; color: string }[] = [
+  { key: 'ema9', label: 'EMA 9', color: '#f0b90b' },
+  { key: 'ema21', label: 'EMA 21', color: '#3b82f6' },
+  { key: 'sma50', label: 'SMA 50', color: '#a855f7' },
+  { key: 'sma200', label: 'SMA 200', color: '#9aa7b8' },
+  { key: 'bb', label: 'Bollinger Bands (20, 2)', color: 'rgba(120,144,180,0.95)' },
+  { key: 'vwap', label: 'VWAP (loaded range)', color: '#e6c200' },
+]
+
+// TradingView-style "Indicators" dropdown for the bot chart: tick the moving
+// averages / bands / VWAP to overlay. The choice is saved (localStorage) by the
+// parent, so it persists like a saved layout. Every overlay is computed from the
+// real candles — nothing here fabricates a line.
+function IndicatorsMenu({
+  value,
+  onChange,
+}: {
+  value: IndicatorPrefs
+  onChange: (v: IndicatorPrefs) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!open) return
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+    }
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('mousedown', onDoc)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', onDoc)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [open])
+  const count = INDICATOR_DEFS.filter((d) => value[d.key]).length
+  return (
+    <div className="ind-menu" ref={ref}>
+      <button
+        type="button"
+        className="ind-btn"
+        onClick={() => setOpen((o) => !o)}
+        aria-haspopup="true"
+        aria-expanded={open}
+        title="Add real indicators to the bot chart"
+      >
+        Indicators{count ? ` (${count})` : ''}
+        <span className="ind-caret">▾</span>
+      </button>
+      {open && (
+        <div className="ind-panel">
+          {INDICATOR_DEFS.map((d) => (
+            <label key={d.key} className="ind-row">
+              <input
+                type="checkbox"
+                checked={value[d.key]}
+                onChange={(e) => onChange({ ...value, [d.key]: e.target.checked })}
+              />
+              <span className="ind-swatch" style={{ background: d.color }} />
+              <span className="ind-label">{d.label}</span>
+            </label>
+          ))}
+          {count > 0 && (
+            <button
+              type="button"
+              className="ind-clear"
+              onClick={() => onChange({ ...DEFAULT_INDICATORS })}
+            >
+              Clear all
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
 function SymbolPicker({
   value,
   symbols,

@@ -650,6 +650,118 @@ th.mono {
   padding: 6px 9px;
 }
 
+/* Bot-chart / TradingView view switch — a small segmented toggle. */
+.chart-view-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.cvt-btn {
+  background: var(--input-bg);
+  color: var(--muted);
+  border: none;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.cvt-btn + .cvt-btn {
+  border-left: 1px solid var(--border);
+}
+.cvt-btn:hover {
+  color: var(--text);
+}
+.cvt-btn.active {
+  background: var(--accent);
+  color: #fff;
+}
+
+/* "Indicators" dropdown (bot chart). */
+.ind-menu {
+  position: relative;
+  display: inline-block;
+}
+.ind-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--input-bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.ind-btn:hover {
+  border-color: var(--accent);
+}
+.ind-caret {
+  color: var(--muted);
+  font-size: 10px;
+}
+.ind-panel {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: 40;
+  width: 220px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  padding: 6px;
+}
+.ind-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 13px;
+}
+.ind-row:hover {
+  background: var(--panel-2);
+}
+.ind-swatch {
+  width: 14px;
+  height: 3px;
+  border-radius: 2px;
+  flex: 0 0 auto;
+}
+.ind-label {
+  color: var(--text);
+}
+.ind-clear {
+  width: 100%;
+  margin-top: 4px;
+  background: transparent;
+  color: var(--muted);
+  border: none;
+  border-top: 1px solid var(--border);
+  padding: 8px 8px 4px;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+}
+.ind-clear:hover {
+  color: var(--text);
+}
+
+/* Embedded full TradingView chart. Taller than the bot chart to give the
+   drawing-tools rail room; fills its host via the widget's autosize. */
+.tv-wrap {
+  height: 520px;
+}
+.tv-host {
+  width: 100%;
+  height: 100%;
+}
+.tv-err:empty {
+  display: none;
+}
+
 /* Live order-book depth ladder. */
 .orderbook .panel-head {
   display: flex;

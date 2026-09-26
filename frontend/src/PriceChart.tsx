@@ -14,6 +14,7 @@ import {
 } from 'lightweight-charts'
 import type { Candle } from './types'
 import type { Theme } from './theme'
+import { sma, ema, bollinger, vwap, type IndicatorPrefs, type LinePoint } from './indicators'
 
 // Candlestick price chart powered by TradingView's lightweight-charts library.
 //
@@ -100,6 +101,7 @@ export function PriceChart({
   symbol,
   timeframe,
   priceLines,
+  indicators,
 }: {
   candles: Candle[]
   theme: Theme
@@ -120,6 +122,9 @@ export function PriceChart({
   // price alerts and open-position entry / stop-loss / take-profit levels. Each
   // is a genuine number from the user's OWN data — nothing decorative or faked.
   priceLines?: { price: number; color?: string; title?: string }[]
+  // Which moving-average / band / VWAP overlays to draw, all computed from the
+  // real candles above. Undefined = none (unchanged plain chart).
+  indicators?: IndicatorPrefs
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -140,6 +145,9 @@ export function PriceChart({
   // Horizontal price lines we've drawn (alert / SL / TP / entry markers), kept so
   // we can clear and redraw them when the set changes.
   const priceLineObjsRef = useRef<IPriceLine[]>([])
+  // Indicator overlay line series (EMA/SMA/Bollinger/VWAP), keyed so we can add,
+  // update, or remove one without disturbing the candles or the others.
+  const overlayRef = useRef<Map<string, ISeriesApi<'Line'>>>(new Map())
 
   // Paint the OHLC + volume legend for one bar. Values are all numeric, so
   // writing them via innerHTML is safe; the symbol/timeframe label is rendered
@@ -218,6 +226,7 @@ export function PriceChart({
       chartRef.current = null
       seriesRef.current = null
       volumeRef.current = null
+      overlayRef.current.clear()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
@@ -386,6 +395,59 @@ export function PriceChart({
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [priceLinesKey])
+
+  // Indicator overlays: moving averages, Bollinger Bands and VWAP, each a real
+  // line computed from the candles above. We reconcile against what's on screen
+  // — add a newly-enabled line, drop a disabled one, refresh values on reload —
+  // so toggling one never churns the others or the candles. Times align to the
+  // bars, so the overlays sit exactly on price.
+  const indKey = JSON.stringify(indicators ?? {})
+  useEffect(() => {
+    const chart = chartRef.current
+    if (!chart) return
+    const p = indicators
+    const specs: { key: string; color: string; data: LinePoint[] }[] = []
+    if (p?.ema9) specs.push({ key: 'ema9', color: '#f0b90b', data: ema(candles, 9) })
+    if (p?.ema21) specs.push({ key: 'ema21', color: '#3b82f6', data: ema(candles, 21) })
+    if (p?.sma50) specs.push({ key: 'sma50', color: '#a855f7', data: sma(candles, 50) })
+    if (p?.sma200) specs.push({ key: 'sma200', color: '#9aa7b8', data: sma(candles, 200) })
+    if (p?.vwap) specs.push({ key: 'vwap', color: '#e6c200', data: vwap(candles) })
+    if (p?.bb) {
+      const bb = bollinger(candles, 20, 2)
+      specs.push({ key: 'bbUpper', color: 'rgba(120,144,180,0.9)', data: bb.upper })
+      specs.push({ key: 'bbBasis', color: 'rgba(120,144,180,0.45)', data: bb.basis })
+      specs.push({ key: 'bbLower', color: 'rgba(120,144,180,0.9)', data: bb.lower })
+    }
+    const want = new Set(specs.map((s) => s.key))
+    const map = overlayRef.current
+    for (const [key, series] of map) {
+      if (!want.has(key)) {
+        try {
+          chart.removeSeries(series)
+        } catch {
+          /* chart already torn down */
+        }
+        map.delete(key)
+      }
+    }
+    for (const spec of specs) {
+      let series = map.get(spec.key)
+      if (!series) {
+        series = chart.addLineSeries({
+          color: spec.color,
+          lineWidth: 2,
+          priceLineVisible: false,
+          lastValueVisible: false,
+          crosshairMarkerVisible: false,
+        })
+        map.set(spec.key, series)
+      } else {
+        series.applyOptions({ color: spec.color })
+      }
+      series.setData(spec.data.map((pt) => ({ time: pt.time as Time, value: pt.value })))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [candles, indKey])
 
   return (
     <div className="chart-wrap">
