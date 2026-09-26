@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   createChart,
   ColorType,
@@ -9,12 +9,30 @@ import {
   type IChartApi,
   type IPriceLine,
   type ISeriesApi,
+  type ISeriesPrimitive,
+  type ISeriesPrimitivePaneRenderer,
+  type ISeriesPrimitivePaneView,
+  type LogicalRange,
   type MouseEventParams,
+  type SeriesAttachedParameter,
+  type SeriesMarker,
   type Time,
 } from 'lightweight-charts'
 import type { Candle } from './types'
 import type { Theme } from './theme'
-import { sma, ema, bollinger, vwap, type IndicatorPrefs, type LinePoint } from './indicators'
+import { sma, ema, bollinger, vwap, rsi, macd, type IndicatorPrefs, type LinePoint } from './indicators'
+import type { ChartMarker } from './chartMarkers'
+import {
+  loadDrawings,
+  saveDrawings,
+  newDrawingId,
+  pointNearSegment,
+  pointNearRect,
+  pointNearHLine,
+  type Drawing,
+  type Pt,
+  type Tool,
+} from './drawings'
 
 // Candlestick price chart powered by TradingView's lightweight-charts library.
 //
@@ -51,9 +69,63 @@ function readPalette(): Palette {
 const VOL_UP = 'rgba(38, 166, 154, 0.45)'
 const VOL_DOWN = 'rgba(239, 83, 80, 0.45)'
 
-// Seconds per candle — used only to count down to the forming bar's close (the
-// "time left" read-out, like TradingView). Frames we don't map show no timer.
-const TF_SECONDS: Record<string, number> = {
+// Oscillator sub-panes (RSI, MACD) live in their own charts stacked under price,
+// each with its own y-scale (RSI 0–100, MACD centred on 0). Line colours are
+// fixed literals (not theme-driven) so the two panes read consistently; the MACD
+// histogram uses the theme's up/down. Every value is real math on the candles.
+type OscKind = 'rsi' | 'macd'
+const OSC_ORDER: OscKind[] = ['rsi', 'macd']
+const RSI_COLOR = '#d1a1ff'
+const MACD_LINE = '#3b82f6'
+const MACD_SIGNAL = '#f0b90b'
+// One live sub-pane: its chart, the line series it draws, the optional histogram
+// (MACD), a floating value label, and the range handler we subscribed for sync.
+type SubPane = {
+  chart: IChartApi
+  lines: ISeriesApi<'Line'>[]
+  hist?: ISeriesApi<'Histogram'>
+  label: HTMLDivElement | null
+  rangeHandler: (r: LogicalRange | null) => void
+}
+
+// --- Drawing tools --------------------------------------------------------
+// The left-edge toolbar's buttons and a small preset palette. All the geometry,
+// data model, hit-testing and persistence live in ./drawings (pure + unit-
+// tested); this component only wires mouse events and canvas rendering to it.
+const DRAW_TOOLS: { key: Tool; glyph: string; label: string }[] = [
+  { key: 'cursor', glyph: '↖', label: 'Cursor — click a drawing to select / delete' },
+  { key: 'trend', glyph: '╱', label: 'Trend line — click start, then click end' },
+  { key: 'hline', glyph: '─', label: 'Horizontal line — click a price level' },
+  { key: 'rect', glyph: '▭', label: 'Rectangle — click two opposite corners' },
+]
+const DRAW_COLORS = ['#2962ff', '#f0b90b', '#16c784', '#ea3943']
+const HIT_TOL = 6 // px — how near a click must land to select a drawing
+
+// Tiny media-space canvas helpers (no deps). Coordinates are CSS pixels, which
+// is exactly what priceToCoordinate / timeToCoordinate return.
+function strokeSeg(ctx: CanvasRenderingContext2D, ax: number, ay: number, bx: number, by: number) {
+  ctx.beginPath()
+  ctx.moveTo(ax, ay)
+  ctx.lineTo(bx, by)
+  ctx.stroke()
+}
+// A small square endpoint handle, drawn only on the selected drawing.
+function strokeHandle(ctx: CanvasRenderingContext2D, x: number, y: number, color: string) {
+  ctx.save()
+  ctx.fillStyle = '#ffffff'
+  ctx.strokeStyle = color
+  ctx.lineWidth = 1.5
+  ctx.beginPath()
+  ctx.rect(x - 3, y - 3, 6, 6)
+  ctx.fill()
+  ctx.stroke()
+  ctx.restore()
+}
+
+// Seconds per candle — used to count down to the forming bar's close (the
+// "time left" read-out, like TradingView) and to snap trade markers onto their
+// bar. Frames we don't map show no timer.
+export const TF_SECONDS: Record<string, number> = {
   '1m': 60,
   '5m': 300,
   '15m': 900,
@@ -102,6 +174,7 @@ export function PriceChart({
   timeframe,
   priceLines,
   indicators,
+  markers,
 }: {
   candles: Candle[]
   theme: Theme
@@ -125,6 +198,10 @@ export function PriceChart({
   // Which moving-average / band / VWAP overlays to draw, all computed from the
   // real candles above. Undefined = none (unchanged plain chart).
   indicators?: IndicatorPrefs
+  // Buy/sell arrows on the exact bars where the user's OWN trades opened and
+  // closed (see tradesToMarkers). Real trade history only — undefined or empty
+  // means no markers; nothing here is ever invented.
+  markers?: ChartMarker[]
 }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<IChartApi | null>(null)
@@ -148,6 +225,83 @@ export function PriceChart({
   // Indicator overlay line series (EMA/SMA/Bollinger/VWAP), keyed so we can add,
   // update, or remove one without disturbing the candles or the others.
   const overlayRef = useRef<Map<string, ISeriesApi<'Line'>>>(new Map())
+  // Oscillator sub-panes (RSI/MACD): each is its own synced chart under price.
+  // The two container divs are always in the DOM; a chart is created inside one
+  // only while its oscillator is switched on, and torn down when switched off.
+  const rsiPaneRef = useRef<HTMLDivElement>(null)
+  const macdPaneRef = useRef<HTMLDivElement>(null)
+  const rsiLabelRef = useRef<HTMLDivElement>(null)
+  const macdLabelRef = useRef<HTMLDivElement>(null)
+  const subPanesRef = useRef<Map<OscKind, SubPane>>(new Map())
+  // Every chart (price + active sub-panes) so a pan/zoom on any one drives the
+  // rest; the guard stops the programmatic echo from looping back.
+  const allChartsRef = useRef<Set<IChartApi>>(new Set())
+  const syncingRef = useRef(false)
+
+  // --- Drawing-tools state --------------------------------------------------
+  // React state drives the toolbar; matching refs give the canvas renderer and
+  // the once-created mouse handlers a synchronous read of the latest values.
+  const [tool, setTool] = useState<Tool>('cursor')
+  const [drawings, setDrawings] = useState<Drawing[]>([])
+  const [selected, setSelected] = useState<string | null>(null)
+  const [color, setColor] = useState<string>(DRAW_COLORS[0])
+  const toolRef = useRef<Tool>('cursor')
+  const colorRef = useRef<string>(DRAW_COLORS[0])
+  const drawingsRef = useRef<Drawing[]>([])
+  const selectedRef = useRef<string | null>(null)
+  // First anchor of a two-click drawing (trend/rect) awaiting its second click.
+  const pendingRef = useRef<Pt | null>(null)
+  // Latest pointer position in data space, for the rubber-band preview.
+  const hoverRef = useRef<Pt | null>(null)
+  // Handle to the attached primitive's requestUpdate, so any state change can
+  // ask lightweight-charts to repaint the drawing layer.
+  const drawViewRef = useRef<{ requestUpdate: () => void } | null>(null)
+  // Persistence bookkeeping: which symbol|timeframe is currently loaded, and a
+  // one-shot flag so the load itself doesn't immediately re-save.
+  const loadedKeyRef = useRef<string>('')
+  const skipSaveRef = useRef(false)
+  // Latest delete/cancel actions, so the window keydown handler (created once)
+  // always calls the current closures.
+  const actionsRef = useRef<{ del: () => void; cancel: () => void }>({ del: () => {}, cancel: () => {} })
+
+  // Mirror one chart's visible range onto every other chart so price and its
+  // oscillator panes pan and zoom as one. The guard swallows the echo that the
+  // programmatic setVisibleLogicalRange would otherwise bounce back.
+  const syncRange = (self: IChartApi, range: LogicalRange | null) => {
+    if (!range || syncingRef.current) return
+    syncingRef.current = true
+    for (const c of allChartsRef.current) {
+      if (c !== self) {
+        try {
+          c.timeScale().setVisibleLogicalRange(range)
+        } catch {
+          /* chart torn down mid-sync */
+        }
+      }
+    }
+    syncingRef.current = false
+  }
+
+  // Tear one oscillator pane down: unsubscribe its sync, drop it from the synced
+  // set, remove the chart, and blank its label. Safe to call when absent.
+  const destroySubPane = (kind: OscKind) => {
+    const pane = subPanesRef.current.get(kind)
+    if (!pane) return
+    try {
+      pane.chart.timeScale().unsubscribeVisibleLogicalRangeChange(pane.rangeHandler)
+    } catch {
+      /* already gone */
+    }
+    allChartsRef.current.delete(pane.chart)
+    try {
+      pane.chart.remove()
+    } catch {
+      /* already removed */
+    }
+    if (pane.label) pane.label.textContent = ''
+    subPanesRef.current.delete(kind)
+  }
+
 
   // Paint the OHLC + volume legend for one bar. Values are all numeric, so
   // writing them via innerHTML is safe; the symbol/timeframe label is rendered
@@ -178,7 +332,7 @@ export function PriceChart({
       layout: { background: { type: ColorType.Solid, color: p.bg }, textColor: p.text },
       grid: { vertLines: { color: p.grid }, horzLines: { color: p.grid } },
       timeScale: { borderColor: p.grid, timeVisible: true },
-      rightPriceScale: { borderColor: p.grid },
+      rightPriceScale: { borderColor: p.grid, minimumWidth: 68 },
       crosshair: { mode: CrosshairMode.Normal },
       autoSize: true,
     })
@@ -204,6 +358,20 @@ export function PriceChart({
     const onMove = (param: MouseEventParams<Time>) => {
       const s = seriesRef.current
       if (!s) return
+      // Capture the pointer in data space for the drawing rubber-band preview,
+      // then only repaint the drawing layer while a placement is in progress.
+      if (param.point) {
+        const pr = s.coordinateToPrice(param.point.y)
+        let tm = param.time as number | undefined
+        if (tm == null && chartRef.current) {
+          const t = chartRef.current.timeScale().coordinateToTime(param.point.x)
+          tm = (t as number | null) ?? undefined
+        }
+        hoverRef.current = pr != null && tm != null ? { time: tm, price: pr } : null
+        if (pendingRef.current) drawViewRef.current?.requestUpdate()
+      } else {
+        hoverRef.current = null
+      }
       if (param.time && param.seriesData.size) {
         const cd = param.seriesData.get(s) as CandlestickData | undefined
         const vd = volumeRef.current
@@ -220,8 +388,220 @@ export function PriceChart({
     }
     chart.subscribeCrosshairMove(onMove)
 
+    // Register price as the anchor of the synced group and keep the sub-panes'
+    // time axes locked to whatever range the user drags price to.
+    allChartsRef.current.add(chart)
+    const onMainRange = (r: LogicalRange | null) => syncRange(chart, r)
+    chart.timeScale().subscribeVisibleLogicalRangeChange(onMainRange)
+
+    // Paint every saved drawing (plus the in-progress preview) onto the price
+    // pane each frame, projecting data anchors to pixels through the live scales
+    // so lines stay pinned to their bar/price as the chart pans and zooms.
+    const renderDrawings = (ctx: CanvasRenderingContext2D, width: number) => {
+      const s = seriesRef.current
+      const c = chartRef.current
+      if (!s || !c) return
+      const ts = c.timeScale()
+      const px = (pt: Pt) => {
+        const y = s.priceToCoordinate(pt.price)
+        const x = ts.timeToCoordinate(pt.time as Time)
+        return x == null || y == null ? null : { x, y }
+      }
+      const box = (a: { x: number; y: number }, b: { x: number; y: number }) =>
+        [Math.min(a.x, b.x), Math.min(a.y, b.y), Math.abs(b.x - a.x), Math.abs(b.y - a.y)] as const
+      ctx.save()
+      for (const d of drawingsRef.current) {
+        const sel = d.id === selectedRef.current
+        ctx.strokeStyle = d.color
+        ctx.lineWidth = sel ? 2.5 : 1.5
+        if (d.kind === 'hline') {
+          const y = s.priceToCoordinate(d.price)
+          if (y == null) continue
+          strokeSeg(ctx, 0, y, width, y)
+        } else if (d.kind === 'trend') {
+          const a = px(d.a)
+          const b = px(d.b)
+          if (!a || !b) continue
+          strokeSeg(ctx, a.x, a.y, b.x, b.y)
+          if (sel) { strokeHandle(ctx, a.x, a.y, d.color); strokeHandle(ctx, b.x, b.y, d.color) }
+        } else {
+          const a = px(d.a)
+          const b = px(d.b)
+          if (!a || !b) continue
+          const [rx, ry, rw, rh] = box(a, b)
+          ctx.globalAlpha = sel ? 0.14 : 0.08
+          ctx.fillStyle = d.color
+          ctx.fillRect(rx, ry, rw, rh)
+          ctx.globalAlpha = 1
+          ctx.strokeRect(rx, ry, rw, rh)
+          if (sel) { strokeHandle(ctx, a.x, a.y, d.color); strokeHandle(ctx, b.x, b.y, d.color) }
+        }
+      }
+      // Rubber-band preview between the first click and the pointer, for the
+      // two-click tools (trend / rect), drawn dashed until the second click.
+      const pend = pendingRef.current
+      const hov = hoverRef.current
+      const t = toolRef.current
+      if (pend && hov && (t === 'trend' || t === 'rect')) {
+        const a = px(pend)
+        const b = px(hov)
+        if (a && b) {
+          ctx.strokeStyle = colorRef.current
+          ctx.lineWidth = 1.5
+          ctx.setLineDash([4, 4])
+          if (t === 'trend') {
+            strokeSeg(ctx, a.x, a.y, b.x, b.y)
+          } else {
+            const [rx, ry, rw, rh] = box(a, b)
+            ctx.strokeRect(rx, ry, rw, rh)
+          }
+          ctx.setLineDash([])
+        }
+      }
+      ctx.restore()
+    }
+    // Attach one primitive to the candle series; its single pane view renders
+    // the whole drawing layer on top of price. requestUpdate (captured on
+    // attach) lets any state change trigger a repaint of that layer.
+    const paneRenderer: ISeriesPrimitivePaneRenderer = {
+      draw: (target) => {
+        target.useMediaCoordinateSpace(({ context, mediaSize }) => {
+          renderDrawings(context, mediaSize.width)
+        })
+      },
+    }
+    const paneView: ISeriesPrimitivePaneView = {
+      renderer: () => paneRenderer,
+      zOrder: () => 'top',
+    }
+    let requestUpdate: (() => void) | null = null
+    const primitive: ISeriesPrimitive<Time> = {
+      paneViews: () => [paneView],
+      attached: (param: SeriesAttachedParameter<Time>) => {
+        requestUpdate = param.requestUpdate
+      },
+      detached: () => {
+        requestUpdate = null
+      },
+    }
+    series.attachPrimitive(primitive)
+    drawViewRef.current = { requestUpdate: () => requestUpdate?.() }
+    // Place / select on click. In cursor mode a click selects the nearest
+    // drawing (or clears the selection). A tool click lays down an anchor: one
+    // click for an h-line, two for a trend line or rectangle. Times come from
+    // param.time (already snapped to a bar) so anchors sit on real candles.
+    const onClick = (param: MouseEventParams<Time>) => {
+      const s = seriesRef.current
+      const c = chartRef.current
+      if (!s || !c || !param.point) return
+      const price = s.coordinateToPrice(param.point.y)
+      if (price == null) return
+      let time = param.time as number | undefined
+      if (time == null) {
+        const t = c.timeScale().coordinateToTime(param.point.x)
+        time = (t as number | null) ?? undefined
+      }
+      const activeTool = toolRef.current
+      if (activeTool === 'cursor') {
+        selectAt(param.point.x, param.point.y)
+        return
+      }
+      if (activeTool === 'hline') {
+        commit({ id: newDrawingId(), kind: 'hline', price, color: colorRef.current })
+        return
+      }
+      if (time == null) return // trend / rect need a time anchor
+      if (!pendingRef.current) {
+        pendingRef.current = { time, price }
+        drawViewRef.current?.requestUpdate()
+      } else {
+        const a = pendingRef.current
+        pendingRef.current = null
+        commit({ id: newDrawingId(), kind: activeTool, a, b: { time, price }, color: colorRef.current })
+      }
+    }
+    chart.subscribeClick(onClick)
+    // Commit a finished drawing: append it, drop back to the cursor, and select
+    // the new object so it can be deleted immediately. (Declared as a function
+    // so onClick above can call it regardless of order — hoisting.)
+    function commit(d: Drawing) {
+      const next = [...drawingsRef.current, d]
+      drawingsRef.current = next
+      setDrawings(next)
+      pendingRef.current = null
+      hoverRef.current = null
+      toolRef.current = 'cursor'
+      setTool('cursor')
+      selectedRef.current = d.id
+      setSelected(d.id)
+      drawViewRef.current?.requestUpdate()
+    }
+    // Hit-test a click against the drawings (topmost first) and select the
+    // first within tolerance, else clear the selection. Uses the pure helpers
+    // from ./drawings on pixel projections of each anchor.
+    function selectAt(x: number, y: number) {
+      const s = seriesRef.current
+      const c = chartRef.current
+      if (!s || !c) return
+      const ts = c.timeScale()
+      const px = (pt: Pt) => {
+        const py = s.priceToCoordinate(pt.price)
+        const pxx = ts.timeToCoordinate(pt.time as Time)
+        return pxx == null || py == null ? null : { x: pxx, y: py }
+      }
+      const list = drawingsRef.current
+      let hit: string | null = null
+      for (let i = list.length - 1; i >= 0; i--) {
+        const d = list[i]
+        if (d.kind === 'hline') {
+          const ly = s.priceToCoordinate(d.price)
+          if (ly != null && pointNearHLine(y, ly, HIT_TOL)) { hit = d.id; break }
+        } else if (d.kind === 'trend') {
+          const a = px(d.a)
+          const b = px(d.b)
+          if (a && b && pointNearSegment({ x, y }, a, b, HIT_TOL)) { hit = d.id; break }
+        } else {
+          const a = px(d.a)
+          const b = px(d.b)
+          if (a && b && pointNearRect({ x, y }, a, b, HIT_TOL)) { hit = d.id; break }
+        }
+      }
+      selectedRef.current = hit
+      setSelected(hit)
+      drawViewRef.current?.requestUpdate()
+    }
+    // Keyboard: Delete/Backspace removes the selected drawing; Escape cancels an
+    // in-progress placement or clears the selection. Ignored while a form field
+    // is focused so it never eats typing elsewhere in the app. Delegates to the
+    // latest actions (kept fresh in a ref) so this once-bound handler stays live.
+    const onKeyDown = (e: KeyboardEvent) => {
+      const t = e.target as HTMLElement | null
+      const tag = t?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || t?.isContentEditable) return
+      if (e.key === 'Delete' || e.key === 'Backspace') {
+        if (selectedRef.current) {
+          e.preventDefault()
+          actionsRef.current.del()
+        }
+      } else if (e.key === 'Escape') {
+        actionsRef.current.cancel()
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+
     return () => {
       chart.unsubscribeCrosshairMove(onMove)
+      chart.unsubscribeClick(onClick)
+      window.removeEventListener('keydown', onKeyDown)
+      chart.timeScale().unsubscribeVisibleLogicalRangeChange(onMainRange)
+      for (const kind of OSC_ORDER) destroySubPane(kind)
+      try {
+        series.detachPrimitive(primitive)
+      } catch {
+        /* series already gone with the chart */
+      }
+      drawViewRef.current = null
+      allChartsRef.current.delete(chart)
       chart.remove()
       chartRef.current = null
       seriesRef.current = null
@@ -396,6 +776,25 @@ export function PriceChart({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [priceLinesKey])
 
+  // Trade markers: buy/sell arrows on the exact bars where the user's OWN trades
+  // opened and closed (see tradesToMarkers). Real history only. Re-applied when
+  // the set changes AND when the candles reload, so a marker never vanishes on a
+  // periodic refresh (setData can drop markers) and always sits on a real bar.
+  const markersKey = JSON.stringify(markers ?? [])
+  useEffect(() => {
+    const series = seriesRef.current
+    if (!series) return
+    const list: SeriesMarker<Time>[] = (markers ?? []).map((m) => ({
+      time: m.time as Time,
+      position: m.position,
+      color: m.color,
+      shape: m.shape,
+      text: m.text,
+    }))
+    series.setMarkers(list)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [markersKey, candles])
+
   // Indicator overlays: moving averages, Bollinger Bands and VWAP, each a real
   // line computed from the candles above. We reconcile against what's on screen
   // — add a newly-enabled line, drop a disabled one, refresh values on reload —
@@ -449,8 +848,208 @@ export function PriceChart({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [candles, indKey])
 
+  // Oscillator sub-panes: RSI and MACD, each in its own chart stacked beneath
+  // price and time-synced to it (pan/zoom price and the panes follow). Every
+  // value is real math on the same candles — RSI(14) with 70/30 guides, MACD
+  // (12/26/9) as line + signal + histogram. We reconcile like the overlays: add
+  // a newly-enabled pane, tear down a disabled one, refresh data + the live
+  // value read-out on reload, and re-colour on theme flips — never recreating a
+  // pane that's already up. The bottom-most pane owns the shared time axis.
+  useEffect(() => {
+    const main = chartRef.current
+    const p = paletteRef.current
+    if (!main || !p) return
+    const want: OscKind[] = OSC_ORDER.filter((k) => !!indicators?.[k])
+    for (const kind of OSC_ORDER) {
+      if (!want.includes(kind)) destroySubPane(kind)
+    }
+    for (const kind of want) {
+      const container = kind === 'rsi' ? rsiPaneRef.current : macdPaneRef.current
+      const label = kind === 'rsi' ? rsiLabelRef.current : macdLabelRef.current
+      if (!container) continue
+      let pane = subPanesRef.current.get(kind)
+      if (!pane) {
+        const sub = createChart(container, {
+          layout: { background: { type: ColorType.Solid, color: p.bg }, textColor: p.text },
+          grid: { vertLines: { color: p.grid }, horzLines: { color: p.grid } },
+          timeScale: { borderColor: p.grid, timeVisible: true, visible: false },
+          rightPriceScale: { borderColor: p.grid, minimumWidth: 68 },
+          crosshair: { mode: CrosshairMode.Normal },
+          autoSize: true,
+        })
+        const lines: ISeriesApi<'Line'>[] = []
+        let hist: ISeriesApi<'Histogram'> | undefined
+        if (kind === 'rsi') {
+          const line = sub.addLineSeries({
+            color: RSI_COLOR,
+            lineWidth: 2,
+            priceLineVisible: false,
+            crosshairMarkerVisible: false,
+          })
+          // Real RSI reference levels — overbought 70 / oversold 30.
+          line.createPriceLine({ price: 70, color: p.grid, lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: '70' })
+          line.createPriceLine({ price: 30, color: p.grid, lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: '30' })
+          lines.push(line)
+        } else {
+          // Histogram first so the two lines paint over it.
+          hist = sub.addHistogramSeries({ priceLineVisible: false, lastValueVisible: false })
+          lines.push(
+            sub.addLineSeries({ color: MACD_LINE, lineWidth: 2, priceLineVisible: false, crosshairMarkerVisible: false }),
+            sub.addLineSeries({ color: MACD_SIGNAL, lineWidth: 2, priceLineVisible: false, crosshairMarkerVisible: false }),
+          )
+        }
+        const rangeHandler = (r: LogicalRange | null) => syncRange(sub, r)
+        sub.timeScale().subscribeVisibleLogicalRangeChange(rangeHandler)
+        allChartsRef.current.add(sub)
+        pane = { chart: sub, lines, hist, label, rangeHandler }
+        subPanesRef.current.set(kind, pane)
+      } else {
+        pane.chart.applyOptions({
+          layout: { background: { type: ColorType.Solid, color: p.bg }, textColor: p.text },
+          grid: { vertLines: { color: p.grid }, horzLines: { color: p.grid } },
+          timeScale: { borderColor: p.grid },
+          rightPriceScale: { borderColor: p.grid },
+        })
+      }
+      if (kind === 'rsi') {
+        const data = rsi(candles, 14)
+        pane.lines[0].setData(data.map((pt) => ({ time: pt.time as Time, value: pt.value })))
+        const latest = data.length ? data[data.length - 1].value : null
+        if (pane.label) pane.label.textContent = latest == null ? 'RSI 14' : `RSI 14  ${latest.toFixed(2)}`
+      } else {
+        const m = macd(candles)
+        pane.lines[0].setData(m.macd.map((pt) => ({ time: pt.time as Time, value: pt.value })))
+        pane.lines[1].setData(m.signal.map((pt) => ({ time: pt.time as Time, value: pt.value })))
+        pane.hist?.setData(
+          m.histogram.map((pt) => ({ time: pt.time as Time, value: pt.value, color: pt.value >= 0 ? VOL_UP : VOL_DOWN })),
+        )
+        const lastLine = m.macd.length ? m.macd[m.macd.length - 1].value : null
+        const lastSig = m.signal.length ? m.signal[m.signal.length - 1].value : null
+        if (pane.label) {
+          pane.label.textContent = lastLine == null
+            ? 'MACD 12 26 9'
+            : `MACD 12 26 9  ${lastLine.toFixed(2)} / ${lastSig != null ? lastSig.toFixed(2) : '—'}`
+        }
+      }
+      const mainRange = main.timeScale().getVisibleLogicalRange()
+      if (mainRange) {
+        try {
+          pane.chart.timeScale().setVisibleLogicalRange(mainRange)
+        } catch {
+          /* not ready yet; the main-range subscription will sync it */
+        }
+      }
+    }
+    // Time axis on the bottom-most visible chart only, so it reads once under
+    // the whole stack (price alone when no oscillators are on).
+    const bottom: 'price' | OscKind = want.length ? want[want.length - 1] : 'price'
+    main.timeScale().applyOptions({ visible: bottom === 'price' })
+    for (const kind of OSC_ORDER) {
+      subPanesRef.current.get(kind)?.chart.timeScale().applyOptions({ visible: bottom === kind })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [candles, indKey, theme])
+
+  // While a drawing tool is active, freeze pan/zoom so clicks place cleanly and
+  // show a crosshair cursor; the cursor tool restores normal chart navigation.
+  useEffect(() => {
+    const chart = chartRef.current
+    if (!chart) return
+    const drawing = tool !== 'cursor'
+    chart.applyOptions({ handleScroll: !drawing, handleScale: !drawing })
+    if (containerRef.current) containerRef.current.style.cursor = drawing ? 'crosshair' : ''
+  }, [tool])
+
+  // Load this symbol/timeframe's saved drawings whenever either changes (and on
+  // mount). skipSaveRef stops the next save effect from immediately rewriting
+  // what we just read back in.
+  useEffect(() => {
+    const loaded = loadDrawings(symbol ?? '', timeframe ?? '')
+    loadedKeyRef.current = `${symbol ?? ''}|${timeframe ?? ''}`
+    skipSaveRef.current = true
+    drawingsRef.current = loaded
+    selectedRef.current = null
+    pendingRef.current = null
+    setSelected(null)
+    setDrawings(loaded)
+    drawViewRef.current?.requestUpdate()
+  }, [symbol, timeframe])
+
+  // Persist per symbol/timeframe and keep the renderer's ref in step with state.
+  // The one-shot skip covers the commit where a load just set everything.
+  useEffect(() => {
+    if (skipSaveRef.current) {
+      skipSaveRef.current = false
+      return
+    }
+    drawingsRef.current = drawings
+    drawViewRef.current?.requestUpdate()
+    if (loadedKeyRef.current !== `${symbol ?? ''}|${timeframe ?? ''}`) return
+    saveDrawings(symbol ?? '', timeframe ?? '', drawings)
+  }, [drawings, symbol, timeframe])
+
+  // --- Drawing-tools actions (the toolbar and keyboard shortcuts share these).
+  // Each mirrors its change into the matching ref immediately so the once-built
+  // mouse handlers + canvas renderer read the current value without a re-mount.
+  const selectTool = (t: Tool) => {
+    toolRef.current = t
+    setTool(t)
+    pendingRef.current = null
+    hoverRef.current = null
+    drawViewRef.current?.requestUpdate()
+  }
+  const chooseColor = (c: string) => {
+    colorRef.current = c
+    setColor(c)
+    // If something's selected, recolour it to match the freshly picked swatch.
+    const id = selectedRef.current
+    if (id) {
+      const next = drawingsRef.current.map((d) => (d.id === id ? { ...d, color: c } : d))
+      drawingsRef.current = next
+      setDrawings(next)
+    }
+    drawViewRef.current?.requestUpdate()
+  }
+  const deleteSelected = () => {
+    const id = selectedRef.current
+    if (!id) return
+    const next = drawingsRef.current.filter((d) => d.id !== id)
+    drawingsRef.current = next
+    setDrawings(next)
+    selectedRef.current = null
+    setSelected(null)
+    drawViewRef.current?.requestUpdate()
+  }
+  const clearAll = () => {
+    if (drawingsRef.current.length === 0) return
+    drawingsRef.current = []
+    setDrawings([])
+    selectedRef.current = null
+    setSelected(null)
+    pendingRef.current = null
+    drawViewRef.current?.requestUpdate()
+  }
+  // Escape: abandon a half-placed drawing first, else drop the selection; either
+  // way fall back to the cursor tool so the chart is navigable again.
+  const cancelDraw = () => {
+    if (pendingRef.current) {
+      pendingRef.current = null
+    } else {
+      selectedRef.current = null
+      setSelected(null)
+    }
+    toolRef.current = 'cursor'
+    setTool('cursor')
+    drawViewRef.current?.requestUpdate()
+  }
+  // Keep the ref the window keydown handler calls pointed at the live closures.
+  actionsRef.current = { del: deleteSelected, cancel: cancelDraw }
+
+  // Grow the wrapper by one fixed-height slot per active oscillator so price
+  // keeps its height and each pane stacks below (like adding TradingView panes).
+  const activeSubs = (indicators?.rsi ? 1 : 0) + (indicators?.macd ? 1 : 0)
   return (
-    <div className="chart-wrap">
+    <div className="chart-wrap" style={{ height: 380 + activeSubs * 118 }}>
       <div className="chart-legend">
         <span className="cl-sym">
           {symbol || ''}
@@ -459,7 +1058,66 @@ export function PriceChart({
         <span className="cl-ohlc" ref={legendRef} />
       </div>
       <div className="chart-countdown" ref={countdownRef} title="Time left until this candle closes" />
+      <div className="chart-toolbar" role="toolbar" aria-label="Drawing tools">
+        {DRAW_TOOLS.map((t) => (
+          <button
+            key={t.key}
+            type="button"
+            className={`ct-btn${tool === t.key ? ' active' : ''}`}
+            title={t.label}
+            aria-label={t.label}
+            aria-pressed={tool === t.key}
+            onClick={() => selectTool(t.key)}
+          >
+            {t.glyph}
+          </button>
+        ))}
+        <div className="ct-sep" />
+        <div className="ct-colors">
+          {DRAW_COLORS.map((c) => (
+            <button
+              key={c}
+              type="button"
+              className={`ct-swatch${color === c ? ' active' : ''}`}
+              style={{ background: c }}
+              title={`Colour ${c}${selected ? ' (recolours the selected drawing)' : ''}`}
+              aria-label={`Colour ${c}`}
+              aria-pressed={color === c}
+              onClick={() => chooseColor(c)}
+            />
+          ))}
+        </div>
+        <div className="ct-sep" />
+        <button
+          type="button"
+          className="ct-btn"
+          title="Delete selected drawing (Del)"
+          aria-label="Delete selected drawing"
+          disabled={!selected}
+          onClick={deleteSelected}
+        >
+          🗑
+        </button>
+        <button
+          type="button"
+          className="ct-btn"
+          title="Clear all drawings on this chart"
+          aria-label="Clear all drawings"
+          disabled={drawings.length === 0}
+          onClick={clearAll}
+        >
+          ⌫
+        </button>
+      </div>
       <div className="chart" ref={containerRef} />
+      <div className={`chart-sub${indicators?.rsi ? '' : ' hidden'}`}>
+        <div className="chart-sub-label" ref={rsiLabelRef} />
+        <div className="chart-sub-canvas" ref={rsiPaneRef} />
+      </div>
+      <div className={`chart-sub${indicators?.macd ? '' : ' hidden'}`}>
+        <div className="chart-sub-label" ref={macdLabelRef} />
+        <div className="chart-sub-canvas" ref={macdPaneRef} />
+      </div>
     </div>
   )
 }

@@ -12,6 +12,7 @@ export type LinePoint = { time: number; value: number }
 
 // Which price-overlay indicators the user has switched on. Persisted so the
 // choice sticks between visits (see App: loaded from / saved to localStorage).
+// The first group draws ON price; rsi/macd draw in their own sub-panes below it.
 export type IndicatorPrefs = {
   ema9: boolean
   ema21: boolean
@@ -19,6 +20,8 @@ export type IndicatorPrefs = {
   sma200: boolean
   bb: boolean
   vwap: boolean
+  rsi: boolean
+  macd: boolean
 }
 
 export const DEFAULT_INDICATORS: IndicatorPrefs = {
@@ -28,6 +31,8 @@ export const DEFAULT_INDICATORS: IndicatorPrefs = {
   sma200: false,
   bb: false,
   vwap: false,
+  rsi: false,
+  macd: false,
 }
 
 // Simple moving average of the close over `period` bars.
@@ -132,4 +137,55 @@ export function rsi(candles: Candle[], period = 14): LinePoint[] {
     out.push({ time: candles[i].time, value: rsiAt() })
   }
   return out
+}
+
+// EMA over an arbitrary series of points (not candles). Used for the MACD signal
+// line, which is an EMA of the MACD line itself. Same SMA-seed + k=2/(p+1) as
+// ema(), and it carries each point's own timestamp through so the result stays
+// aligned to the bars.
+function emaOfPoints(points: LinePoint[], period: number): LinePoint[] {
+  if (period <= 0 || points.length < period) return []
+  const k = 2 / (period + 1)
+  const out: LinePoint[] = []
+  let seed = 0
+  for (let i = 0; i < period; i++) seed += points[i].value
+  let prev = seed / period
+  out.push({ time: points[period - 1].time, value: prev })
+  for (let i = period; i < points.length; i++) {
+    prev = points[i].value * k + prev * (1 - k)
+    out.push({ time: points[i].time, value: prev })
+  }
+  return out
+}
+
+// MACD — the classic momentum oscillator, all three lines real and computed from
+// the candles' own closes: `macd` = EMA(fast) − EMA(slow); `signal` =
+// EMA(signalPeriod) of that line; `histogram` = macd − signal. Each is time-
+// aligned to its bar (the line begins once the slow EMA exists, the signal once
+// enough line points exist), so a sub-pane draws them exactly under price.
+// Classic defaults are 12 / 26 / 9.
+export function macd(
+  candles: Candle[],
+  fast = 12,
+  slow = 26,
+  signalPeriod = 9,
+): { macd: LinePoint[]; signal: LinePoint[]; histogram: LinePoint[] } {
+  const emaFast = ema(candles, fast)
+  const emaSlow = ema(candles, slow)
+  if (!emaFast.length || !emaSlow.length) return { macd: [], signal: [], histogram: [] }
+  // Subtract fast − slow only on bars where BOTH EMAs are defined (i.e. from the
+  // slow EMA's first bar onward), matching them up by timestamp.
+  const fastAt = new Map(emaFast.map((p) => [p.time, p.value]))
+  const line: LinePoint[] = []
+  for (const s of emaSlow) {
+    const f = fastAt.get(s.time)
+    if (f != null) line.push({ time: s.time, value: f - s.value })
+  }
+  const signal = emaOfPoints(line, signalPeriod)
+  const lineAt = new Map(line.map((p) => [p.time, p.value]))
+  const histogram: LinePoint[] = signal.map((s) => ({
+    time: s.time,
+    value: (lineAt.get(s.time) as number) - s.value,
+  }))
+  return { macd: line, signal, histogram }
 }

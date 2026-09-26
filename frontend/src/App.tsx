@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type Dispatch, type KeyboardEvent as ReactKeyboardEvent, type SetStateAction } from 'react'
 import { api, setToken, getToken, setAuthFailureHandler } from './api'
-import { PriceChart } from './PriceChart'
+import { PriceChart, TF_SECONDS } from './PriceChart'
 import { TradingViewChart } from './TradingViewChart'
 import { DEFAULT_INDICATORS, type IndicatorPrefs } from './indicators'
+import { tradesToMarkers } from './chartMarkers'
 import { useBinanceStream } from './useBinanceStream'
 import { Login, LicenseGate } from './Login'
 import { Admin } from './Admin'
@@ -520,6 +521,13 @@ function Dashboard({
     return lines
   }, [alerts, trades, symbol])
 
+  // Buy/sell arrows on the exact bars where THIS symbol's trades opened/closed —
+  // real history only (see tradesToMarkers), snapped to the candle timeframe.
+  const chartMarkers = useMemo(
+    () => tradesToMarkers(trades, symbol, TF_SECONDS[timeframe] ?? 0),
+    [trades, symbol, timeframe],
+  )
+
   // Load candles when symbol/timeframe changes, and poll periodically. The
   // poll is fairly frequent so a new closed bar shows up quickly; the live
   // ticker (below) keeps the forming bar moving in between reloads.
@@ -994,6 +1002,7 @@ function Dashboard({
                   timeframe={timeframe}
                   priceLines={chartPriceLines}
                   indicators={indicators}
+                  markers={chartMarkers}
                 />
               ) : (
                 <div className="empty">
@@ -1593,6 +1602,14 @@ const INDICATOR_DEFS: { key: keyof IndicatorPrefs; label: string; color: string 
   { key: 'vwap', label: 'VWAP (loaded range)', color: '#e6c200' },
 ]
 
+// Oscillators that draw in their OWN pane under price (their y-scale isn't the
+// price), so they're offered as a separate group. Same rule: real math on the
+// chart's candles — RSI(14) and MACD(12,26,9), nothing fabricated.
+const OSCILLATOR_DEFS: { key: keyof IndicatorPrefs; label: string; color: string }[] = [
+  { key: 'rsi', label: 'RSI (14)', color: '#d1a1ff' },
+  { key: 'macd', label: 'MACD (12, 26, 9)', color: '#3b82f6' },
+]
+
 // TradingView-style "Indicators" dropdown for the bot chart: tick the moving
 // averages / bands / VWAP to overlay. The choice is saved (localStorage) by the
 // parent, so it persists like a saved layout. Every overlay is computed from the
@@ -1621,7 +1638,9 @@ function IndicatorsMenu({
       document.removeEventListener('keydown', onKey)
     }
   }, [open])
-  const count = INDICATOR_DEFS.filter((d) => value[d.key]).length
+  const count =
+    INDICATOR_DEFS.filter((d) => value[d.key]).length +
+    OSCILLATOR_DEFS.filter((d) => value[d.key]).length
   return (
     <div className="ind-menu" ref={ref}>
       <button
@@ -1638,6 +1657,18 @@ function IndicatorsMenu({
       {open && (
         <div className="ind-panel">
           {INDICATOR_DEFS.map((d) => (
+            <label key={d.key} className="ind-row">
+              <input
+                type="checkbox"
+                checked={value[d.key]}
+                onChange={(e) => onChange({ ...value, [d.key]: e.target.checked })}
+              />
+              <span className="ind-swatch" style={{ background: d.color }} />
+              <span className="ind-label">{d.label}</span>
+            </label>
+          ))}
+          <div className="ind-group">Oscillators · own pane</div>
+          {OSCILLATOR_DEFS.map((d) => (
             <label key={d.key} className="ind-row">
               <input
                 type="checkbox"
