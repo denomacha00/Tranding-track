@@ -270,3 +270,41 @@ def test_chat_no_history_is_single_user_turn(monkeypatch):
     ai.chat("hello")
     roles = [m["role"] for m in _FakeClient.captured["body"]["messages"]]
     assert roles == ["system", "user"]
+
+
+# ---- action tag parsing (the assistant's "hands") --------------------------
+# The assistant proposes an action by emitting a hidden [[action:{json}]] tag;
+# strip_action_tag pulls it out. It must be defensive: a garbled tag must never
+# raise and must never leak the raw tag into the user-visible reply.
+
+from app.ai import strip_action_tag
+
+
+def test_strip_action_tag_none_when_absent():
+    text = "Here's my read on BTC — momentum is fading."
+    clean, obj = strip_action_tag(text)
+    assert clean == text
+    assert obj is None
+
+
+def test_strip_action_tag_extracts_and_hides():
+    reply = (
+        "I'll place a market buy on BTC, auto-sized by your risk manager.\n"
+        '[[action:{"type":"order","side":"buy","symbol":"BTC/USDT","amount":null}]]'
+    )
+    clean, obj = strip_action_tag(reply)
+    assert "[[action" not in clean  # never shown to the user
+    assert clean.startswith("I'll place a market buy")
+    assert obj == {"type": "order", "side": "buy", "symbol": "BTC/USDT", "amount": None}
+
+
+def test_strip_action_tag_malformed_json_is_safe():
+    reply = "Sure. [[action:{not valid json}]]"
+    clean, obj = strip_action_tag(reply)
+    assert obj is None  # no crash, no proposal
+    assert "[[action" not in clean
+
+
+def test_strip_action_tag_empty_input():
+    assert strip_action_tag("") == ("", None)
+

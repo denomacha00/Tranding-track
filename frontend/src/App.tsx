@@ -6,7 +6,7 @@ import { Admin } from './Admin'
 import { useSocket } from './useSocket'
 import { useTheme, type Theme } from './theme'
 import { ThemeToggle } from './ThemeToggle'
-import type { AiHealth, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, MarketAnalysis, Me, NewsItem, OrderBook as OrderBookData, Performance, PerfBucket, SavedStrategy, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
+import type { AiHealth, BotStatus, BacktestResult, Candle, ChatTurn, ExchangeAccess, MarketAnalysis, Me, NewsItem, OrderBook as OrderBookData, Performance, PerfBucket, ProposedAction, SavedStrategy, Settings, SignalRow, StrategyInfo, Ticker, Trade, TrainingReport } from './types'
 
 const SYMBOLS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
 const TIMEFRAMES = ['1m', '5m', '15m', '1h', '4h', '1d']
@@ -1063,6 +1063,7 @@ function Dashboard({
                 <AssistantPanel
                   symbol={symbol}
                   timeframe={timeframe}
+                  tradingMode={status?.trading_mode}
                   onNavigate={setTab}
                   onError={(m) => showToast('error', m)}
                 />
@@ -2120,17 +2121,26 @@ function getSpeechRecognition(): (new () => SpeechRec) | null {
 function AssistantPanel({
   symbol,
   timeframe,
+  tradingMode,
   onNavigate,
   onError,
 }: {
   symbol: string
   timeframe: string
+  tradingMode?: string
   onNavigate: (dest: TabKey) => void
   onError: (msg: string) => void
 }) {
-  // AI replies may carry a hidden [[goto:…]] action; we keep the resolved tab on
-  // the turn so the bubble can render a "take me there" button.
-  type ChatMsg = ChatTurn & { nav?: { dest: TabKey; label: string } }
+  // AI replies may carry a hidden [[goto:…]] action (navigation) or a validated
+  // [[action:…]] proposal (place order / change setting / start-stop / train). We
+  // keep the resolved tab and/or the proposed action on the turn so the bubble can
+  // render a "take me there" button or a Confirm/Cancel card. `actionState` tracks
+  // the proposal's lifecycle so it can't be run twice.
+  type ChatMsg = ChatTurn & {
+    nav?: { dest: TabKey; label: string }
+    action?: ProposedAction
+    actionState?: 'pending' | 'running' | 'done' | 'dismissed'
+  }
   const [turns, setTurns] = useState<ChatMsg[]>([])
   const [input, setInput] = useState('')
   const [busy, setBusy] = useState(false)
@@ -2196,8 +2206,11 @@ function AssistantPanel({
         history,
       })
       // Extract any hidden navigation action; the spoken/shown text is the reply
-      // with the tag removed, and a button lets the user actually go there.
+      // with the tag removed, and a button lets the user actually go there. A
+      // validated proposed_action (order/settings/bot/train) rides along and is
+      // shown as a Confirm/Cancel card — nothing runs until the user confirms.
       const { text, dest } = parseNavAction(res.reply)
+      const action = res.proposed_action ?? undefined
       setTurns((t) => [
         ...t,
         {
@@ -2205,6 +2218,8 @@ function AssistantPanel({
           text,
           usedNews: res.used_news,
           nav: dest ? { dest, label: NAV_LABEL[dest] } : undefined,
+          action,
+          actionState: action ? 'pending' : undefined,
         },
       ])
       speak(text)
@@ -2214,6 +2229,88 @@ function AssistantPanel({
       setTurns((t) => [...t, { role: 'ai', text: `(request failed: ${msg})` }])
     } finally {
       setBusy(false)
+    }
+  }
+
+  // Mark a turn's action with a new lifecycle state (so its card can't be re-run
+  // and shows the outcome). Turns are only appended, so the index stays stable.
+  const setActionState = (idx: number, s: 'pending' | 'running' | 'done' | 'dismissed') =>
+    setTurns((t) => t.map((m, i) => (i === idx ? { ...m, actionState: s } : m)))
+  const pushResult = (text: string) => setTurns((t) => [...t, { role: 'ai', text }])
+  const dismissAction = (idx: number) => setActionState(idx, 'dismissed')
+
+  // Turn a proposed action into a human-readable card: a title, plain-English
+  // detail lines, and whether it's a real-money danger (a live order).
+  const describeAction = (
+    a: ProposedAction,
+  ): { title: string; lines: string[]; danger: boolean } => {
+    if (a.type === 'order') {
+      const live = (tradingMode || '').toLowerCase() === 'live'
+      const lines = [
+        `${a.side.toUpperCase()} ${a.symbol}`,
+        a.amount != null ? `Amount: ${a.amount}` : 'Amount: auto-sized by your risk manager',
+      ]
+      if (a.limit_price != null) lines.push(`Limit price: ${a.limit_price}`)
+      if (a.stop_loss != null) lines.push(`Stop loss: ${a.stop_loss}`)
+      if (a.take_profit != null) lines.push(`Take profit: ${a.take_profit}`)
+      if (a.stop_loss == null && a.take_profit == null && a.side !== 'close')
+        lines.push('Stop / target: your Settings defaults')
+      lines.push(live ? '⚠️ LIVE mode — a REAL order with real money.' : 'Paper mode — simulated, no real money.')
+      return { title: a.side === 'close' ? 'Close position' : 'Place order', lines, danger: live }
+    }
+    if (a.type === 'settings')
+      return { title: 'Change settings', lines: Object.entries(a.changes).map(([k, v]) => `${k} → ${v}`), danger: false }
+    if (a.type === 'bot')
+      return { title: a.state === 'start' ? 'Start the bot' : 'Stop the bot', lines: [a.state === 'start' ? 'Begin trading / monitoring per your settings.' : 'Halt autonomous trading.'], danger: false }
+    return { title: 'Train a strategy', lines: [`${a.strategy} on ${a.symbol} ${a.timeframe}`, 'Measures real results on history; saves only if it beats the baseline.'], danger: false }
+  }
+
+  // Execute a proposed action AFTER the user confirms it, by calling the SAME
+  // authenticated endpoints the manual controls use — the AI has no private path
+  // to money or settings. Report the REAL result (or the real error); leave the
+  // card re-confirmable if the server rejected it.
+  const runAction = async (idx: number, action: ProposedAction) => {
+    setActionState(idx, 'running')
+    try {
+      if (action.type === 'order') {
+        const res = await api.order({
+          action: action.side,
+          symbol: action.symbol,
+          ...(action.amount != null ? { amount: action.amount } : {}),
+          ...(action.limit_price != null ? { limit_price: action.limit_price } : {}),
+          ...(action.stop_loss != null ? { stop_loss: action.stop_loss } : {}),
+          ...(action.take_profit != null ? { take_profit: action.take_profit } : {}),
+        })
+        const tr = res.trade
+        setActionState(idx, res.accepted ? 'done' : 'pending')
+        pushResult(
+          (res.accepted ? '✅ ' : '⚠️ ') +
+            res.message +
+            (res.accepted && tr ? ` (trade #${tr.id}: ${tr.side} ${tr.amount} ${tr.symbol} @ ${tr.entry_price}, ${tr.mode})` : ''),
+        )
+        if (!res.accepted) onError(res.message)
+      } else if (action.type === 'settings') {
+        const s = await api.updateSettings(action.changes)
+        setActionState(idx, 'done')
+        pushResult('✅ Settings updated: ' + Object.keys(action.changes).map((k) => `${k}=${(s as any)[k]}`).join(', '))
+      } else if (action.type === 'bot') {
+        const res = await api.setBot(action.state)
+        setActionState(idx, 'done')
+        pushResult(`✅ Bot ${res.running ? 'started' : 'stopped'}.`)
+      } else if (action.type === 'train') {
+        const rep = await api.train(action.symbol, action.strategy, action.timeframe, true)
+        setActionState(idx, 'done')
+        pushResult(
+          rep.best
+            ? `✅ Trained ${rep.strategy} on ${rep.symbol} ${rep.timeframe}: return ${rep.best.total_return_pct.toFixed(2)}%, win ${rep.best.win_rate_pct.toFixed(1)}%, ${rep.best.num_trades} trades — ${rep.saved ? 'saved to your account.' : 'not saved (did not beat the baseline).'}${rep.warning ? ` Note: ${rep.warning}` : ''}`
+            : `ℹ️ Training ran but found no config beating the baseline${rep.warning ? ` — ${rep.warning}` : ''}.`,
+        )
+      }
+    } catch (e) {
+      const msg = (e as Error).message
+      onError(msg)
+      setActionState(idx, 'pending')
+      pushResult(`⚠️ Couldn't complete that action: ${msg}`)
     }
   }
 
@@ -2245,11 +2342,12 @@ function AssistantPanel({
 
   const suggestions = [
     'How does this app work?',
-    'Am I connected to my exchange?',
-    'How do I connect Binance and go live?',
+    'Set me up — I’m new to trading',
+    'How long have my trades been running?',
     `What's your read on ${symbol} ${timeframe}?`,
+    `Place a safe ${symbol} buy for me`,
+    'Set my stop loss to 2%',
     'How is my bot doing right now?',
-    'Take me to settings',
   ]
 
   return (
@@ -2259,11 +2357,14 @@ function AssistantPanel({
             {turns.length === 0 ? (
               <div className="chat-empty">
                 <p>
-                  Ask about your bot, a market, or your risk — or how the app
-                  works and how to do things (“how do I connect Binance?”). It sees
-                  your live, non-secret account state, can pull real headlines, and
-                  can take you to the right screen (“take me to settings”). It
-                  advises only: it can’t place orders or change settings for you.
+                  Ask about your bot, a market, or your risk — or how the app works
+                  and how to set it up (“how do I connect Binance?”, “set me up”). It
+                  sees your live, non-secret account state — positions, P&L, how long
+                  each trade has run — pulls real headlines, and can take you to the
+                  right screen. It can also DO things for you: place or close a
+                  trade, change a risk setting, start/stop the bot, or train a
+                  strategy — but it always asks you to confirm on a card first, and
+                  nothing is ever faked.
                 </p>
                 <div className="chip-row">
                   {suggestions.map((s) => (
@@ -2293,6 +2394,49 @@ function AssistantPanel({
                       Take me to {t.nav.label} →
                     </button>
                   )}
+                  {t.action && t.actionState && t.actionState !== 'dismissed' && (() => {
+                    const d = describeAction(t.action)
+                    const running = t.actionState === 'running'
+                    const done = t.actionState === 'done'
+                    return (
+                      <div className={`action-card${d.danger ? ' danger' : ''}`}>
+                        <div className="action-title">
+                          {done ? '✓ ' : '⚡ '}
+                          {d.title}
+                        </div>
+                        <ul className="action-lines">
+                          {d.lines.map((ln, k) => (
+                            <li key={k}>{ln}</li>
+                          ))}
+                        </ul>
+                        {t.action.reason && (
+                          <div className="action-reason">Why: {t.action.reason}</div>
+                        )}
+                        {done ? (
+                          <div className="action-status">Done ✓</div>
+                        ) : (
+                          <div className="action-btns">
+                            <button
+                              type="button"
+                              className="btn primary sm"
+                              onClick={() => runAction(i, t.action!)}
+                              disabled={running || busy}
+                            >
+                              {running ? 'Working…' : 'Confirm'}
+                            </button>
+                            <button
+                              type="button"
+                              className="btn ghost sm"
+                              onClick={() => dismissAction(i)}
+                              disabled={running}
+                            >
+                              Cancel
+                            </button>
+                          </div>
+                        )}
+                      </div>
+                    )
+                  })()}
                   {t.usedNews && <div className="bubble-note">grounded in live news</div>}
                 </div>
               ))

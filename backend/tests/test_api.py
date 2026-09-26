@@ -522,3 +522,200 @@ def test_switch_to_live_without_keys_is_refused(client):
     assert "live" in r.json()["detail"].lower()
     # Mode is unchanged — still paper.
     assert client.get("/api/settings").json()["trading_mode"] == "paper"
+
+
+# ---- AI assistant "hands": proposed-action validation + wiring -------------
+# The assistant SUGGESTS an action; _normalize_proposed_action turns its raw tag
+# into a safe, allowlisted proposal (or None). It never executes — that only
+# happens when the operator confirms and the frontend calls the real endpoint.
+
+
+def test_normalize_order_defaults_amount_to_none():
+    from app.main import _normalize_proposed_action
+
+    a = _normalize_proposed_action(
+        {"type": "order", "side": "buy", "symbol": "btc/usdt", "reason": "momentum"},
+        None,
+    )
+    assert a == {
+        "type": "order",
+        "side": "buy",
+        "symbol": "BTC/USDT",  # normalised upper-case
+        "reason": "momentum",
+        "amount": None,  # null => risk manager sizes it
+    }
+
+
+def test_normalize_order_rejects_bad_side_and_symbol():
+    from app.main import _normalize_proposed_action
+
+    assert _normalize_proposed_action({"type": "order", "side": "yolo", "symbol": "BTC/USDT"}, None) is None
+    assert _normalize_proposed_action({"type": "order", "side": "buy", "symbol": "BTC"}, None) is None
+
+
+def test_normalize_order_keeps_explicit_prices():
+    from app.main import _normalize_proposed_action
+
+    a = _normalize_proposed_action(
+        {"type": "order", "side": "buy", "symbol": "BTC/USDT", "amount": 0.01, "stop_loss": 60000},
+        None,
+    )
+    assert a["amount"] == 0.01
+    assert a["stop_loss"] == 60000.0
+    assert "take_profit" not in a  # omitted stays omitted (engine applies defaults)
+
+
+def test_normalize_settings_allowlist_drops_trading_mode():
+    from app.main import _normalize_proposed_action
+
+    a = _normalize_proposed_action(
+        {
+            "type": "settings",
+            "changes": {
+                "default_stop_loss_pct": "2.5",  # coerced to float
+                "max_open_positions": "3",  # coerced to int
+                "use_saved_strategy": "true",  # coerced to bool
+                "trading_mode": "live",  # NOT allowlisted -> dropped
+                "bogus_field": 1,  # unknown -> dropped
+            },
+        },
+        None,
+    )
+    assert a["type"] == "settings"
+    assert a["changes"] == {
+        "default_stop_loss_pct": 2.5,
+        "max_open_positions": 3,
+        "use_saved_strategy": True,
+    }
+    assert "trading_mode" not in a["changes"]
+
+
+def test_normalize_settings_all_unknown_is_none():
+    from app.main import _normalize_proposed_action
+
+    assert _normalize_proposed_action({"type": "settings", "changes": {"trading_mode": "live"}}, None) is None
+
+
+def test_normalize_bot_and_train():
+    from app.main import _normalize_proposed_action
+
+    assert _normalize_proposed_action({"type": "bot", "state": "start"}, None)["state"] == "start"
+    assert _normalize_proposed_action({"type": "bot", "state": "explode"}, None) is None
+    # Unknown strategy is refused; a real one from the registry is accepted.
+    assert _normalize_proposed_action({"type": "train", "symbol": "BTC/USDT", "strategy": "made_up"}, None) is None
+    t = _normalize_proposed_action(
+        {"type": "train", "symbol": "eth/usdt", "strategy": "ma_cross", "timeframe": "4h"}, None
+    )
+    assert t == {
+        "type": "train",
+        "symbol": "ETH/USDT",
+        "strategy": "ma_cross",
+        "timeframe": "4h",
+        "reason": None,
+    }
+
+
+def test_normalize_garbage_is_none():
+    from app.main import _normalize_proposed_action
+
+    assert _normalize_proposed_action(None, None) is None
+    assert _normalize_proposed_action({"type": "nonsense"}, None) is None
+    assert _normalize_proposed_action("not a dict", None) is None
+
+
+def _admin_engine():
+    """The admin user's cached engine — the same instance the endpoints use."""
+    from app.usermgr import get_manager
+    from app.database import SessionLocal
+    from app.models import User
+    from sqlalchemy import select
+
+    db = SessionLocal()
+    user = db.scalars(select(User).where(User.email == ADMIN_EMAIL)).first()
+    engine = get_manager().get(db, user)
+    uid = user.id  # read before close() so the detached instance isn't refreshed
+    db.close()
+    return engine, uid
+
+
+def test_ai_chat_returns_validated_proposed_action(client, monkeypatch):
+    # Monkeypatch the model so it "proposes" an order via the tag protocol; the
+    # endpoint must strip the tag from the reply and return the validated action.
+    engine, _ = _admin_engine()
+
+    def fake_chat(question, **kwargs):
+        return (
+            "I'll place a market buy on BTC, sized by your risk manager.\n"
+            '[[action:{"type":"order","side":"buy","symbol":"BTC/USDT","amount":null,"reason":"trend up"}]]'
+        )
+
+    monkeypatch.setattr(engine.ai, "chat", fake_chat)
+    r = client.post("/api/ai/chat", json={"question": "buy me some btc safely"})
+    assert r.status_code == 200
+    body = r.json()
+    assert "[[action" not in body["reply"]  # tag hidden from the user
+    assert body["proposed_action"] == {
+        "type": "order",
+        "side": "buy",
+        "symbol": "BTC/USDT",
+        "reason": "trend up",
+        "amount": None,
+    }
+
+
+def test_ai_chat_no_action_when_none_proposed(client, monkeypatch):
+    engine, _ = _admin_engine()
+    monkeypatch.setattr(engine.ai, "chat", lambda q, **k: "Momentum looks weak; I'd wait.")
+    r = client.post("/api/ai/chat", json={"question": "should i buy?"})
+    assert r.status_code == 200
+    assert r.json()["proposed_action"] is None
+
+
+def test_ai_chat_context_has_trading_hours(client, monkeypatch):
+    # The failing example from the field: "how many hours was my trading for". The
+    # grounding context must carry real durations derived from trade timestamps.
+    import datetime as dt
+    from app.database import SessionLocal
+    from app.models import Trade, _utcnow
+
+    engine, uid = _admin_engine()
+    db = SessionLocal()
+    tr = Trade(
+        user_id=uid,
+        symbol="BTC/USDT",
+        side="buy",
+        amount=0.01,
+        entry_price=60000.0,
+        status="open",
+        pnl=12.5,
+        mode="paper",
+        opened_at=_utcnow() - dt.timedelta(hours=5),
+    )
+    db.add(tr)
+    db.commit()
+    trade_id = tr.id
+    db.close()
+
+    captured = {}
+
+    def fake_chat(question, **kwargs):
+        captured["ctx"] = kwargs.get("bot_context") or ""
+        return "ok"
+
+    monkeypatch.setattr(engine.ai, "chat", fake_chat)
+    try:
+        r = client.post("/api/ai/chat", json={"question": "how long have i been trading?"})
+        assert r.status_code == 200
+        ctx = captured["ctx"]
+        assert "Trading activity" in ctx
+        assert "hours" in ctx
+        assert "BTC/USDT" in ctx
+        # The open position reports its running P&L direction (real, not faked).
+        assert "up" in ctx
+    finally:
+        db = SessionLocal()
+        obj = db.get(Trade, trade_id)
+        if obj:
+            db.delete(obj)
+            db.commit()
+        db.close()

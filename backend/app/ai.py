@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Optional
 
 import httpx
@@ -49,9 +50,15 @@ _SYSTEM_ASSISTANT = (
     "bot, read the current market analysis, reason about strategy/skills, weigh in "
     "on a decision, and factor in recent real news. You are risk-first and honest: "
     "you never promise profit, you flag weak/conflicted setups, and you remember "
-    "this is real money. You cannot place orders or change settings yourself — "
-    "recommend actions and tell the operator exactly which control to use; they "
-    "confirm and execute. Never ask for or repeat secrets/API keys."
+    "this is real money. You can DO things for the operator, not just talk: when "
+    "they ask you to place or close an order, change a setting, start or stop the "
+    "bot, or train a strategy, first analyse whether it's sound, then PROPOSE it "
+    "with the ACTION PROTOCOL. The app then shows them a confirmation card and "
+    "NOTHING happens until they approve it — you never execute directly and never "
+    "bypass that confirmation. You are also a patient guide for someone who "
+    "doesn't know trading: walk them through setting up and running the bot step "
+    "by step. If a request is unsafe, or you'd have to guess a real number, say so "
+    "plainly instead of inventing one. Never ask for or repeat secrets/API keys."
 )
 
 # What the assistant knows about the product itself, so "how does this work?" and
@@ -98,8 +105,10 @@ _APP_GUIDE = (
     "• News: the assistant can attach REAL public market headlines on request; an "
     "empty list means the feeds were unreachable, never fabricated.\n"
     "• The AI assistant (you): built into the app and funded by the operator — users "
-    "never enter an AI key. You advise only; you cannot place orders or change "
-    "settings.\n"
+    "never enter an AI key. You can guide a beginner through setting up and running "
+    "the bot, and you can PROPOSE actions (place or close an order, change a risk "
+    "setting, start/stop the bot, train a strategy) that the operator confirms on a "
+    "card before anything runs — you never act without that confirmation.\n"
     "• Privacy & security: keys/secrets are encrypted at rest and isolated per user. "
     "You receive only a NON-secret snapshot of the asking user's OWN account — never "
     "keys, passwords, the webhook token, or any other user's data."
@@ -120,6 +129,73 @@ _NAV_ACTIONS = (
     "destination outside that list. The tag is machine-read and hidden from the "
     "user, so keep your sentence self-contained."
 )
+
+# The assistant can also PROPOSE a real action. It never executes anything: it
+# emits one machine-read tag describing the action, the backend validates it
+# against a strict allowlist and hands the frontend a proposal, and the app shows
+# the operator a Confirm/Cancel card. Nothing touches money or settings until the
+# operator clicks Confirm. The JSON must be a FLAT object (no nested braces).
+_ACTION_GUIDE = (
+    "ACTION PROTOCOL — how you actually DO things (never without confirmation):\n"
+    "When the operator asks you to place/close a trade, change a setting, start or "
+    "stop the bot, or train a strategy, first say (briefly) what you'll do and why, "
+    "THEN append on its own final line ONE tag of the form [[action:{...}]] whose "
+    "body is a single flat JSON object. The app validates it and shows a "
+    "confirmation card; you never execute it and nothing happens until the operator "
+    "approves. Emit at most one action tag (and don't also emit a goto tag). Only "
+    "propose an action the user actually asked for or clearly agreed to. Use REAL "
+    "values from the context; if you don't have a real number, ask instead of "
+    "guessing. Shapes:\n"
+    '• Place an order: {"type":"order","side":"buy|sell|close","symbol":"BTC/USDT",'
+    '"amount":null,"reason":"one short line"}. Leave "amount" null to let the risk '
+    "manager size it safely, and OMIT stop_loss/take_profit so the bot applies the "
+    "operator's own default risk rules — that is the safe default for a beginner. "
+    'Only include "amount" (base units), "limit_price", "stop_loss" or '
+    '"take_profit" (absolute prices) when the operator gave specific numbers. '
+    '"close" exits the open position for that symbol.\n'
+    '• Change settings: {"type":"settings","changes":{"default_stop_loss_pct":2.0},'
+    '"reason":"..."}. Allowed keys ONLY: risk_per_trade_pct, daily_loss_limit_pct, '
+    "default_stop_loss_pct, default_take_profit_pct, trailing_stop_pct, "
+    "max_total_exposure_pct, max_open_positions, min_signal_confidence, "
+    "paper_taker_fee_pct, auto_trade_enabled, auto_symbols, auto_timeframe, "
+    "auto_confirm_timeframe, use_saved_strategy, ai_trade_confirm. You CANNOT switch "
+    "between paper and live here — going live is a deliberate human step, so guide "
+    "them to Settings → Trading mode for that.\n"
+    '• Start/stop the bot: {"type":"bot","state":"start|stop","reason":"..."}.\n'
+    '• Train + save a strategy: {"type":"train","symbol":"BTC/USDT",'
+    '"strategy":"ma_cross","timeframe":"1h","reason":"..."}. Training measures real '
+    "results on history and only saves if it genuinely beats the baseline.\n"
+    "The tag is hidden from the user, so keep your sentence before it self-contained."
+)
+
+
+# Flat-object only: the action JSON never nests, so [^{}] safely bounds it and we
+# can't accidentally swallow surrounding prose. Case-insensitive, whitespace-lax.
+_ACTION_TAG_RE = re.compile(
+    r"\[\[\s*action\s*:\s*(\{[^{}]*\})\s*\]\]", re.IGNORECASE | re.DOTALL
+)
+
+
+def strip_action_tag(text: str) -> tuple[str, Optional[dict]]:
+    """Pull a trailing ``[[action:{json}]]`` proposal out of an assistant reply.
+
+    Returns ``(clean_text, raw_obj_or_None)``: the reply with the machine-only tag
+    removed (it's never shown to the user) and the parsed JSON object, or None if
+    there's no tag or the JSON is malformed. Pure and defensive — never raises, so
+    a garbled tag simply yields no proposed action. Validation/allowlisting of the
+    object happens in the API layer, which knows the real settings/strategies.
+    """
+    if not text:
+        return text, None
+    m = _ACTION_TAG_RE.search(text)
+    if not m:
+        return text, None
+    clean = (text[: m.start()] + text[m.end() :]).strip()
+    try:
+        obj = json.loads(m.group(1))
+    except (ValueError, TypeError):
+        return clean, None
+    return clean, (obj if isinstance(obj, dict) else None)
 
 
 def _looks_anthropic(model: str, base_url: str) -> bool:
@@ -395,13 +471,25 @@ class AICommentator:
             + "\n\n---\n"
             + "\n\n".join(blocks)
             + "\n\n---\nAnswer helpfully and concretely for THIS bot and account. "
-            "You may recommend an action (and how to do it here), but you cannot "
-            "execute it — the operator stays in control and confirms every order. "
-            "Weigh downside first and never promise profit."
+            "If the operator is asking you to actually do something (place or close "
+            "a trade, change a setting, start/stop the bot, train a strategy), "
+            "analyse whether it's sound and then PROPOSE it with the action "
+            "protocol so they can confirm — you never execute it yourself, and the "
+            "operator stays in control of every order. Weigh downside first and "
+            "never promise profit."
         )
-        # System prompt = who you are + how the app works + how to navigate it, so
-        # the assistant can both explain the product and drive the UI on request.
-        system = _SYSTEM_ASSISTANT + "\n\n" + _APP_GUIDE + "\n\n" + _NAV_ACTIONS
+        # System prompt = who you are + how the app works + how to navigate it +
+        # how to propose real actions, so the assistant can explain the product,
+        # drive the UI, and act on the account — always behind a confirmation.
+        system = (
+            _SYSTEM_ASSISTANT
+            + "\n\n"
+            + _APP_GUIDE
+            + "\n\n"
+            + _NAV_ACTIONS
+            + "\n\n"
+            + _ACTION_GUIDE
+        )
         reply = self._post(system, prompt, history=_sanitize_history(history))
         if reply is not None:
             return reply

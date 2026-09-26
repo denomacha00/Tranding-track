@@ -14,6 +14,7 @@ import type {
   NewsItem,
   OrderBook,
   Performance,
+  ProposedAction,
   ScaledResult,
   SavedStrategy,
   Settings,
@@ -232,9 +233,10 @@ export const api = {
       body: JSON.stringify({ question, symbol, timeframe }),
     }),
   // Assistant chat: grounded in the user's OWN non-secret bot state, an optional
-  // per-symbol analysis, and (opt-in) live public news. The AI advises only — it
-  // cannot place orders or change settings. `history` carries prior turns so the
-  // assistant keeps the thread across a multi-step conversation.
+  // per-symbol analysis, and (opt-in) live public news. The AI advises and can
+  // PROPOSE an action (`proposed_action`) — it never executes: the UI shows a
+  // Confirm card and only then calls the real endpoint. `history` carries prior
+  // turns so the assistant keeps the thread across a multi-step conversation.
   aiChat: (body: {
     question: string
     symbol?: string
@@ -242,7 +244,12 @@ export const api = {
     include_news?: boolean
     history?: { role: 'user' | 'assistant'; content: string }[]
   }) =>
-    req<{ reply: string; ai_enabled: boolean; used_news: boolean }>('/api/ai/chat', {
+    req<{
+      reply: string
+      ai_enabled: boolean
+      used_news: boolean
+      proposed_action?: ProposedAction | null
+    }>('/api/ai/chat', {
       method: 'POST',
       body: JSON.stringify(body),
     }),

@@ -32,6 +32,7 @@ from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app import __version__
+from app.ai import strip_action_tag
 from app.backtest import run_backtest
 from app.config import get_settings
 from app.database import get_db, init_db
@@ -1121,6 +1122,26 @@ def _assistant_account_context(db: Session, user: User, engine) -> str:
         f"AI trade review {'on' if getattr(s, 'ai_trade_confirm', False) else 'off'}"
     )
     # __ACCOUNT_CONTEXT_TAIL__
+    now = _utcnow()
+
+    def _hours_since(ts) -> float | None:
+        """Real elapsed hours since a stored timestamp (UTC-safe), or None."""
+        if ts is None:
+            return None
+        try:
+            return max(0.0, (now - _as_utc(ts)).total_seconds() / 3600.0)
+        except Exception:
+            return None
+
+    def _fmt_dur(hours: float | None) -> str:
+        if hours is None:
+            return "unknown age"
+        if hours < 1:
+            return f"{hours * 60:.0f}m"
+        if hours < 48:
+            return f"{hours:.1f}h"
+        return f"{hours / 24:.1f}d"
+
     try:
         open_rows = db.scalars(
             select(Trade)
@@ -1128,17 +1149,75 @@ def _assistant_account_context(db: Session, user: User, engine) -> str:
             .order_by(Trade.opened_at.desc())
             .limit(10)
         ).all()
-        lines.append(
-            "- Open trades: "
-            + (
-                "; ".join(
-                    f"{t.symbol} {t.side} {t.amount}@{t.entry_price} (pnl {t.pnl})"
-                    for t in open_rows
+        if open_rows:
+            parts = []
+            for t in open_rows:
+                pnl = t.pnl or 0
+                state = "up" if pnl > 0 else "down" if pnl < 0 else "flat"
+                parts.append(
+                    f"{t.symbol} {t.side} {t.amount}@{t.entry_price} "
+                    f"(pnl {pnl} — {state}, open {_fmt_dur(_hours_since(t.opened_at))})"
                 )
-                if open_rows
-                else "none"
+            lines.append("- Open trades: " + "; ".join(parts))
+            oldest = _hours_since(
+                min((t.opened_at for t in open_rows if t.opened_at), default=None)
             )
+            if oldest is not None:
+                lines.append(
+                    f"- Oldest open position has been running {oldest:.1f} hours "
+                    f"({_fmt_dur(oldest)})"
+                )
+        else:
+            lines.append("- Open trades: none")
+    except Exception:
+        pass
+    # Real trading span + counts — this is what answers "how many hours have I
+    # been trading" honestly, from actual trade timestamps (never a made-up uptime).
+    try:
+        first_trade = db.scalars(
+            select(Trade)
+            .where(Trade.user_id == user.id)
+            .order_by(Trade.opened_at.asc())
+            .limit(1)
+        ).first()
+        total_trades = (
+            db.scalar(
+                select(func.count()).select_from(Trade).where(Trade.user_id == user.id)
+            )
+            or 0
         )
+        closed_trades = (
+            db.scalar(
+                select(func.count())
+                .select_from(Trade)
+                .where(Trade.user_id == user.id, Trade.status == "closed")
+            )
+            or 0
+        )
+        if first_trade is not None:
+            span = _hours_since(first_trade.opened_at)
+            last_close = db.scalars(
+                select(Trade)
+                .where(Trade.user_id == user.id, Trade.status == "closed")
+                .order_by(Trade.closed_at.desc())
+                .limit(1)
+            ).first()
+            since_last = (
+                _hours_since(last_close.closed_at)
+                if last_close and last_close.closed_at
+                else None
+            )
+            line = (
+                f"- Trading activity: your first trade was {_fmt_dur(span)} ago"
+                + (f" ({span:.1f} hours of history)" if span is not None else "")
+                + f"; {total_trades} trades total, {closed_trades} closed, "
+                f"{total_trades - closed_trades} still open"
+            )
+            if since_last is not None:
+                line += f"; last close {_fmt_dur(since_last)} ago"
+            lines.append(line)
+        else:
+            lines.append("- Trading activity: no trades yet on this account")
     except Exception:
         pass
     try:
@@ -1162,6 +1241,136 @@ def _assistant_account_context(db: Session, user: User, engine) -> str:
     return "\n".join(lines)
 
 
+# Fields the assistant may PROPOSE changing via chat. Deliberately EXCLUDES
+# trading_mode: switching between paper and live is a conscious human step the
+# operator takes in Settings, never something a chat proposal can flip. Every key
+# here maps to a real, schema-validated field on the settings PATCH endpoint.
+_AI_SETTINGS_FLOAT = {
+    "risk_per_trade_pct",
+    "daily_loss_limit_pct",
+    "default_stop_loss_pct",
+    "default_take_profit_pct",
+    "trailing_stop_pct",
+    "max_total_exposure_pct",
+    "min_signal_confidence",
+    "paper_taker_fee_pct",
+}
+_AI_SETTINGS_INT = {"max_open_positions"}
+_AI_SETTINGS_BOOL = {"auto_trade_enabled", "use_saved_strategy", "ai_trade_confirm"}
+_AI_SETTINGS_STR = {"auto_symbols", "auto_timeframe", "auto_confirm_timeframe"}
+
+
+def _coerce_bool(v) -> bool | None:
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s in ("true", "1", "yes", "on"):
+            return True
+        if s in ("false", "0", "no", "off"):
+            return False
+    return None
+
+
+def _normalize_proposed_action(raw: dict | None, engine) -> dict | None:
+    """Validate an AI-proposed action against a strict allowlist.
+
+    The assistant only ever SUGGESTS an action; this turns its raw tag into a
+    safe, typed proposal the frontend renders on a Confirm card — or None if it's
+    malformed or outside what we permit. Nothing here executes: real execution
+    happens only after the operator confirms and the frontend calls the normal
+    authenticated endpoint (/api/order, PATCH /api/settings, /api/bot/*,
+    /api/train), which re-checks licence, risk rules and live-trade permission.
+    Defensive on purpose — never raises; anything unexpected yields None.
+    """
+    if not isinstance(raw, dict):
+        return None
+    try:
+        atype = str(raw.get("type", "")).strip().lower()
+        reason = str(raw.get("reason", "")).strip()[:280] or None
+
+        if atype == "order":
+            side = str(raw.get("side", "")).strip().lower()
+            if side not in ("buy", "sell", "close"):
+                return None
+            symbol = str(raw.get("symbol", "")).strip().upper()
+            if not symbol or "/" not in symbol:
+                return None
+            out: dict = {
+                "type": "order",
+                "side": side,
+                "symbol": symbol,
+                "reason": reason,
+            }
+            for k in ("amount", "limit_price", "stop_loss", "take_profit"):
+                v = raw.get(k)
+                if v is None:
+                    continue
+                try:
+                    fv = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if fv > 0:
+                    out[k] = fv
+            out.setdefault("amount", None)  # null => risk manager sizes it safely
+            return out
+
+        if atype == "settings":
+            changes_in = raw.get("changes")
+            if not isinstance(changes_in, dict) or not changes_in:
+                return None
+            changes: dict = {}
+            for key, val in changes_in.items():
+                k = str(key).strip()
+                if k in _AI_SETTINGS_FLOAT:
+                    try:
+                        changes[k] = float(val)
+                    except (TypeError, ValueError):
+                        continue
+                elif k in _AI_SETTINGS_INT:
+                    try:
+                        changes[k] = int(val)
+                    except (TypeError, ValueError):
+                        continue
+                elif k in _AI_SETTINGS_BOOL:
+                    b = _coerce_bool(val)
+                    if b is not None:
+                        changes[k] = b
+                elif k in _AI_SETTINGS_STR:
+                    changes[k] = str(val).strip()
+                # Anything else (e.g. trading_mode, api keys) is silently dropped.
+            if not changes:
+                return None
+            return {"type": "settings", "changes": changes, "reason": reason}
+
+        if atype == "bot":
+            state = str(raw.get("state", "")).strip().lower()
+            if state not in ("start", "stop"):
+                return None
+            return {"type": "bot", "state": state, "reason": reason}
+
+        if atype == "train":
+            symbol = str(raw.get("symbol", "")).strip().upper()
+            if not symbol or "/" not in symbol:
+                return None
+            strategy = str(raw.get("strategy", "ma_cross")).strip()
+            if strategy not in STRATEGY_REGISTRY:
+                return None
+            timeframe = str(raw.get("timeframe", "1h")).strip() or "1h"
+            return {
+                "type": "train",
+                "symbol": symbol,
+                "strategy": strategy,
+                "timeframe": timeframe,
+                "reason": reason,
+            }
+    except Exception:
+        return None
+    return None
+
+
 @app.post("/api/ai/chat")
 def ai_chat(
     payload: dict,
@@ -1173,8 +1382,10 @@ def ai_chat(
 
     Privacy: only NON-secret context (mode, risk config, position/PnL summary) and
     public headlines are sent to the user's OWN configured AI provider — never
-    exchange keys, passwords, or any other user's data. The assistant advises; it
-    cannot place orders or change settings (the operator confirms and acts).
+    exchange keys, passwords, or any other user's data. The assistant may PROPOSE
+    an action (order/settings/bot/train), returned as ``proposed_action``; it never
+    executes anything — the operator confirms on a card and the frontend then calls
+    the normal authenticated endpoint.
     """
     _enforce_rate_limit(request, "ai", limit=20, window_seconds=60)
     question = str(payload.get("question", "")).strip()
@@ -1251,7 +1462,19 @@ def ai_chat(
         news=news or None,
         history=history,
     )
-    return {"reply": reply, "ai_enabled": engine.ai.available, "used_news": used_news}
+    # The reply may carry a hidden [[action:{...}]] tag proposing a real action.
+    # Strip it (never shown raw) and validate it into a safe, typed proposal the UI
+    # confirms before anything runs. No AI key -> chat() returned a plain string ->
+    # no tag -> no action. Execution only happens when the operator confirms and the
+    # frontend calls the normal authenticated endpoint.
+    clean_reply, raw_action = strip_action_tag(reply)
+    proposed_action = _normalize_proposed_action(raw_action, engine)
+    return {
+        "reply": clean_reply,
+        "ai_enabled": engine.ai.available,
+        "used_news": used_news,
+        "proposed_action": proposed_action,
+    }
 
 
 @app.get("/api/ai/health")

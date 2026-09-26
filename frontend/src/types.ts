@@ -65,6 +65,32 @@ export interface ChatTurn {
   usedNews?: boolean
 }
 
+// An action the assistant PROPOSES the user take. The AI never executes anything:
+// the backend validates its suggestion against a strict allowlist and returns one
+// of these, the UI shows a Confirm/Cancel card, and only on Confirm does the app
+// call the normal authenticated endpoint. `reason` is the AI's one-line rationale.
+export type ProposedAction =
+  | {
+      type: 'order'
+      side: 'buy' | 'sell' | 'close'
+      symbol: string
+      // null => let the risk manager size it (the safe default). A number is base units.
+      amount: number | null
+      limit_price?: number
+      stop_loss?: number
+      take_profit?: number
+      reason?: string | null
+    }
+  | { type: 'settings'; changes: Partial<Settings>; reason?: string | null }
+  | { type: 'bot'; state: 'start' | 'stop'; reason?: string | null }
+  | {
+      type: 'train'
+      symbol: string
+      strategy: string
+      timeframe: string
+      reason?: string | null
+    }
+
 export interface Settings {
   trading_mode: string
   binance_testnet: boolean
