@@ -598,7 +598,30 @@ class BinanceConnector:
             else:
                 result["detail"] = f"account read failed: {msg}"
             return result
-        # 3) infer trading permission from reported account permissions
+        # 3) determine TRADE permission — whether THIS key can place spot orders.
+        #    The most reliable signal is the key's OWN restrictions, not just the
+        #    account's: a read-only key on a spot-eligible account still cannot
+        #    trade. Read that where available; otherwise fall back to the
+        #    account's reported permissions.
+        key_spot = self._key_spot_trading_enabled()
+        if key_spot is not None:
+            result["can_trade"] = key_spot
+            result["ok"] = key_spot
+            result["detail"] = (
+                "trading enabled (this API key has Spot & Margin trading)"
+                if key_spot
+                else (
+                    "key can read your account but this API key does NOT have "
+                    "Spot trading enabled — you can see real balances and market "
+                    "data, but to place orders turn on 'Enable Spot & Margin "
+                    "Trading' for the key in Binance API Management (and clear any "
+                    "IP restriction that blocks this server)."
+                )
+            )
+            return result
+        # Fall back to the account's reported permissions when the key-level
+        # signal isn't available (testnet has no sapi, non-binance venues differ,
+        # or the endpoint erroring).
         perms = self._account_permissions(balance)
         if perms is None:
             # Exchange didn't expose permissions; a successful private read means
@@ -607,7 +630,19 @@ class BinanceConnector:
             result["ok"] = True
             result["detail"] = "account readable; trading permission not reported (assumed enabled)"
             return result
-        if any(p.lower() in ("spot", "trd_grp_002", "trd_grp_003") or "spot" in p.lower() for p in perms):
+        # Binance reports spot-trade authorization either as "SPOT" or as a
+        # trade-group tag "TRD_GRP_NNN" (002, 003, 004 … 061 …). Per Binance, a
+        # TRD_GRP entry means the account IS authorized to trade that group's
+        # symbols — it's a spot permission, just region/eligibility-scoped. New
+        # groups are minted over time, so match the whole TRD_GRP_* family rather
+        # than a hardcoded few; otherwise a genuinely tradeable account (e.g.
+        # TRD_GRP_061) is wrongly told Spot trading is off and blocked from going
+        # live. MARGIN / LEVERAGED are named separately and are NOT spot.
+        def _is_spot_perm(p: str) -> bool:
+            pl = p.lower()
+            return "spot" in pl or pl.startswith("trd_grp_")
+
+        if any(_is_spot_perm(p) for p in perms):
             result["can_trade"] = True
             result["ok"] = True
             result["detail"] = f"trading enabled (permissions: {', '.join(perms)})"
@@ -632,3 +667,29 @@ class BinanceConnector:
         except Exception:
             pass
         return None
+
+    def _key_spot_trading_enabled(self) -> Optional[bool]:
+        """Whether THIS API key may place spot orders, read from the key's own
+        restrictions (GET /sapi/v1/account/apiRestrictions ->
+        ``enableSpotAndMarginTrading``).
+
+        This reflects the KEY, not just the account: a read-only key on a
+        spot-eligible account (e.g. permissions ``TRD_GRP_061``) returns False
+        here, so we never tell the user they can trade when their key can't.
+        Returns None when the signal isn't available — testnet has no sapi,
+        non-binance venues differ, or the endpoint errors — so the caller falls
+        back to account-permission inference. Never places an order.
+        """
+        if self._exchange_id != "binance" or self._settings.binance_testnet:
+            return None
+        fn = getattr(self._client, "sapiGetAccountApiRestrictions", None)
+        if not callable(fn):
+            return None
+        try:
+            res = fn()
+        except Exception as exc:  # endpoint disabled / region-blocked / etc.
+            logger.info("apiRestrictions probe unavailable: %s", exc)
+            return None
+        if not isinstance(res, dict) or "enableSpotAndMarginTrading" not in res:
+            return None
+        return bool(res.get("enableSpotAndMarginTrading"))

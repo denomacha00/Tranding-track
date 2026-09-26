@@ -50,6 +50,16 @@ def _conn_with_creds() -> BinanceConnector:
     return conn
 
 
+def _live_conn_with_creds() -> BinanceConnector:
+    # Real-binance, testnet OFF: exercises the key-level apiRestrictions probe
+    # (sapi is real-binance only, so the testnet default would skip it).
+    conn = BinanceConnector(
+        Settings(binance_api_key="k", binance_api_secret="s", binance_testnet=False)
+    )
+    conn._client = FakeClient()
+    return conn
+
+
 def test_stop_loss_order_placed_with_stop_price():
     conn = _conn_with_creds()
     order = conn.create_stop_loss_order("BTC/USDT", "sell", 0.5, 40_000.0)
@@ -172,6 +182,20 @@ def test_access_ok_with_spot_permission():
     assert res["can_trade"] is True
 
 
+def test_access_ok_with_trade_group_permission():
+    # Region/eligibility-scoped accounts report a trade-group tag ("TRD_GRP_NNN")
+    # instead of a bare "SPOT" — but they ARE authorized to trade the group's
+    # symbols. Any TRD_GRP_* must count as spot-tradeable (not just a hardcoded
+    # few), so a real account like TRD_GRP_061 isn't falsely blocked from live.
+    for perms in (["TRD_GRP_061"], ["LEVERAGED", "TRD_GRP_061"], ["TRD_GRP_250"]):
+        conn = _conn_with_creds()
+        conn._client.fetch_time = lambda: 123
+        conn._client.fetch_balance = lambda perms=perms: {"info": {"permissions": perms}}
+        res = conn.check_trading_access()
+        assert res["can_trade"] is True, perms
+        assert res["ok"] is True, perms
+
+
 def test_access_ok_when_permissions_not_reported():
     conn = _conn_with_creds()
     conn._client.fetch_time = lambda: 123
@@ -198,3 +222,75 @@ def test_access_cantrade_flag_false():
     res = conn.check_trading_access()
     assert res["can_trade"] is False
     assert res["ok"] is False
+
+
+# ---- key-level Spot-trading probe (apiRestrictions) -----------------
+# On REAL binance the authoritative signal for "can THIS key place spot orders"
+# is the key's OWN restrictions (GET /sapi/v1/account/apiRestrictions ->
+# enableSpotAndMarginTrading), NOT the account's permissions: a read-only key on
+# a spot-eligible account (e.g. TRD_GRP_061) reads balances fine but still can't
+# trade. These use _live_conn_with_creds() (testnet OFF) so the probe runs.
+
+
+def test_access_readonly_key_sees_account_but_cannot_trade():
+    # Read-only key on a spot-eligible (TRD_GRP_061) account: the account reads
+    # fine (real balances + market data), but the KEY has Spot trading OFF, so
+    # can_trade is honestly False while can_read_account stays True.
+    conn = _live_conn_with_creds()
+    conn._client.fetch_time = lambda: 123
+    conn._client.fetch_balance = lambda: {"info": {"permissions": ["TRD_GRP_061"]}}
+    conn._client.sapiGetAccountApiRestrictions = lambda: {
+        "enableReading": True,
+        "enableSpotAndMarginTrading": False,
+    }
+    res = conn.check_trading_access()
+    assert res["can_read_account"] is True
+    assert res["can_trade"] is False
+    assert res["ok"] is False
+    assert "Spot" in res["detail"]
+
+
+def test_access_key_with_spot_trading_can_trade():
+    conn = _live_conn_with_creds()
+    conn._client.fetch_time = lambda: 123
+    conn._client.fetch_balance = lambda: {"info": {"permissions": ["TRD_GRP_061"]}}
+    conn._client.sapiGetAccountApiRestrictions = lambda: {
+        "enableReading": True,
+        "enableSpotAndMarginTrading": True,
+    }
+    res = conn.check_trading_access()
+    assert res["can_trade"] is True
+    assert res["ok"] is True
+
+
+# __MORE_KEY_TESTS__
+
+
+def test_access_key_restrictions_override_account_permissions():
+    # Even when the account reports plain "SPOT", a read-only KEY must still be
+    # reported as unable to trade — the key-level signal is authoritative.
+    conn = _live_conn_with_creds()
+    conn._client.fetch_time = lambda: 123
+    conn._client.fetch_balance = lambda: {"info": {"permissions": ["SPOT"]}}
+    conn._client.sapiGetAccountApiRestrictions = lambda: {
+        "enableSpotAndMarginTrading": False,
+    }
+    res = conn.check_trading_access()
+    assert res["can_trade"] is False
+    assert res["ok"] is False
+
+
+def test_access_falls_back_to_permissions_when_apirestrictions_errors():
+    # If the key-restrictions endpoint is unavailable (disabled/region-blocked),
+    # fall back to the account's reported permissions rather than hard-failing.
+    conn = _live_conn_with_creds()
+    conn._client.fetch_time = lambda: 123
+    conn._client.fetch_balance = lambda: {"info": {"permissions": ["SPOT"]}}
+
+    def boom():
+        raise ccxt.ExchangeError("apiRestrictions disabled")
+
+    conn._client.sapiGetAccountApiRestrictions = boom
+    res = conn.check_trading_access()
+    assert res["can_trade"] is True
+    assert res["ok"] is True
