@@ -497,6 +497,28 @@ class TradingEngine:
             )
         return None
 
+    def _friendly_exchange_error(self, exc: Exception, action: str = "order") -> str:
+        """Turn a raw exchange rejection into plain, actionable guidance.
+
+        A -2015 ("Invalid API-key, IP, or permissions") on an order almost always
+        means the key can READ the account but Spot trading isn't enabled (or an
+        IP restriction blocks this server) — the same read-only case the
+        pre-check catches. If that pre-check was bypassed (trade-access couldn't
+        be probed, e.g. the apiRestrictions endpoint was unavailable), still give
+        the user the real reason instead of a cryptic code. Nothing is fabricated:
+        it only rephrases an error the exchange actually returned."""
+        msg = str(exc)
+        if "-2015" in msg or "Invalid API-key" in msg or "permissions for action" in msg:
+            return (
+                "Can't place this order: your Binance API key can read your real "
+                "account and market data, but Spot trading isn't enabled for the "
+                "key (or an IP restriction is blocking this server). Turn on "
+                "'Enable Spot & Margin Trading' for the key in Binance API "
+                "Management, clear any IP limit, then run Test connection. Nothing "
+                "was traded."
+            )
+        return f"Exchange {action} failed: {msg}"
+
     def reset_paper_data(self, db: Session) -> dict[str, Any]:
         """Wipe this account's SIMULATED (paper) history for a clean slate.
 
@@ -693,7 +715,7 @@ class TradingEngine:
                         )
                         exchange_order_id = str(order.get("id")) if order else None
                     except Exception as exc:
-                        return False, f"Exchange limit order failed: {exc}", None
+                        return False, self._friendly_exchange_error(exc, "limit order"), None
                 else:
                     # Paper: reserve notional now so equity/exposure is honest
                     # while the order rests; released if cancelled, consumed on fill.
@@ -752,7 +774,7 @@ class TradingEngine:
                     filled_price = float(order.get("average") or order.get("price") or price)
                     price = filled_price
                 except Exception as exc:
-                    return False, f"Exchange order failed: {exc}", None
+                    return False, self._friendly_exchange_error(exc, "order"), None
             else:
                 # Paper: reserve notional from the paper wallet.
                 self.paper_balance -= qty * price
@@ -837,7 +859,7 @@ class TradingEngine:
                     exchange_order_id = str(order.get("id")) if order else None
                     price = float(order.get("average") or order.get("price") or price)
                 except Exception as exc:
-                    return False, f"Exchange order failed: {exc}", None
+                    return False, self._friendly_exchange_error(exc, "order"), None
             else:
                 self.paper_balance -= qty * price
                 save_paper_balance(db, self.paper_balance, self.user_id)
@@ -881,7 +903,7 @@ class TradingEngine:
                 order = self.connector.create_limit_order(symbol, "buy", qty, lp)
                 exchange_order_id = str(order.get("id")) if order else None
             except Exception as exc:
-                return False, f"Exchange limit order failed: {exc}", None
+                return False, self._friendly_exchange_error(exc, "limit order"), None
         else:
             self.paper_balance -= qty * lp
             save_paper_balance(db, self.paper_balance, self.user_id)
@@ -1232,6 +1254,12 @@ class TradingEngine:
         price = self._price(trade.symbol, fallback=trade.entry_price)
 
         if self.settings.is_live:
+            # Read-only key? Say so honestly BEFORE touching the exchange, so the
+            # user gets the same clear "enable Spot" guidance as on the open path
+            # instead of a raw -2015 after they've confirmed the close.
+            ro = self._live_readonly_block()
+            if ro:
+                return False, ro, None
             # Cancel any resting exchange-side stop before we market-close, so it
             # can't fire later against a position we no longer hold.
             if trade.stop_order_id:
@@ -1243,7 +1271,7 @@ class TradingEngine:
                     trade.symbol, close_side, trade.amount
                 )
             except Exception as exc:
-                return False, f"Exchange close failed: {exc}", None
+                return False, self._friendly_exchange_error(exc, "close"), None
             # Book PnL at the price we ACTUALLY got, not the pre-trade ticker: a
             # market-close fill can differ from the last quote (slippage/spread).
             # Fall back to the ticker price if the venue reports no average.
