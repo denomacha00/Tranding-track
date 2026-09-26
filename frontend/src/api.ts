@@ -259,6 +259,18 @@ export const api = {
   news: (limit = 8) =>
     req<{ items: NewsItem[]; errors: string[] }>(`/api/news?limit=${limit}`),
   exchangeAccess: () => req<ExchangeAccess>('/api/exchange/access'),
+  // Real tradable spot pairs from the configured exchange (ccxt load_markets),
+  // so the pair selector reflects what ACTUALLY exists on Binance rather than a
+  // hardcoded list. Empty list = markets unreachable (honest, never fabricated).
+  symbols: (quote = 'USDT') =>
+    req<{ symbols: string[]; quote: string }>(`/api/symbols?quote=${quote}`),
+  // Clean slate for SIMULATED data: wipe this account's paper trades + signal
+  // log and reset the paper wallet. Real (live) trades are never touched.
+  resetPaperData: () =>
+    req<{ trades_deleted: number; signals_deleted: number; paper_balance: number }>(
+      '/api/paper/reset',
+      { method: 'POST' },
+    ),
   // Real reachability of the app-wide AI provider (no secrets). Lets the
   // assistant show "connected" or the concrete reason it can't answer.
   aiHealth: () => req<AiHealth>('/api/ai/health'),

@@ -745,6 +745,32 @@ def exchange_access(
     return _engine_for(db, user).connector.check_trading_access()
 
 
+@app.get("/api/symbols")
+def list_symbols(
+    quote: str = "USDT",
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Real, tradable spot pairs from the configured exchange (via ccxt
+    load_markets), so the UI's pair selector reflects what actually exists on
+    Binance instead of a hardcoded list. Empty list = markets unreachable."""
+    engine = _engine_for(db, user)
+    try:
+        symbols = engine.connector.list_symbols(quote=quote)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not list symbols: {exc}")
+    return {"symbols": symbols, "quote": (quote or "USDT").upper()}
+
+
+@app.post("/api/paper/reset")
+def reset_paper(
+    db: Session = Depends(get_db), user: User = Depends(require_licensed_user)
+):
+    """Clean slate for SIMULATED data: delete this user's paper trades + signal
+    log and reset the paper wallet. Real (live) trades are preserved."""
+    return _engine_for(db, user).reset_paper_data(db)
+
+
 @app.post("/api/bot/{state}")
 def set_bot_state(
     state: str,
@@ -811,18 +837,21 @@ def update_settings(
     s = engine.settings
     data = update.model_dump(exclude_unset=True)
     # SAFETY GATE: before flipping to LIVE (real money), verify this user's keys
-    # actually exist and can TRADE. Switching to live without a permissioned key
-    # would let the bot *think* it's trading live while every order silently
-    # fails — the opposite of "a money task is serious". We refuse with the real
-    # reason instead. Only runs on the OFF→LIVE transition; paper is never gated.
+    # actually exist and can READ the real account. Live mode then shows REAL
+    # balances and market data (never fake paper numbers). Order PLACEMENT is
+    # gated separately at execution time — a read-only key sees real data but
+    # can't trade until Spot/IP is enabled — so "live" always means real data,
+    # and never means silently-failing orders. Only runs on OFF→LIVE; paper is
+    # never gated.
     if data.get("trading_mode") == "live" and s.trading_mode != "live":
         if not (user.binance_api_key_enc and user.binance_api_secret_enc):
             raise HTTPException(
                 status_code=400,
                 detail=(
                     "Can't switch to LIVE: no exchange API key is set for your "
-                    "account. Add Binance API keys (with Spot trading permission) "
-                    "under Keys first, then switch to live."
+                    "account. Add Binance API keys under Keys first, then switch "
+                    "to live. Trading needs Spot permission; read-only keys still "
+                    "show your real account and market data."
                 ),
             )
         try:
@@ -830,16 +859,16 @@ def update_settings(
         except Exception as exc:
             raise HTTPException(
                 status_code=502,
-                detail=f"Can't verify live trading access right now: {exc}",
+                detail=f"Can't verify live account access right now: {exc}",
             )
-        if not access.get("can_trade"):
+        if not access.get("can_read_account"):
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    "Can't switch to LIVE: your API key can't place trades. "
-                    + (access.get("detail") or "Check the key's Spot trading "
-                       "permission, IP restrictions, and that it matches the "
-                       "configured exchange/testnet.")
+                    "Can't switch to LIVE: your API key can't read your Binance "
+                    "account yet, so live mode would have no real data to show. "
+                    + (access.get("detail") or "Check the key, its IP "
+                       "restriction, and that testnet is off for a real key.")
                 ),
             )
     for key, value in data.items():

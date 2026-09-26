@@ -183,6 +183,10 @@ function Dashboard({
   const [tickerStale, setTickerStale] = useState(false)
   const [symbol, setSymbol] = useState(SYMBOLS[0])
   const [timeframe, setTimeframe] = useState('1h')
+  // Real tradable pairs pulled from the exchange (see effect below). Seeded with
+  // the majors as a fallback so the picker is never empty if markets are briefly
+  // unreachable; replaced with the live Binance listing once it loads.
+  const [symbolList, setSymbolList] = useState<string[]>(SYMBOLS)
   // Free-text draft for the symbol box (committed on Enter/blur) so you can
   // chart ANY pair, not just the presets, without reloading on every keystroke.
   const [symbolDraft, setSymbolDraft] = useState(SYMBOLS[0])
@@ -331,6 +335,30 @@ function Dashboard({
     }
   }, [refreshAccess, showToast])
 
+  // Wipe SIMULATED (paper) data for a clean slate. The backend never touches
+  // real (live) trades. Refreshes the tables and wallet so the reset shows
+  // immediately. Guarded by a confirm — it can't be undone.
+  const resetPaper = useCallback(async () => {
+    const ok = window.confirm(
+      'Reset ALL paper (simulated) data?\n\n' +
+        'This deletes your paper trades and signal history and resets the paper ' +
+        'wallet to its starting balance. Your real (live) trades are NOT touched. ' +
+        'This cannot be undone.',
+    )
+    if (!ok) return
+    try {
+      const res = await api.resetPaperData()
+      await Promise.all([refreshTrades(), refreshSignals()])
+      api.status().then(applyStatus).catch(() => {})
+      showToast(
+        'ok',
+        `Paper data cleared — wallet reset to ${res.paper_balance.toLocaleString()} USDT`,
+      )
+    } catch (e) {
+      showToast('error', e instanceof Error ? e.message : 'Could not reset paper data')
+    }
+  }, [refreshTrades, refreshSignals, applyStatus, showToast])
+
   // Initial load.
   useEffect(() => {
     api.status().then(applyStatus).catch(() => {})
@@ -340,6 +368,19 @@ function Dashboard({
     refreshTrades()
     refreshSignals()
   }, [loadSettings, refreshAccess, loadAiHealth, refreshTrades, refreshSignals, applyStatus])
+
+  // Pull the REAL tradable pairs from the exchange once, so the symbol picker
+  // reflects what actually exists on Binance instead of a hardcoded guess. If
+  // the venue is briefly unreachable it returns [] and we keep the majors
+  // fallback — never a fabricated list.
+  useEffect(() => {
+    api
+      .symbols()
+      .then((r) => {
+        if (r.symbols && r.symbols.length) setSymbolList(r.symbols)
+      })
+      .catch(() => {})
+  }, [])
 
   // Poll the trades table on a slow cadence as a safety net. Trade changes are
   // normally pushed over the WebSocket (see onEvent), but if the socket drops
@@ -809,7 +850,7 @@ function Dashboard({
                   title="Type any Binance pair (e.g. DOGE/USDT) and press Enter"
                 />
                 <datalist id="symbol-presets">
-                  {SYMBOLS.map((s) => (
+                  {symbolList.map((s) => (
                     <option key={s} value={s} />
                   ))}
                 </datalist>
@@ -1096,6 +1137,7 @@ function Dashboard({
                   }}
                   onMeChanged={onMeChanged}
                   onError={(msg) => showToast('error', msg)}
+                  onResetPaper={resetPaper}
                 />
               )}
               {tab === 'admin' && me.role === 'admin' && (
@@ -3231,6 +3273,7 @@ function SettingsPanel({
   onSaved,
   onMeChanged,
   onError,
+  onResetPaper,
 }: {
   settings: Settings | null
   loadError: boolean
@@ -3241,6 +3284,7 @@ function SettingsPanel({
   onSaved: (s: Settings) => void
   onMeChanged: (m: Me) => void
   onError: (msg: string) => void
+  onResetPaper: () => void
 }) {
   const [form, setForm] = useState<Settings | null>(settings)
   const [copied, setCopied] = useState(false)
@@ -3556,6 +3600,20 @@ function SettingsPanel({
       <button className="btn primary" onClick={save}>
         Save settings
       </button>
+
+      <div className="panel" style={{ marginTop: 6 }}>
+        <div className="panel-head">Paper (simulated) data</div>
+        <div className="panel-body">
+          <p className="hint" style={{ marginTop: 0 }}>
+            Start fresh: delete your <b>paper</b> trades and signal history and
+            reset the simulated wallet to its starting balance. Your <b>real</b>{' '}
+            (live) trades are never touched. This can't be undone.
+          </p>
+          <button className="btn" onClick={onResetPaper}>
+            Reset paper data
+          </button>
+        </div>
+      </div>
 
       <CredentialsCard
         me={me}

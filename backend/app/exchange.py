@@ -83,6 +83,11 @@ class BinanceConnector:
         # Which venue actually served the most recent public read — an honest
         # label for the UI/logs: the primary exchange id, or the fallback id.
         self.last_data_source: str = "binance"
+        # Cached trade-access probe (set by check_trading_access). Lets the
+        # engine's read-only guard block live ORDER placement without a network
+        # round-trip per order. None = not probed yet (unknown).
+        self._can_trade: Optional[bool] = None
+        self._can_read_account: Optional[bool] = None
         self._connect()
 
     def _connect(self) -> None:
@@ -185,10 +190,27 @@ class BinanceConnector:
             self._settings.binance_api_key and self._settings.binance_api_secret
         )
 
+    @property
+    def can_trade(self) -> Optional[bool]:
+        """Cached result of the last trade-access probe: True if the key can
+        place orders, False if it can only read (or nothing), None if not yet
+        probed. Used by the engine to block live order placement for a
+        read-only key without pretending the order went through."""
+        return self._can_trade
+
+    @property
+    def can_read_account(self) -> Optional[bool]:
+        """Cached: True if the key can read the real account balance."""
+        return self._can_read_account
+
     def reload(self, settings: Settings) -> None:
         """Recreate the client, e.g. after settings change."""
         self._settings = settings
         self._markets: dict[str, Any] | None = None
+        # Endpoint or credentials may have changed — invalidate the cached
+        # trade-access so the next probe re-evaluates against the new key.
+        self._can_trade = None
+        self._can_read_account = None
         self._connect()
 
     # ---- markets / precision ----------------------------------------
@@ -205,6 +227,34 @@ class BinanceConnector:
             logger.warning("load_markets failed: %s", exc)
             self._markets = {}
         return self._markets
+
+    def list_symbols(self, quote: str = "USDT", limit: int = 300) -> list[str]:
+        """Real, tradable spot symbols from the exchange (e.g. 'BTC/USDT').
+
+        Sourced from ccxt ``load_markets()`` — the venue's ACTUAL listings, never
+        a hardcoded guess. Filtered to active spot pairs with the given quote so
+        the UI only offers pairs that really exist on Binance. A handful of
+        majors are hoisted to the top for convenience; the rest follow
+        alphabetically. Returns [] if the market list can't be loaded (honest
+        empty, never fabricated)."""
+        markets = self._load_markets()
+        if not markets:
+            return []
+        q = (quote or "USDT").upper()
+        out: list[str] = []
+        for sym, m in markets.items():
+            try:
+                is_spot = bool(m.get("spot", m.get("type") == "spot"))
+                if is_spot and m.get("active", True) and (m.get("quote") or "").upper() == q:
+                    out.append(sym)
+            except Exception:
+                continue
+        out.sort()
+        majors = [f"BTC/{q}", f"ETH/{q}", f"BNB/{q}", f"SOL/{q}", f"XRP/{q}"]
+        front = [s for s in majors if s in out]
+        rest = [s for s in out if s not in front]
+        ordered = front + rest
+        return ordered[:limit] if limit else ordered
 
     def normalize_amount(
         self, symbol: str, amount: float, price: float
@@ -458,6 +508,15 @@ class BinanceConnector:
     # ---- health / permissions ---------------------------------------
 
     def check_trading_access(self) -> dict[str, Any]:
+        """Probe trade access and CACHE the result on the connector, so the
+        engine's read-only guard can cheaply block live order placement for a
+        key that can read the account but not trade."""
+        result = self._probe_trading_access()
+        self._can_trade = bool(result.get("can_trade"))
+        self._can_read_account = bool(result.get("can_read_account"))
+        return result
+
+    def _probe_trading_access(self) -> dict[str, Any]:
         """Probe whether the configured key can actually TRADE, not just read.
 
         Returns a dict: {ok, can_read_public, can_read_account, can_trade,

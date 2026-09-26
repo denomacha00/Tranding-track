@@ -719,3 +719,149 @@ def test_ai_chat_context_has_trading_hours(client, monkeypatch):
             db.delete(obj)
             db.commit()
         db.close()
+
+
+# ---- read-only live data mode / real symbols / paper reset -----------------
+# Product rule: LIVE means REAL data. A read-only key (reads the account but
+# Spot trading not enabled) must still flip to live and show real balances and
+# market data, while ORDER placement is refused with an honest message — never a
+# fake fill, never a silent -2015.
+
+def _sub_client(email, password="password123"):
+    """A TestClient authenticated as a freshly-signed-up (auto-licensed) user."""
+    c = TestClient(app)
+    r = c.post("/api/auth/signup", json={
+        "username": email.split("@", 1)[0], "email": email, "password": password,
+    })
+    if r.status_code == 409:
+        r = c.post("/api/auth/login", json={"identifier": email, "password": password})
+    c.headers.update({"Authorization": f"Bearer {r.json()['access_token']}"})
+    return c
+
+
+def _engine_by_email(email):
+    from app.usermgr import get_manager
+    from app.database import SessionLocal
+    from app.models import User
+    from sqlalchemy import select
+    db = SessionLocal()
+    try:
+        user = db.scalars(select(User).where(User.email == email)).first()
+        return get_manager().get(db, user), user.id
+    finally:
+        db.close()
+
+# __APPEND_MARKER__
+
+def test_live_switch_allows_readonly_key_and_blocks_orders(client):
+    email = "ro-live@example.com"
+    c = _sub_client(email)
+    assert c.put("/api/credentials", json={
+        "binance_api_key": "k" * 12, "binance_api_secret": "s" * 12,
+        "binance_testnet": False,
+    }).status_code == 200
+    eng, _ = _engine_by_email(email)
+    # Account READABLE, trading NOT enabled — the real read-only situation.
+    eng.connector._probe_trading_access = lambda: {
+        "ok": True, "can_read_public": True, "can_read_account": True,
+        "can_trade": False, "detail": "read-only key",
+    }
+    r = c.patch("/api/settings", json={"trading_mode": "live"})
+    assert r.status_code == 200, r.text
+    assert r.json()["trading_mode"] == "live"  # live allowed with a read-only key
+    # Real data is live; placing an order is refused honestly (200 + accepted False).
+    r = c.post("/api/order", json={
+        "action": "buy", "symbol": "BTC/USDT", "amount": 0.001,
+    })
+    assert r.status_code == 200
+    body = r.json()
+    assert body["accepted"] is False
+    assert "read-only" in body["message"].lower()
+    assert eng.connector.can_trade is False  # probe result cached on the connector
+
+
+def test_live_switch_refused_when_account_unreadable(client):
+    email = "noread-live@example.com"
+    c = _sub_client(email)
+    assert c.put("/api/credentials", json={
+        "binance_api_key": "k" * 12, "binance_api_secret": "s" * 12,
+        "binance_testnet": False,
+    }).status_code == 200
+    eng, _ = _engine_by_email(email)
+    eng.connector._probe_trading_access = lambda: {
+        "ok": False, "can_read_public": True, "can_read_account": False,
+        "can_trade": False, "detail": "key can't read account",
+    }
+    r = c.patch("/api/settings", json={"trading_mode": "live"})
+    assert r.status_code == 400  # no real data to show -> refuse the switch
+    assert "can't read" in r.json()["detail"].lower()
+
+# __APPEND_MARKER2__
+
+def test_reset_paper_data_preserves_live_trades(client):
+    from app.database import SessionLocal
+    from app.models import Trade, SignalLog, TradeStatus
+    from sqlalchemy import select
+    email = "reset-paper@example.com"
+    _sub_client(email)
+    eng, uid = _engine_by_email(email)
+    db = SessionLocal()
+    try:
+        db.add(Trade(user_id=uid, symbol="BTC/USDT", side="buy", amount=0.1,
+                     entry_price=100.0, status=TradeStatus.open.value, mode="paper"))
+        db.add(Trade(user_id=uid, symbol="ETH/USDT", side="buy", amount=1.0,
+                     entry_price=50.0, status=TradeStatus.open.value, mode="live"))
+        db.add(SignalLog(user_id=uid, source="analyzer", symbol="BTC/USDT",
+                         action="buy", raw="{}", accepted=1))
+        db.commit()
+        eng.paper_balance = 12345.0
+        out = eng.reset_paper_data(db)
+        assert out["trades_deleted"] == 1
+        assert out["signals_deleted"] == 1
+        assert out["paper_balance"] == eng.settings.paper_starting_balance
+        paper = db.scalars(select(Trade).where(
+            Trade.user_id == uid, Trade.mode == "paper")).all()
+        live = db.scalars(select(Trade).where(
+            Trade.user_id == uid, Trade.mode == "live")).all()
+        assert len(paper) == 0 and len(live) == 1  # real trades untouched
+    finally:
+        for t in db.scalars(select(Trade).where(Trade.user_id == uid)).all():
+            db.delete(t)
+        db.commit()
+        db.close()
+
+# __APPEND_MARKER3__
+
+def test_connector_list_symbols_filters_and_hoists():
+    from app.exchange import BinanceConnector
+    from app.config import Settings
+    conn = BinanceConnector(Settings())
+    conn._markets = {
+        "AAVE/USDT": {"spot": True, "active": True, "quote": "USDT"},
+        "BTC/USDT": {"spot": True, "active": True, "quote": "USDT"},
+        "ETH/USDT": {"spot": True, "active": True, "quote": "USDT"},
+        "DOGE/BTC": {"spot": True, "active": True, "quote": "BTC"},    # wrong quote
+        "OLD/USDT": {"spot": True, "active": False, "quote": "USDT"},  # inactive
+        "PERP/USDT": {"spot": False, "active": True, "quote": "USDT"}, # not spot
+    }
+    syms = conn.list_symbols(quote="USDT")
+    assert syms[:2] == ["BTC/USDT", "ETH/USDT"]  # majors hoisted, in order
+    assert "AAVE/USDT" in syms                    # other real USDT spot pair kept
+    assert "DOGE/BTC" not in syms                 # wrong quote filtered out
+    assert "OLD/USDT" not in syms                 # inactive filtered out
+    assert "PERP/USDT" not in syms                # non-spot filtered out
+
+
+def test_symbols_endpoint_shape(client):
+    r = client.get("/api/symbols")
+    assert r.status_code == 200
+    body = r.json()
+    assert isinstance(body["symbols"], list)  # real list (may be empty offline)
+    assert body["quote"] == "USDT"
+
+
+def test_paper_reset_endpoint_shape(client):
+    r = client.post("/api/paper/reset")
+    assert r.status_code == 200
+    for k in ("trades_deleted", "signals_deleted", "paper_balance"):
+        assert k in r.json()

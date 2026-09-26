@@ -458,6 +458,78 @@ class TradingEngine:
         self._killswitch_tripped = False
         self._peak_equity = 0.0
 
+    def _live_readonly_block(self) -> Optional[str]:
+        """Guard for live ORDER PLACEMENT with a read-only key.
+
+        In live mode the app shows the user's REAL balances and market data even
+        when the API key can only READ the account (Spot trading not enabled yet,
+        or an IP restriction not set). But it must never *pretend* to place an
+        order it can't. When we KNOW the key can't trade (already probed), refuse
+        placement with a clear, honest message instead of firing an order the
+        exchange would reject with a cryptic -2015. Returns the message to
+        surface, or None when placement is allowed — including when trade-access
+        is still unknown (None), in which case the real order attempt itself is
+        the source of truth and will surface any real error."""
+        if not self.settings.is_live:
+            return None
+        # getattr with a default keeps this working for lightweight test/stub
+        # connectors that don't implement the trade-access probe at all.
+        can = getattr(self.connector, "can_trade", None)
+        if can is None:
+            # Not probed since the last (re)connect — find out BEFORE attempting a
+            # live order, so a read-only key gets an honest message instead of a
+            # doomed -2015. Best-effort: if the probe is absent or itself fails,
+            # fall through and let the real order attempt surface the true error.
+            probe = getattr(self.connector, "check_trading_access", None)
+            if callable(probe):
+                try:
+                    probe()
+                    can = getattr(self.connector, "can_trade", None)
+                except Exception:
+                    can = None
+        if can is False:
+            return (
+                "Live mode is read-only right now: your API key can read your "
+                "real Binance account but can't place orders yet. Enable Spot "
+                "trading (and any required IP restriction) on the key, then run "
+                "Test connection. Your balances and market data are live and real "
+                "in the meantime."
+            )
+        return None
+
+    def reset_paper_data(self, db: Session) -> dict[str, Any]:
+        """Wipe this account's SIMULATED (paper) history for a clean slate.
+
+        Deletes the user's paper trades and their signal log, and resets the
+        paper wallet to its starting balance. REAL (live) trades are never
+        touched, so this can't destroy real-money records. Irreversible."""
+        with self._lock:
+            paper_trades = list(
+                db.scalars(
+                    self._scope(select(Trade).where(Trade.mode == "paper"))
+                ).all()
+            )
+            n_trades = len(paper_trades)
+            for t in paper_trades:
+                db.delete(t)
+            sig_stmt = select(SignalLog)
+            if self.user_id is not None:
+                sig_stmt = sig_stmt.where(SignalLog.user_id == self.user_id)
+            signals = list(db.scalars(sig_stmt).all())
+            n_signals = len(signals)
+            for slog in signals:
+                db.delete(slog)
+            db.commit()
+            self.paper_balance = self.settings.paper_starting_balance
+            save_paper_balance(db, self.paper_balance, self.user_id)
+            self._last_auto_verdict.clear()
+            self.reset_killswitch()
+        return {
+            "trades_deleted": n_trades,
+            "signals_deleted": n_signals,
+            "paper_balance": self.paper_balance,
+        }
+
     def _consecutive_losses(self, db: Session) -> int:
         """Count the current run of losing CLOSED trades (most recent first)."""
         rows = db.scalars(
@@ -559,6 +631,14 @@ class TradingEngine:
                 return False, f"Already in a {state} position for {symbol}", None
 
             # ---- OPEN a new position ---------------------------------
+            # Read-only live guard: in live mode with a key that can READ the
+            # real account but not TRADE yet (Spot not enabled / IP not set), we
+            # still show real balances and market data — but must never pretend
+            # to open a position. Refuse placement honestly. Exits above already
+            # returned, so a close is never blocked.
+            ro = self._live_readonly_block()
+            if ro:
+                return False, ro, None
             # Account-level kill-switch first: on catastrophic drawdown, refuse
             # ALL new entries (manual, webhook or autonomous) until the bot is
             # restarted. Exits above already returned, so this never blocks a
@@ -860,6 +940,11 @@ class TradingEngine:
             return False, "Scaled entry allows at most 20 legs", []
         if step_pct <= 0:
             return False, "Scaled entry step % must be positive", []
+        # Read-only live guard: block a scaled ENTRY when the live key can't
+        # trade yet (same rationale as execute_signal). Real data stays live.
+        ro = self._live_readonly_block()
+        if ro:
+            return False, ro, []
 
         with self._lock:
             # Don't stack onto an existing position/resting order for this symbol.
