@@ -4,6 +4,7 @@ import { PriceChart, TF_SECONDS } from './PriceChart'
 import { TradingViewChart } from './TradingViewChart'
 import { DEFAULT_INDICATORS, type IndicatorPrefs } from './indicators'
 import { tradesToMarkers } from './chartMarkers'
+import { loadTurns, saveTurns } from './chatHistory'
 import { useBinanceStream } from './useBinanceStream'
 import { Login, LicenseGate } from './Login'
 import { Admin } from './Admin'
@@ -175,6 +176,9 @@ type ChatMsg = ChatTurn & {
   action?: ProposedAction
   actionState?: 'pending' | 'running' | 'done' | 'dismissed'
   live?: boolean
+  // When this turn was created (unix ms). Used to age the persisted transcript
+  // out after 24h (see chatHistory). Stamped at creation; absent on old data.
+  ts?: number
 }
 
 function Dashboard({
@@ -222,12 +226,21 @@ function Dashboard({
     }
     return DEFAULT_INDICATORS
   })
+  // Trade arrows (buy/sell markers on the exact bars where your OWN trades opened
+  // and closed) are OFF by default — they can crowd the chart — and shown on
+  // demand via the "Trades" toggle. Remembered like the other chart prefs.
+  const [showTradeMarkers, setShowTradeMarkers] = useState<boolean>(
+    () => localStorage.getItem('tt.showTradeMarkers') === '1',
+  )
   useEffect(() => {
     localStorage.setItem('tt.chartView', chartView)
   }, [chartView])
   useEffect(() => {
     localStorage.setItem('tt.indicators', JSON.stringify(indicators))
   }, [indicators])
+  useEffect(() => {
+    localStorage.setItem('tt.showTradeMarkers', showTradeMarkers ? '1' : '0')
+  }, [showTradeMarkers])
   // Wall-clock of the last status we received (WS push or poll), so the bot
   // activity strip can show an honest "updated Ns ago" heartbeat.
   const [statusTs, setStatusTs] = useState(0)
@@ -268,7 +281,15 @@ function Dashboard({
   // The AI-assistant transcript, LIFTED here (out of AssistantPanel) so proactive
   // monitor/alert call-outs pushed over the socket land in it even when the
   // Assistant tab isn't mounted — and so voice can read them regardless of tab.
-  const [turns, setTurns] = useState<ChatMsg[]>([])
+  // Restored from this browser's 24h history (scoped to this user) so the thread
+  // survives a refresh/quit and the assistant can recall earlier turns.
+  const [turns, setTurns] = useState<ChatMsg[]>(() => loadTurns<ChatMsg>(me.id))
+  // Persist the transcript back for 24h whenever it changes (see chatHistory):
+  // real messages only, scoped to this user, proposed-action cards neutralised on
+  // reload so a stale order card can never be one-click executed later.
+  useEffect(() => {
+    saveTurns(me.id, turns)
+  }, [turns, me.id])
   // Read-aloud (Web Speech) is OFF by default; the user turns it on in the
   // assistant. Lifted so a pushed alert can be spoken from any tab when it's on.
   const [readAloud, setReadAloud] = useState(false)
@@ -385,7 +406,7 @@ function Dashboard({
         // whatever tab is open; toast by level; and speak it if the user turned
         // voice on. A fired alert also flipped its row to "triggered" — refetch so
         // the list + chart marker update.
-        setTurns((t) => [...t, { role: 'ai', text: d.text, live: true } as ChatMsg].slice(-200))
+        setTurns((t) => [...t, { role: 'ai', text: d.text, live: true, ts: Date.now() } as ChatMsg].slice(-200))
         showToast(d.level === 'warn' ? 'error' : 'ok', d.text)
         speak(d.text)
         if (d.kind === 'alert') refreshAlerts()
@@ -962,6 +983,23 @@ function Dashboard({
                 {chartView === 'bot' && (
                   <IndicatorsMenu value={indicators} onChange={setIndicators} />
                 )}
+                {chartView === 'bot' && (
+                  <div className="chart-view-toggle" role="group" aria-label="Trade arrows">
+                    <button
+                      type="button"
+                      className={`cvt-btn${showTradeMarkers ? ' active' : ''}`}
+                      aria-pressed={showTradeMarkers}
+                      onClick={() => setShowTradeMarkers((v) => !v)}
+                      title={
+                        showTradeMarkers
+                          ? 'Hide the buy/sell trade arrows on the chart'
+                          : 'Show buy/sell arrows on the bars where your own trades opened and closed'
+                      }
+                    >
+                      Trades
+                    </button>
+                  </div>
+                )}
                 <div className="chart-view-toggle" role="tablist" aria-label="Chart view">
                   <button
                     type="button"
@@ -1002,7 +1040,7 @@ function Dashboard({
                   timeframe={timeframe}
                   priceLines={chartPriceLines}
                   indicators={indicators}
-                  markers={chartMarkers}
+                  markers={showTradeMarkers ? chartMarkers : []}
                 />
               ) : (
                 <div className="empty">
@@ -1610,6 +1648,15 @@ const OSCILLATOR_DEFS: { key: keyof IndicatorPrefs; label: string; color: string
   { key: 'macd', label: 'MACD (12, 26, 9)', color: '#3b82f6' },
 ]
 
+// Volume visualisations. `volume` is the bar histogram along the bottom (on by
+// default); `volumeProfile` is the horizontal VPVR histogram up the right edge
+// showing how much real volume traded at each price. Both are summed from the
+// chart's own candles — nothing fabricated.
+const VOLUME_DEFS: { key: keyof IndicatorPrefs; label: string; color: string }[] = [
+  { key: 'volume', label: 'Volume (bars)', color: '#5b8def' },
+  { key: 'volumeProfile', label: 'Volume Profile (VPVR)', color: '#f0b90b' },
+]
+
 // TradingView-style "Indicators" dropdown for the bot chart: tick the moving
 // averages / bands / VWAP to overlay. The choice is saved (localStorage) by the
 // parent, so it persists like a saved layout. Every overlay is computed from the
@@ -1640,7 +1687,8 @@ function IndicatorsMenu({
   }, [open])
   const count =
     INDICATOR_DEFS.filter((d) => value[d.key]).length +
-    OSCILLATOR_DEFS.filter((d) => value[d.key]).length
+    OSCILLATOR_DEFS.filter((d) => value[d.key]).length +
+    VOLUME_DEFS.filter((d) => value[d.key]).length
   return (
     <div className="ind-menu" ref={ref}>
       <button
@@ -1669,6 +1717,18 @@ function IndicatorsMenu({
           ))}
           <div className="ind-group">Oscillators · own pane</div>
           {OSCILLATOR_DEFS.map((d) => (
+            <label key={d.key} className="ind-row">
+              <input
+                type="checkbox"
+                checked={value[d.key]}
+                onChange={(e) => onChange({ ...value, [d.key]: e.target.checked })}
+              />
+              <span className="ind-swatch" style={{ background: d.color }} />
+              <span className="ind-label">{d.label}</span>
+            </label>
+          ))}
+          <div className="ind-group">Volume</div>
+          {VOLUME_DEFS.map((d) => (
             <label key={d.key} className="ind-row">
               <input
                 type="checkbox"
@@ -2822,7 +2882,7 @@ function AssistantPanel({
         role: m.role === 'ai' ? ('assistant' as const) : ('user' as const),
         content: m.text,
       }))
-    setTurns((t) => [...t, { role: 'you', text: question }])
+    setTurns((t) => [...t, { role: 'you', text: question, ts: Date.now() }])
     setInput('')
     setBusy(true)
     try {
@@ -2848,13 +2908,14 @@ function AssistantPanel({
           nav: dest ? { dest, label: NAV_LABEL[dest] } : undefined,
           action,
           actionState: action ? 'pending' : undefined,
+          ts: Date.now(),
         },
       ])
       speak(text)
     } catch (e) {
       const msg = (e as Error).message
       onError(msg)
-      setTurns((t) => [...t, { role: 'ai', text: `(request failed: ${msg})` }])
+      setTurns((t) => [...t, { role: 'ai', text: `(request failed: ${msg})`, ts: Date.now() }])
     } finally {
       setBusy(false)
     }
@@ -2864,7 +2925,7 @@ function AssistantPanel({
   // and shows the outcome). Turns are only appended, so the index stays stable.
   const setActionState = (idx: number, s: 'pending' | 'running' | 'done' | 'dismissed') =>
     setTurns((t) => t.map((m, i) => (i === idx ? { ...m, actionState: s } : m)))
-  const pushResult = (text: string) => setTurns((t) => [...t, { role: 'ai', text }])
+  const pushResult = (text: string) => setTurns((t) => [...t, { role: 'ai', text, ts: Date.now() }])
   const dismissAction = (idx: number) => setActionState(idx, 'dismissed')
 
   // Turn a proposed action into a human-readable card: a title, plain-English
@@ -3850,6 +3911,67 @@ function SavedStrategiesCard({
   )
 }
 
+// A numeric text field you can actually TYPE decimals into. The parent keeps
+// the value as a number, but binding a <input> straight to a number re-writes
+// its text on every keystroke, which swallows a trailing dot — "0." snaps back
+// to "0", so you can never get to "0.1". This holds the raw text locally while
+// you edit, pushes the parsed number up the moment it's a valid number, and
+// only re-syncs from the parent number when the field isn't focused (e.g. after
+// settings load or reset). It never lets a non-numeric character land.
+function NumField({
+  value,
+  onChange,
+  className,
+  inputMode = 'decimal',
+  placeholder,
+}: {
+  value: number
+  onChange: (n: number) => void
+  className?: string
+  inputMode?: 'decimal' | 'numeric'
+  placeholder?: string
+}) {
+  const [text, setText] = useState<string>(() => String(value))
+  const editingRef = useRef(false)
+  useEffect(() => {
+    // Reflect an external change unless the user is mid-edit (never clobber what
+    // they're typing). Compare numerically so "0." vs 0 doesn't force a rewrite.
+    if (!editingRef.current && Number(text) !== value) setText(String(value))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [value])
+  return (
+    <input
+      className={className}
+      value={text}
+      inputMode={inputMode}
+      placeholder={placeholder}
+      onFocus={() => {
+        editingRef.current = true
+      }}
+      onBlur={() => {
+        // Normalise on the way out: blank -> 0, garbage -> last good value.
+        editingRef.current = false
+        const n = text.trim() === '' ? 0 : Number(text)
+        const final = Number.isFinite(n) ? n : value
+        setText(String(final))
+        if (final !== value) onChange(final)
+      }}
+      onChange={(e) => {
+        const raw = e.target.value
+        // Only the shape of a number-in-progress: digits, one dot, a lead sign.
+        // "", ".", "0.", "-", "-." are allowed so decimals can be typed freely.
+        if (!/^-?\d*\.?\d*$/.test(raw)) return
+        editingRef.current = true
+        setText(raw)
+        const n = Number(raw)
+        if (raw !== '' && raw !== '.' && raw !== '-' && raw !== '-.' && Number.isFinite(n)) {
+          onChange(n)
+        }
+      }}
+    />
+  )
+}
+
 function SettingsPanel({
   settings,
   loadError,
@@ -3894,18 +4016,10 @@ function SettingsPanel({
   }
 
   const webhookUrl = `${location.origin}${form.webhook_path}`
-  // Numeric field handler: empty clears to 0; anything that isn't a finite
-  // number is ignored (the field keeps its last valid value) so NaN/garbage can
-  // never be saved to a risk setting.
-  const num = (k: keyof Settings, v: string) => {
-    if (v === '') {
-      setForm({ ...form, [k]: 0 } as Settings)
-      return
-    }
-    const parsed = Number(v)
-    if (!Number.isFinite(parsed)) return
-    setForm({ ...form, [k]: parsed } as Settings)
-  }
+  // Numeric field setter: NumField hands us an already-parsed finite number, so
+  // we just store it. (NumField owns the "let me type a decimal" behaviour and
+  // normalises blank/garbage, so risk settings never receive NaN.)
+  const setNum = (k: keyof Settings) => (n: number) => setForm({ ...form, [k]: n } as Settings)
 
   const save = async () => {
     try {
@@ -4006,19 +4120,19 @@ function SettingsPanel({
       <div className="row">
         <div className="field">
           <label>Max open positions</label>
-          <input
+          <NumField
             className="input"
             value={form.max_open_positions}
-            onChange={(e) => num('max_open_positions', e.target.value)}
+            onChange={setNum('max_open_positions')}
             inputMode="numeric"
           />
         </div>
         <div className="field">
           <label>Risk per trade %</label>
-          <input
+          <NumField
             className="input"
             value={form.risk_per_trade_pct}
-            onChange={(e) => num('risk_per_trade_pct', e.target.value)}
+            onChange={setNum('risk_per_trade_pct')}
             inputMode="decimal"
           />
         </div>
@@ -4026,55 +4140,55 @@ function SettingsPanel({
       <div className="row">
         <div className="field">
           <label>Stop-loss %</label>
-          <input
+          <NumField
             className="input"
             value={form.default_stop_loss_pct}
-            onChange={(e) => num('default_stop_loss_pct', e.target.value)}
+            onChange={setNum('default_stop_loss_pct')}
             inputMode="decimal"
           />
         </div>
         <div className="field">
           <label>Take-profit %</label>
-          <input
+          <NumField
             className="input"
             value={form.default_take_profit_pct}
-            onChange={(e) => num('default_take_profit_pct', e.target.value)}
+            onChange={setNum('default_take_profit_pct')}
             inputMode="decimal"
           />
         </div>
         <div className="field">
           <label>Trailing stop % (0 = off)</label>
-          <input
+          <NumField
             className="input"
             value={form.trailing_stop_pct}
-            onChange={(e) => num('trailing_stop_pct', e.target.value)}
+            onChange={setNum('trailing_stop_pct')}
             inputMode="decimal"
           />
         </div>
         <div className="field">
           <label>Daily loss limit %</label>
-          <input
+          <NumField
             className="input"
             value={form.daily_loss_limit_pct}
-            onChange={(e) => num('daily_loss_limit_pct', e.target.value)}
+            onChange={setNum('daily_loss_limit_pct')}
             inputMode="decimal"
           />
         </div>
         <div className="field">
           <label>Max total exposure % (0 = off)</label>
-          <input
+          <NumField
             className="input"
             value={form.max_total_exposure_pct}
-            onChange={(e) => num('max_total_exposure_pct', e.target.value)}
+            onChange={setNum('max_total_exposure_pct')}
             inputMode="decimal"
           />
         </div>
         <div className="field">
           <label>Paper taker fee % (0 = off)</label>
-          <input
+          <NumField
             className="input"
             value={form.paper_taker_fee_pct}
-            onChange={(e) => num('paper_taker_fee_pct', e.target.value)}
+            onChange={setNum('paper_taker_fee_pct')}
             inputMode="decimal"
           />
         </div>
@@ -4131,10 +4245,10 @@ function SettingsPanel({
         </div>
         <div className="field">
           <label>Min signal confidence (0–1)</label>
-          <input
+          <NumField
             className="input"
             value={form.min_signal_confidence}
-            onChange={(e) => num('min_signal_confidence', e.target.value)}
+            onChange={setNum('min_signal_confidence')}
             inputMode="decimal"
           />
         </div>

@@ -13,6 +13,9 @@ export type LinePoint = { time: number; value: number }
 // Which price-overlay indicators the user has switched on. Persisted so the
 // choice sticks between visits (see App: loaded from / saved to localStorage).
 // The first group draws ON price; rsi/macd draw in their own sub-panes below it.
+// `volume`/`volumeProfile` are the two volume VISUALISATIONS (the bottom bars
+// and the right-edge VPVR histogram) — toggles handled in PriceChart, not line
+// math here — kept in the same prefs object so they persist with the rest.
 export type IndicatorPrefs = {
   ema9: boolean
   ema21: boolean
@@ -22,6 +25,8 @@ export type IndicatorPrefs = {
   vwap: boolean
   rsi: boolean
   macd: boolean
+  volume: boolean
+  volumeProfile: boolean
 }
 
 export const DEFAULT_INDICATORS: IndicatorPrefs = {
@@ -33,6 +38,8 @@ export const DEFAULT_INDICATORS: IndicatorPrefs = {
   vwap: false,
   rsi: false,
   macd: false,
+  volume: true,
+  volumeProfile: false,
 }
 
 // Simple moving average of the close over `period` bars.

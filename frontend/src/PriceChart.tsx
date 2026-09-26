@@ -21,6 +21,7 @@ import {
 import type { Candle } from './types'
 import type { Theme } from './theme'
 import { sma, ema, bollinger, vwap, rsi, macd, type IndicatorPrefs, type LinePoint } from './indicators'
+import { volumeProfile, type VolumeProfile } from './volumeProfile'
 import type { ChartMarker } from './chartMarkers'
 import {
   loadDrawings,
@@ -93,7 +94,7 @@ type SubPane = {
 // data model, hit-testing and persistence live in ./drawings (pure + unit-
 // tested); this component only wires mouse events and canvas rendering to it.
 const DRAW_TOOLS: { key: Tool; glyph: string; label: string }[] = [
-  { key: 'cursor', glyph: '↖', label: 'Cursor — click a drawing to select / delete' },
+  { key: 'cursor', glyph: '↖', label: 'Cursor — click a drawing to select, right-click it to remove' },
   { key: 'trend', glyph: '╱', label: 'Trend line — click start, then click end' },
   { key: 'hline', glyph: '─', label: 'Horizontal line — click a price level' },
   { key: 'rect', glyph: '▭', label: 'Rectangle — click two opposite corners' },
@@ -256,6 +257,11 @@ export function PriceChart({
   // Handle to the attached primitive's requestUpdate, so any state change can
   // ask lightweight-charts to repaint the drawing layer.
   const drawViewRef = useRef<{ requestUpdate: () => void } | null>(null)
+  // Volume Profile (VPVR): the computed profile to paint up the right edge, and
+  // whether it's switched on. The drawing primitive's renderer reads both so the
+  // profile repaints in step with pans/zooms and theme flips.
+  const vpRef = useRef<VolumeProfile | null>(null)
+  const vpOnRef = useRef<boolean>(false)
   // Persistence bookkeeping: which symbol|timeframe is currently loaded, and a
   // one-shot flag so the load itself doesn't immediately re-save.
   const loadedKeyRef = useRef<string>('')
@@ -394,6 +400,32 @@ export function PriceChart({
     const onMainRange = (r: LogicalRange | null) => syncRange(chart, r)
     chart.timeScale().subscribeVisibleLogicalRangeChange(onMainRange)
 
+    // Paint the Volume Profile (VPVR) up the right edge: one horizontal bar per
+    // price bucket, its width proportional to the REAL volume that traded there,
+    // the fattest (POC) highlighted. Translucent so price stays readable. Drawn
+    // before the user's drawings so those sit on top; y comes from the live price
+    // scale so the bars stay pinned to their price as the chart pans/zooms.
+    const renderVolumeProfile = (ctx: CanvasRenderingContext2D, width: number) => {
+      if (!vpOnRef.current) return
+      const vp = vpRef.current
+      const s = seriesRef.current
+      if (!vp || !s || vp.maxVolume <= 0) return
+      const maxW = Math.max(40, width * 0.3) // widest bar spans ~30% of the plot
+      ctx.save()
+      for (const row of vp.rows) {
+        if (row.volume <= 0) continue
+        const yHi = s.priceToCoordinate(row.hi)
+        const yLo = s.priceToCoordinate(row.lo)
+        if (yHi == null || yLo == null) continue
+        const top = Math.min(yHi, yLo)
+        const barH = Math.max(1, Math.abs(yLo - yHi) - 1) // 1px gap between rows
+        const w = (row.volume / vp.maxVolume) * maxW
+        const isPoc = vp.poc != null && row.lo <= vp.poc && vp.poc <= row.hi
+        ctx.fillStyle = isPoc ? 'rgba(240,185,11,0.55)' : 'rgba(91,141,239,0.32)'
+        ctx.fillRect(width - w, top, w, barH)
+      }
+      ctx.restore()
+    }
     // Paint every saved drawing (plus the in-progress preview) onto the price
     // pane each frame, projecting data anchors to pixels through the live scales
     // so lines stay pinned to their bar/price as the chart pans and zooms.
@@ -466,6 +498,7 @@ export function PriceChart({
     const paneRenderer: ISeriesPrimitivePaneRenderer = {
       draw: (target) => {
         target.useMediaCoordinateSpace(({ context, mediaSize }) => {
+          renderVolumeProfile(context, mediaSize.width)
           renderDrawings(context, mediaSize.width)
         })
       },
@@ -536,13 +569,13 @@ export function PriceChart({
       setSelected(d.id)
       drawViewRef.current?.requestUpdate()
     }
-    // Hit-test a click against the drawings (topmost first) and select the
-    // first within tolerance, else clear the selection. Uses the pure helpers
-    // from ./drawings on pixel projections of each anchor.
-    function selectAt(x: number, y: number) {
+    // Hit-test a point (chart-pane pixels) against the drawings, topmost first,
+    // and return the id of the first within tolerance, else null. Shared by
+    // click-to-select and right-click-to-remove.
+    function hitTest(x: number, y: number): string | null {
       const s = seriesRef.current
       const c = chartRef.current
-      if (!s || !c) return
+      if (!s || !c) return null
       const ts = c.timeScale()
       const px = (pt: Pt) => {
         const py = s.priceToCoordinate(pt.price)
@@ -550,26 +583,51 @@ export function PriceChart({
         return pxx == null || py == null ? null : { x: pxx, y: py }
       }
       const list = drawingsRef.current
-      let hit: string | null = null
       for (let i = list.length - 1; i >= 0; i--) {
         const d = list[i]
         if (d.kind === 'hline') {
           const ly = s.priceToCoordinate(d.price)
-          if (ly != null && pointNearHLine(y, ly, HIT_TOL)) { hit = d.id; break }
+          if (ly != null && pointNearHLine(y, ly, HIT_TOL)) return d.id
         } else if (d.kind === 'trend') {
           const a = px(d.a)
           const b = px(d.b)
-          if (a && b && pointNearSegment({ x, y }, a, b, HIT_TOL)) { hit = d.id; break }
+          if (a && b && pointNearSegment({ x, y }, a, b, HIT_TOL)) return d.id
         } else {
           const a = px(d.a)
           const b = px(d.b)
-          if (a && b && pointNearRect({ x, y }, a, b, HIT_TOL)) { hit = d.id; break }
+          if (a && b && pointNearRect({ x, y }, a, b, HIT_TOL)) return d.id
         }
       }
+      return null
+    }
+    // Select the drawing under a click (or clear the selection when it misses).
+    function selectAt(x: number, y: number) {
+      const hit = hitTest(x, y)
       selectedRef.current = hit
       setSelected(hit)
       drawViewRef.current?.requestUpdate()
     }
+    // Right-click straight on a drawing removes it (TradingView-style — no need
+    // to switch to the cursor and press Delete first). Off any drawing we leave
+    // the browser's own menu alone. Coordinates come from the container's rect,
+    // which lines up with the price pane's top-left, same space hitTest expects.
+    const onContextMenu = (e: MouseEvent) => {
+      const el = containerRef.current
+      if (!el) return
+      const r = el.getBoundingClientRect()
+      const id = hitTest(e.clientX - r.left, e.clientY - r.top)
+      if (!id) return
+      e.preventDefault()
+      const next = drawingsRef.current.filter((d) => d.id !== id)
+      drawingsRef.current = next
+      setDrawings(next)
+      if (selectedRef.current === id) {
+        selectedRef.current = null
+        setSelected(null)
+      }
+      drawViewRef.current?.requestUpdate()
+    }
+    containerRef.current?.addEventListener('contextmenu', onContextMenu)
     // Keyboard: Delete/Backspace removes the selected drawing; Escape cancels an
     // in-progress placement or clears the selection. Ignored while a form field
     // is focused so it never eats typing elsewhere in the app. Delegates to the
@@ -593,6 +651,7 @@ export function PriceChart({
       chart.unsubscribeCrosshairMove(onMove)
       chart.unsubscribeClick(onClick)
       window.removeEventListener('keydown', onKeyDown)
+      containerRef.current?.removeEventListener('contextmenu', onContextMenu)
       chart.timeScale().unsubscribeVisibleLogicalRangeChange(onMainRange)
       for (const kind of OSC_ORDER) destroySubPane(kind)
       try {
@@ -848,7 +907,28 @@ export function PriceChart({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [candles, indKey])
 
-  // Oscillator sub-panes: RSI and MACD, each in its own chart stacked beneath
+  // Volume visualisations. `volume` shows/hides the bottom histogram (on by
+  // default — a missing pref counts as on). `volumeProfile` recomputes the VPVR
+  // from the loaded candles into a ref the drawing primitive paints, then asks
+  // it to repaint. Both are pure reads of real volume; nothing is fabricated.
+  useEffect(() => {
+    const showVol = indicators?.volume !== false
+    volumeRef.current?.applyOptions({ visible: showVol })
+    // Reclaim the bottom band for price when the volume bars are hidden.
+    seriesRef.current?.priceScale().applyOptions({
+      scaleMargins: { top: 0.08, bottom: showVol ? 0.26 : 0.08 },
+    })
+    if (indicators?.volumeProfile) {
+      vpRef.current = volumeProfile(candles, 24)
+      vpOnRef.current = true
+    } else {
+      vpRef.current = null
+      vpOnRef.current = false
+    }
+    drawViewRef.current?.requestUpdate()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [candles, indKey])
+
   // price and time-synced to it (pan/zoom price and the panes follow). Every
   // value is real math on the same candles — RSI(14) with 70/30 guides, MACD
   // (12/26/9) as line + signal + histogram. We reconcile like the overlays: add
@@ -992,8 +1072,12 @@ export function PriceChart({
   // Each mirrors its change into the matching ref immediately so the once-built
   // mouse handlers + canvas renderer read the current value without a re-mount.
   const selectTool = (t: Tool) => {
-    toolRef.current = t
-    setTool(t)
+    // Tapping the tool that's already active toggles it back off to the cursor
+    // (TradingView-style "touch again to unuse") so a second click on Trend /
+    // H-line / Rectangle stops drawing. The cursor has nothing to toggle off to.
+    const next = t !== 'cursor' && toolRef.current === t ? 'cursor' : t
+    toolRef.current = next
+    setTool(next)
     pendingRef.current = null
     hoverRef.current = null
     drawViewRef.current?.requestUpdate()
@@ -1091,7 +1175,7 @@ export function PriceChart({
         <button
           type="button"
           className="ct-btn"
-          title="Delete selected drawing (Del)"
+          title="Delete selected drawing (Del key, or right-click the drawing)"
           aria-label="Delete selected drawing"
           disabled={!selected}
           onClick={deleteSelected}
