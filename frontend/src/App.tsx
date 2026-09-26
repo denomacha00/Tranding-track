@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { api, setToken, getToken, setAuthFailureHandler } from './api'
 import { PriceChart } from './PriceChart'
+import { useBinanceStream } from './useBinanceStream'
 import { Login, LicenseGate } from './Login'
 import { Admin } from './Admin'
 import { useSocket } from './useSocket'
@@ -209,6 +210,14 @@ function Dashboard({
   const [toast, setToast] = useState<Toast>(null)
   const [tab, setTab] = useState<TabKey>('trades')
   const [access, setAccess] = useState<ExchangeAccess | null>(null)
+  // Real-time market data: when the account is on REAL Binance.com (not testnet,
+  // not a public fallback venue), stream price / candles / depth straight from
+  // Binance's PUBLIC websocket in the browser so the chart, price and order book
+  // move the SAME as a TradingView chart — no REST polling lag. It's public,
+  // read-only, key-less data; REST stays the seed (history) and the fallback
+  // whenever the stream isn't live, so nothing on screen is ever fabricated.
+  const liveBinance = !!access && !access.testnet && (access.exchange ?? 'binance') === 'binance'
+  const stream = useBinanceStream(symbol, timeframe, liveBinance)
   const [menuOpen, setMenuOpen] = useState(false)
   // Global connection status (shown in the slim bar under the header on every
   // tab): the built-in AI provider's real reachability + the exchange access.
@@ -654,8 +663,14 @@ function Dashboard({
   const pnlClass = (n: number) => (n > 0 ? 'pos' : n < 0 ? 'neg' : '')
 
   // Live price for the header readout + the chart's forming bar. Prefer the
-  // fast ticker; fall back to the newest candle close until it arrives.
-  const livePrice = ticker?.last ?? (candles.length ? candles[candles.length - 1].close : null)
+  // real-time stream when it's live (sub-second, exchange-grade); otherwise the
+  // polled ticker; and fall back to the newest candle close until either
+  // arrives. Never a fabricated number — only real feeds, in order of freshness.
+  const streamingLive = liveBinance && stream.streaming
+  const livePrice =
+    (streamingLive && stream.price != null && stream.price > 0 ? stream.price : null) ??
+    ticker?.last ??
+    (candles.length ? candles[candles.length - 1].close : null)
   const chgPct = ticker?.percentage ?? null
 
   return (
@@ -866,12 +881,18 @@ function Dashboard({
               </div>
             </div>
             <div className="panel-body">
-              <MarketStats ticker={ticker} symbol={symbol} stale={tickerStale} />
+              <MarketStats
+                ticker={ticker}
+                symbol={symbol}
+                stale={tickerStale && !streamingLive}
+                live={streamingLive}
+              />
               {candles.length ? (
                 <PriceChart
                   candles={candles}
                   theme={theme}
                   last={livePrice}
+                  liveBar={streamingLive ? stream.candle : null}
                   fitKey={`${symbol}:${timeframe}`}
                   symbol={symbol}
                   timeframe={timeframe}
@@ -884,7 +905,12 @@ function Dashboard({
             </div>
           </section>
 
-          <OrderBook symbol={symbol} exchange={access?.exchange} />
+          <OrderBook
+            symbol={symbol}
+            exchange={access?.exchange}
+            liveBook={streamingLive ? stream.book : null}
+            streaming={streamingLive}
+          />
 
           <section className="panel">
             <div className="panel-head">Manual order</div>
@@ -1372,10 +1398,12 @@ function MarketStats({
   ticker,
   symbol,
   stale,
+  live,
 }: {
   ticker: Ticker | null
   symbol: string
   stale: boolean
+  live?: boolean
 }) {
   const [base, quote] = symbol.split('/')
   const bid = ticker?.bid ?? null
@@ -1384,6 +1412,14 @@ function MarketStats({
   const spreadPct = spread != null && ask ? (spread / ask) * 100 : null
   return (
     <div className={`market-stats ${stale ? 'stale' : ''}`}>
+      {live && (
+        <div className="ms-item">
+          <span className="ms-k">Feed</span>
+          <span className="ms-v live-pill" title="Streaming live from Binance's public websocket — sub-second, same as an exchange chart">
+            ● LIVE
+          </span>
+        </div>
+      )}
       <div className="ms-item">
         <span className="ms-k">Bid</span>
         <span className="ms-v buy" title="Highest resting buy order — you sell into this">
@@ -1412,13 +1448,44 @@ function MarketStats({
     </div>
   )
 }
+// Running cumulative sum of order-book amounts from the top of book outward, so
+// each level shows the TOTAL resting liquidity up to (and including) it — the
+// depth ladder every exchange draws.
+function cumulative(levels: { amount: number }[]): number[] {
+  const out: number[] = []
+  let run = 0
+  for (const l of levels) {
+    run += Number.isFinite(l.amount) ? l.amount : 0
+    out.push(run)
+  }
+  return out
+}
 // Live order-book depth: the market's REAL resting bids (buy side) and asks
-// (sell side), polled every few seconds. Depth bars are scaled to the largest
-// order shown. Empty sides mean the venue returned no depth — never invented.
-function OrderBook({ symbol, exchange }: { symbol: string; exchange?: string }) {
+// (sell side). When a real-time depth stream is available it's used directly
+// (100ms, exchange-grade); otherwise REST is polled every 2.5s. Each side shows
+// price, amount, and a running Total (cumulative amount from the top of book
+// outward), with depth bars scaled to that cumulative total. Empty sides mean
+// the venue returned no depth — never invented.
+function OrderBook({
+  symbol,
+  exchange,
+  liveBook,
+  streaming,
+}: {
+  symbol: string
+  exchange?: string
+  liveBook?: OrderBookData | null
+  streaming?: boolean
+}) {
   const [book, setBook] = useState<OrderBookData | null>(null)
   const [err, setErr] = useState<string | null>(null)
   useEffect(() => {
+    // While the live websocket is feeding depth, don't also poll REST — the
+    // stream is fresher (100ms) and polling would only fight it.
+    if (streaming) {
+      setErr(null)
+      return
+    }
     let alive = true
     setBook(null)
     setErr(null)
@@ -1440,25 +1507,38 @@ function OrderBook({ symbol, exchange }: { symbol: string; exchange?: string }) 
       alive = false
       clearInterval(id)
     }
-  }, [symbol])
+  }, [symbol, streaming])
 
+  // Prefer the live streamed book when streaming; otherwise the polled book.
+  const active = streaming ? liveBook ?? null : book
   const LEVELS = 12
-  const asks = (book?.asks ?? []).slice(0, LEVELS)
-  const bids = (book?.bids ?? []).slice(0, LEVELS)
-  const maxAmt = Math.max(1e-9, ...asks.map((a) => a.amount), ...bids.map((b) => b.amount))
-  const bestAsk = book?.asks[0]?.price
-  const bestBid = book?.bids[0]?.price
+  const asks = (active?.asks ?? []).slice(0, LEVELS)
+  const bids = (active?.bids ?? []).slice(0, LEVELS)
+  const askCum = cumulative(asks)
+  const bidCum = cumulative(bids)
+  const maxCum = Math.max(
+    1e-9,
+    askCum[askCum.length - 1] ?? 0,
+    bidCum[bidCum.length - 1] ?? 0,
+  )
+  const bestAsk = active?.asks[0]?.price
+  const bestBid = active?.bids[0]?.price
   const spread = bestAsk != null && bestBid != null ? bestAsk - bestBid : null
   const spreadPct = spread != null && bestAsk ? (spread / bestAsk) * 100 : null
-  const viaFallback = Boolean(book?.source && exchange && book.source !== exchange)
+  const viaFallback = Boolean(active?.source && exchange && active.source !== exchange)
   return (
     <section className="panel orderbook">
       <div className="panel-head">
         <span>Order book</span>
         <div className="row" style={{ alignItems: 'center', gap: 8 }}>
+          {streaming && (
+            <span className="live-pill" title="Streaming live depth at 100ms from Binance's public websocket">
+              ● LIVE
+            </span>
+          )}
           {viaFallback && (
-            <span className="hint" title={`Depth served from the public fallback ${book?.source}, not ${exchange}.`}>
-              via {book?.source}
+            <span className="hint" title={`Depth served from the public fallback ${active?.source}, not ${exchange}.`}>
+              via {active?.source}
             </span>
           )}
           {spread != null && (
@@ -1470,38 +1550,52 @@ function OrderBook({ symbol, exchange }: { symbol: string; exchange?: string }) 
         </div>
       </div>
       <div className="panel-body">
-        {err ? (
-          <div className="empty">Order book unavailable: {err}</div>
-        ) : !book ? (
-          <div className="empty">Loading order book…</div>
+        {!active ? (
+          streaming ? (
+            <div className="empty">Connecting live order book…</div>
+          ) : err ? (
+            <div className="empty">Order book unavailable: {err}</div>
+          ) : (
+            <div className="empty">Loading order book…</div>
+          )
         ) : asks.length === 0 && bids.length === 0 ? (
-          <div className="empty">No resting orders returned{book.source ? ` by ${book.source}` : ''}.</div>
+          <div className="empty">No resting orders returned{active.source ? ` by ${active.source}` : ''}.</div>
         ) : (
           <div className="ob">
             <div className="ob-headrow">
               <span>Price</span>
               <span>Amount</span>
+              <span>Total</span>
             </div>
             <div className="ob-side">
-              {[...asks].reverse().map((lvl, i) => (
-                <div className="ob-row ask" key={`a${i}`}>
-                  <div className="ob-depth" style={{ width: `${(lvl.amount / maxAmt) * 100}%` }} />
-                  <span className="ob-price sell">{fmtPx(lvl.price)}</span>
-                  <span className="ob-amt">{compact(lvl.amount)}</span>
-                </div>
-              ))}
+              {[...asks].reverse().map((lvl, i) => {
+                const orig = asks.length - 1 - i
+                const cum = askCum[orig] ?? lvl.amount
+                return (
+                  <div className="ob-row ask" key={`a${i}`} title={`Cumulative ${compact(cum)} up to ${fmtPx(lvl.price)}`}>
+                    <div className="ob-depth" style={{ width: `${(cum / maxCum) * 100}%` }} />
+                    <span className="ob-price sell">{fmtPx(lvl.price)}</span>
+                    <span className="ob-amt">{compact(lvl.amount)}</span>
+                    <span className="ob-total">{compact(cum)}</span>
+                  </div>
+                )
+              })}
             </div>
             <div className="ob-spread">
               {bestBid != null && bestAsk != null ? `${fmtPx(bestBid)} — ${fmtPx(bestAsk)}` : '—'}
             </div>
             <div className="ob-side">
-              {bids.map((lvl, i) => (
-                <div className="ob-row bid" key={`b${i}`}>
-                  <div className="ob-depth" style={{ width: `${(lvl.amount / maxAmt) * 100}%` }} />
-                  <span className="ob-price buy">{fmtPx(lvl.price)}</span>
-                  <span className="ob-amt">{compact(lvl.amount)}</span>
-                </div>
-              ))}
+              {bids.map((lvl, i) => {
+                const cum = bidCum[i] ?? lvl.amount
+                return (
+                  <div className="ob-row bid" key={`b${i}`} title={`Cumulative ${compact(cum)} down to ${fmtPx(lvl.price)}`}>
+                    <div className="ob-depth" style={{ width: `${(cum / maxCum) * 100}%` }} />
+                    <span className="ob-price buy">{fmtPx(lvl.price)}</span>
+                    <span className="ob-amt">{compact(lvl.amount)}</span>
+                    <span className="ob-total">{compact(cum)}</span>
+                  </div>
+                )
+              })}
             </div>
           </div>
         )}

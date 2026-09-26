@@ -93,6 +93,7 @@ export function PriceChart({
   candles,
   theme,
   last,
+  liveBar,
   fitKey,
   symbol,
   timeframe,
@@ -100,6 +101,12 @@ export function PriceChart({
   candles: Candle[]
   theme: Theme
   last?: number | null
+  // A full OHLCV frame for the forming/just-closed candle, straight from a
+  // real-time kline WebSocket. When present it drives the newest bar (including
+  // rolling over to a brand-new candle the instant the market opens one) and the
+  // scalar `last` path is skipped — this is the exchange-grade live update. When
+  // null (no stream) the chart falls back to moving the last bar by `last`.
+  liveBar?: (Candle & { closed?: boolean }) | null
   // Changes when the symbol/timeframe changes. The chart re-fits the view only
   // when this changes (or on first data) so periodic reloads don't yank the
   // user's pan/zoom back — an exchange chart stays where you left it.
@@ -261,8 +268,11 @@ export function PriceChart({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [candles, fitKey])
 
-  // Move the newest bar live as the ticker price updates.
+  // Move the newest bar live as the ticker price updates. Skipped entirely when
+  // a real-time kline stream is feeding `liveBar` — that path is richer (true
+  // OHLC + volume + rollover) and the two must not fight over the same bar.
   useEffect(() => {
+    if (liveBar) return
     if (!seriesRef.current || last == null || !Number.isFinite(last) || last <= 0) return
     const bar = lastBarRef.current
     if (!bar) return
@@ -277,7 +287,38 @@ export function PriceChart({
     seriesRef.current.update(updated)
     if (!hoveringRef.current) renderLegend(updated, lastVolRef.current)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [last])
+  }, [last, liveBar])
+
+  // Real-time kline stream: move (and roll over) the newest bar from full OHLCV
+  // frames — the same data an exchange chart draws — so a fresh candle appears
+  // the instant the market opens it, not on the next REST reload. Out-of-order
+  // frames older than the bar on screen are ignored.
+  useEffect(() => {
+    const series = seriesRef.current
+    if (!series || !liveBar) return
+    if (!Number.isFinite(liveBar.close) || liveBar.close <= 0) return
+    const prev = lastBarRef.current
+    if (prev && (liveBar.time as number) < (prev.time as number)) return
+    const bar: CandlestickData = {
+      time: liveBar.time as Time,
+      open: liveBar.open,
+      high: liveBar.high,
+      low: liveBar.low,
+      close: liveBar.close,
+    }
+    series.update(bar)
+    lastBarRef.current = bar
+    if (volumeRef.current && Number.isFinite(liveBar.volume)) {
+      volumeRef.current.update({
+        time: liveBar.time as Time,
+        value: liveBar.volume,
+        color: liveBar.close >= liveBar.open ? VOL_UP : VOL_DOWN,
+      })
+      lastVolRef.current = liveBar.volume
+    }
+    if (!hoveringRef.current) renderLegend(bar, lastVolRef.current)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [liveBar])
 
   // Count down to the forming candle's close (open time + one frame), ticking
   // every second. Frames without a known length simply show no timer.
@@ -290,9 +331,12 @@ export function PriceChart({
       el.textContent = ''
       return
     }
-    const closeAt = (lastBar.time as number) + secs
     const tick = () => {
-      el.textContent = '⏱ ' + fmtDur(closeAt - Math.floor(Date.now() / 1000))
+      // Prefer the live forming bar's open time (kept current by the live/stream
+      // effects) so the timer rolls over the instant a new candle opens, not on
+      // the next REST reload; fall back to the seeded last bar.
+      const openT = (lastBarRef.current?.time as number) ?? (lastBar.time as number)
+      el.textContent = '⏱ ' + fmtDur(openT + secs - Math.floor(Date.now() / 1000))
     }
     tick()
     const id = window.setInterval(tick, 1000)

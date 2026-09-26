@@ -580,8 +580,9 @@ th.mono {
 }
 
 .ob-headrow {
-  display: flex;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 12px;
   color: var(--muted);
   font-size: 11px;
   text-transform: uppercase;
@@ -589,10 +590,16 @@ th.mono {
   padding: 0 2px 4px;
 }
 
+.ob-headrow span:nth-child(2),
+.ob-headrow span:nth-child(3) {
+  text-align: right;
+}
+
 .ob-row {
   position: relative;
-  display: flex;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 12px;
   align-items: center;
   padding: 2px 4px;
   overflow: hidden;
@@ -616,7 +623,8 @@ th.mono {
 }
 
 .ob-price,
-.ob-amt {
+.ob-amt,
+.ob-total {
   position: relative;
   z-index: 1;
 }
@@ -631,6 +639,37 @@ th.mono {
 
 .ob-amt {
   color: var(--text);
+  text-align: right;
+}
+
+.ob-total {
+  color: var(--muted);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* "● LIVE" pulse shown when a real-time websocket feed is driving the view. */
+.live-pill {
+  color: var(--green);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+  animation: live-pulse 1.6s ease-in-out infinite;
+}
+
+.market-stats .ms-v.live-pill {
+  color: var(--green);
+}
+
+@keyframes live-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.4;
+  }
 }
 
 .ob-spread {
